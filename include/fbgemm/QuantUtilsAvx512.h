@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "Types.h"
 #if defined(FBGEMM_FBCODE) || !defined(__aarch64__)
 
 #include <cstdint>
@@ -37,6 +38,13 @@ FBGEMM_API void requantizeOutputProcessingGConvAvx512(
     int ld_out,
     int ld_in,
     const requantizationParams_t<BIAS_TYPE>& r);
+
+template <bool scale_bias_last = true, bool quant_padding_float_type = true>
+void Fused8BitRowwiseQuantizedSBFloatToBfloat16Avx512(
+    const std::uint8_t* input,
+    size_t input_rows,
+    int input_columns,
+    bfloat16* output);
 } // namespace fbgemm
 
 #endif

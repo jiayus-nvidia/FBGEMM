@@ -10,7 +10,7 @@ import sys
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 import click
 
@@ -73,7 +73,7 @@ def set_amd_env_vars() -> None:
     os.environ["PYTORCH_TUNABLEOP_MAX_WARMUP_DURATION_MS"] = "30"
 
 
-def get_llama_shapes() -> List[Tuple[int, int, int, int]]:
+def get_llama_shapes() -> list[tuple[int, int, int, int]]:
     # Helper function that returns a list of shapes relevant to llama.
 
     llama_shapes = []
@@ -103,7 +103,7 @@ def get_llama_shapes() -> List[Tuple[int, int, int, int]]:
     return llama_shapes
 
 
-def get_ldm_shapes() -> List[Tuple[int, int, int, int]]:
+def get_ldm_shapes() -> list[tuple[int, int, int, int]]:
     # Helper function that returns a list of shapes relevant to ldm.
     return [
         (1, 1536, 3584, 3584),
@@ -160,11 +160,11 @@ class Metrics:
 
 
 def benchmark_grouped(
-    quantize_ops: List[QuantizeOpBase],
-    b: List[int],
-    m: List[int],
-    n: List[int],
-    k: List[int],
+    quantize_ops: list[QuantizeOpBase],
+    b: list[int],
+    m: list[int],
+    n: list[int],
+    k: list[int],
     bench_quantize: bool = False,
     use_rotating_buffer_bench: bool = False,
     use_cuda_graph: bool = True,
@@ -172,7 +172,7 @@ def benchmark_grouped(
     num_iters: int = 1,
     fast_accum: bool = True,
     torch_compile: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     num_groups = len(m)
     # Create input tensors.
     A = []
@@ -193,7 +193,7 @@ def benchmark_grouped(
     log_m = m[0] if len(np.unique(m)) == 1 else m
     log_n = n[0] if len(np.unique(n)) == 1 else n
     log_k = k[0] if len(np.unique(k)) == 1 else k
-    results: Dict[str, Any] = {"M": log_m, "N": log_n, "K": log_k, "groups": num_groups}
+    results: dict[str, Any] = {"M": log_m, "N": log_n, "K": log_k, "groups": num_groups}
     # Benchmark each operator.
     for quantize_op in quantize_ops:
         metrics = Metrics(op_name=quantize_op.name)
@@ -277,7 +277,7 @@ def benchmark_grouped(
 
 
 def benchmark(
-    quantize_ops: List[QuantizeOpBase],
+    quantize_ops: list[QuantizeOpBase],
     b: int,
     m: int,
     n: int,
@@ -289,7 +289,7 @@ def benchmark(
     num_iters: int = 1,
     fast_accum: bool = True,
     torch_compile: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     # Create input tensors.
     if b > 1:
         A = torch.randn(b, m, k, device="cuda", dtype=torch.bfloat16)
@@ -301,7 +301,7 @@ def benchmark(
     # Compute baseline output for correctness checking.
     out_ref = torch.matmul(A, torch.transpose(B, -2, -1))
     # Keep track of results.
-    results: Dict[str, Any] = {"B": b, "M": m, "N": n, "K": k}
+    results: dict[str, Any] = {"B": b, "M": m, "N": n, "K": k}
     # Benchmark each operator.
     for quantize_op in quantize_ops:
         metrics = Metrics(op_name=quantize_op.name)
@@ -368,7 +368,7 @@ def benchmark(
     return results
 
 
-def plot_benchmark(results: List[Dict[str, Any]], output_dir: str) -> None:
+def plot_benchmark(results: list[dict[str, Any]], output_dir: str) -> None:
     """Create a barplot visualizing the TFLOPS of each kernel."""
     # Reprocess into new dataframe with proper graph format.
     data = []
@@ -394,7 +394,7 @@ def plot_benchmark(results: List[Dict[str, Any]], output_dir: str) -> None:
     print(f"Plot saved to {img_fn}")
 
 
-def collect_kernels_to_profile(kernels: Optional[List[str]]) -> List[QuantizeOpBase]:
+def collect_kernels_to_profile(kernels: Optional[list[str]]) -> list[QuantizeOpBase]:
     # Get existing quantization operators.
     quantize_ops = get_quantize_ops()
     quantize_ops = [op for op in quantize_ops if op.supported]
@@ -403,7 +403,7 @@ def collect_kernels_to_profile(kernels: Optional[List[str]]) -> List[QuantizeOpB
     return [op for op in quantize_ops if op.name in kernels]
 
 
-def print_kernels(kernels: Optional[List[str]]) -> List[QuantizeOpBase]:
+def print_kernels(kernels: Optional[list[str]]) -> list[QuantizeOpBase]:
     data = sorted(
         [
             (op.name, "Yes" if op.cuda else "No", "Yes" if op.hip else "No")
@@ -487,10 +487,18 @@ def print_kernels(kernels: Optional[List[str]]) -> List[QuantizeOpBase]:
     help="If set with grouped mode, repeat input shapes this many times. Comma separated list of groups to benchmark",
 )
 @click.option(
+    "--total-K",
+    default=None,
+    help="If set, adjusts the K values to sum to this number. "
+    "This can help simulate real grouped workloads in backward wgrad. "
+    "Comma separated list of total-K values to benchmark.",
+)
+@click.option(
     "--total-M",
     default=None,
-    help="If set, Adjusts the M values to sum to this number. "
-    "This can help simulate real grouped workloads.",
+    help="If set, adjusts the M values to sum to this number. "
+    "This can help simulate real grouped workloads."
+    "Comma separated list of total-M values to benchmark.",
 )
 @click.option(
     "--no-cuda-graph",
@@ -542,6 +550,7 @@ def invoke_main(
     pair_nk: bool,
     grouped: bool,
     groups: Optional[str],
+    total_k: Optional[str],
     total_m: Optional[str],
     no_cuda_graph: bool,
     use_rotating_buffer_bench: bool,
@@ -553,6 +562,14 @@ def invoke_main(
 ):
     if enable_amd_env_vars:
         set_amd_env_vars()
+
+    # Validate that total_m and total_k are mutually exclusive
+    if total_m is not None and total_k is not None:
+        raise ValueError(
+            "total_m and total_k cannot be specified at the same time. "
+            "Please provide only one of them."
+        )
+
     # If kernel filter is provided, parse it. Else, benchmark all kernels.
     all_kernels = kernels.strip().split(",") if kernels else None
     quantize_ops = collect_kernels_to_profile(all_kernels)
@@ -619,15 +636,30 @@ def invoke_main(
     if groups:
         groups_list = [int(g) for g in groups.strip().split(",")]
         if total_m:
+            total_m_list = [int(tm) for tm in total_m.strip().split(",")]
             MNK = [
                 [
                     [b] * g,
-                    generate_group_tensor(g, int(total_m)),
+                    generate_group_tensor(g, tm),
                     [n] * g,
                     [k] * g,
                 ]
                 for g in groups_list
+                for tm in total_m_list
                 for b, _, n, k in MNK
+            ]
+        elif total_k:
+            total_k_list = [int(tk) for tk in total_k.strip().split(",")]
+            MNK = [
+                [
+                    [b] * g,
+                    [m] * g,
+                    [n] * g,
+                    generate_group_tensor(g, tk),
+                ]
+                for g in groups_list
+                for tk in total_k_list
+                for b, m, n, _ in MNK
             ]
         else:
             MNK = [

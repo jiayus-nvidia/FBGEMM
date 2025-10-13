@@ -411,6 +411,7 @@ at::Tensor FP8rowwise_to_float_cpu(
     const bool forward = true,
     const int64_t output_dtype = 0);
 at::Tensor fused8bitrowwise_to_half_cpu(const at::Tensor& input);
+at::Tensor fused8bitrowwise_to_bfloat16_cpu(const at::Tensor& input);
 at::Tensor fused8bitrowwise_to_float_or_half_cpu(
     const at::Tensor& input,
     const int64_t output_dtype,
@@ -468,7 +469,19 @@ at::Tensor _fusednbitrowwise_to_float_or_half_gpu(
     const int64_t output_dtype);
 at::Tensor& _fused8bitrowwise_to_float_cpu_out(
     at::Tensor& output,
-    const at::Tensor& input);
+    const at::Tensor& input,
+    const bool scale_bias_last = true,
+    const bool quant_padding_float_type = true);
+at::Tensor& fused8bitrowwise_to_half_cpu_out(
+    at::Tensor& output,
+    const at::Tensor& input,
+    const bool scale_bias_last = true,
+    const bool quant_padding_float_type = true);
+at::Tensor& _fused8bitrowwise_to_bfloat16_cpu_out(
+    at::Tensor& output,
+    const at::Tensor& input,
+    const bool scale_bias_last = true,
+    const bool quant_padding_float_type = true);
 at::Tensor& _float_to_fused8bitrowwise_cpu_out(
     at::Tensor& output,
     const at::Tensor& input);
@@ -630,6 +643,12 @@ at::Tensor jagged_to_padded_dense(
     const at::Tensor& values,
     const std::vector<at::Tensor>& offsets,
     const c10::SymIntArrayRef max_lengths,
+    const double padding_value);
+
+at::Tensor jagged_to_padded_dense_forward_cpu(
+    const at::Tensor& values,
+    const std::vector<at::Tensor>& offsets,
+    c10::SymIntArrayRef max_lengths,
     const double padding_value);
 
 at::Tensor jagged_dense_elementwise_add(
