@@ -109,9 +109,6 @@ if(MSVC)
   set(MSVC_BOOL True)
 else(MSVC)
   set(MSVC_BOOL False)
-  check_cxx_compiler_flag(-march=armv8-a+sve COMPILER_SUPPORTS_SVE)
-  check_cxx_compiler_flag(-march=armv8-a+sve2 COMPILER_SUPPORTS_SVE2)
-  check_cxx_compiler_flag(-march=armv8-a+fp16fml COMPILER_SUPPORTS_FP16FML)
 endif(MSVC)
 
 ################################################################################
@@ -225,7 +222,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
 
   message(STATUS "Processor is ${CMAKE_SYSTEM_PROCESSOR}; will build AVX2 target")
 
-  get_filelist("get_fbgemm_avx2_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX2_SRCS)
+  get_filelist("get_fbgemm_avx2_srcs()" FBGEMM_AVX2_SRCS)
   get_filelist("get_fbgemm_inline_avx2_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX2_INLINE_SRCS)
 
   cpp_library(
@@ -259,7 +256,7 @@ endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686" AND CXX_AVX512_FOUND)
   message(STATUS "Processor is ${CMAKE_SYSTEM_PROCESSOR}; will build AVX512 target")
 
-  get_filelist("get_fbgemm_avx512_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX512_SRCS)
+  get_filelist("get_fbgemm_avx512_srcs()" FBGEMM_AVX512_SRCS)
   get_filelist("get_fbgemm_inline_avx512_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX512_INLINE_SRCS)
 
   cpp_library(
@@ -290,6 +287,17 @@ endif()
 ################################################################################
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+  check_cxx_compiler_flag(-march=armv8.2-a+fp16fml COMPILER_SUPPORTS_FP16FML)
+  if(COMPILER_SUPPORTS_FP16FML)
+    set(fbgemm_fml_flags "-march=armv8.2-a+fp16fml")
+  endif()
+  if(NOT COMPILER_SUPPORTS_FP16FML) # for clang
+    check_cxx_compiler_flag(-mfp16fml  COMPILER_SUPPORTS_FP16FML)
+    if(COMPILER_SUPPORTS_FP16FML)
+      set(fbgemm_fml_flags "-march=armv8.2 -mfp16fml")
+    endif()
+  endif()
+
   if(NOT COMPILER_SUPPORTS_FP16FML)
     message(FATAL_ERROR "The current compiler does not support building FP16FML code")
   endif()
@@ -309,7 +317,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
       -ftree-vectorize
       -fno-trapping-math
       -Wignored-qualifiers
-      -march=armv8-a+fp16fml
+      ${fbgemm_fml_flags}
     DEFINITIONS
       ${fbgemm_arm_defs}
     DEPS
@@ -329,7 +337,16 @@ endif()
 ################################################################################
 
 set(FBGEMM_BUILD_SVE False)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+# SVE and SVE2 feature paths require the intrinsics declared in arm_neon_sve_bridge.h
+# This header file is available in the following releases:
+#    Clang 17 and later.
+#    GCC 14 and later.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64" AND
+  ((CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 14)
+  OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 17)))
+
+  check_cxx_compiler_flag(-march=armv8-a+sve COMPILER_SUPPORTS_SVE)
+  check_cxx_compiler_flag(-march=armv8-a+sve2 COMPILER_SUPPORTS_SVE2)
   if(COMPILER_SUPPORTS_SVE2)
     set(FBGEMM_BUILD_SVE True)
     set(fbgemm_sve_flags "-march=armv8-a+sve2")
@@ -388,6 +405,8 @@ if(NOT DISABLE_FBGEMM_AUTOVEC)
       OBJECT
     SRCS
       ${FBGEMM_AUTOVEC_SRCS}
+    CC_FLAGS
+      -ftree-vectorize
     ENABLE_IPO
       ${FBGEMM_USE_IPO}
     DEPS

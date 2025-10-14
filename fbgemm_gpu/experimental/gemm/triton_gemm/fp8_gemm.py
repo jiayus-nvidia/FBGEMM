@@ -8,7 +8,7 @@
 import functools
 import logging
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 import triton  # @manual
@@ -68,7 +68,7 @@ def supports_float8_fnuz(throw_on_hip_incompatibility: bool = True) -> bool:
     return False
 
 
-def get_fp8_constants() -> Tuple[torch.dtype, tl.dtype, float, float]:
+def get_fp8_constants() -> tuple[torch.dtype, tl.dtype, float, float]:
     """
     Helper function to get constant values for the current platform.
 
@@ -106,7 +106,7 @@ def init_to_zero(name):
     return lambda nargs: nargs[name].zero_()
 
 
-def get_configs_io_bound() -> List[Config]:
+def get_configs_io_bound() -> list[Config]:
     """
     Returns a list of configs for matmul that are IO bound.
 
@@ -159,7 +159,7 @@ def dummy_prune_configs(configs, named_args, **kwargs):
     return configs
 
 
-MATMUL_CONFIGS: List[Config] = [
+MATMUL_CONFIGS: list[Config] = [
     # basic configs for compute-bound matmuls
     Config(
         {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32, "SPLIT_K": 1},
@@ -960,7 +960,7 @@ def make_autotuner_config(dictargs, **kwargs):
     return Config(dictargs, **kwargs)
 
 
-def get_ws_configs() -> List[Config]:
+def get_ws_configs() -> list[Config]:
     if not has_warp_specialization:
         return []
     return [
@@ -1246,8 +1246,19 @@ def matmul_fp8_row(
     # View inputs into proper torch fp8 dtype.
     if torch.version.cuda:
         assert a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    elif torch.version.hip:
+        if torch.cuda.get_device_capability() < (9, 5):
+            assert a.dtype in (
+                torch.float8_e4m3fnuz,
+                torch.float8_e5m2fnuz,
+            )
+        else:
+            assert a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     else:
-        assert a.dtype in (torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
+        assert a.dtype in (
+            torch.float8_e4m3fnuz,
+            torch.float8_e5m2fnuz,
+        )
     assert b.dtype == pt_fp8_dtype
     M, N, K, m_key, n_key, k_key, c, c_dtype_triton, dot_out_dtype_triton, device = (
         prep_matmul(a, b, dot_out_dtype)
@@ -1281,7 +1292,7 @@ def matmul_fp8_row(
             output += bias[None, :]
         return output.to(c.dtype)
 
-    def grid(META: Dict[str, int]) -> Tuple[int, int]:
+    def grid(META: dict[str, int]) -> tuple[int, int]:
         return (
             triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
             META["SPLIT_K"],
@@ -1289,7 +1300,7 @@ def matmul_fp8_row(
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    def persistent_grid(META: Dict[str, int]) -> Tuple[int]:
+    def persistent_grid(META: dict[str, int]) -> tuple[int]:
         return (
             min(
                 NUM_SMS,
@@ -1337,7 +1348,7 @@ def matmul_fp8_row(
         desc_helper.init_tma_descriptor("b_scale")
         desc_helper.init_tma_descriptor("bias")
 
-        def persistent_grid_tma_ws(META: Dict[str, int]) -> Tuple[int]:
+        def persistent_grid_tma_ws(META: dict[str, int]) -> tuple[int]:
             nonlocal desc_helper  # noqa: F824
             assert a_scale is not None  # Type narrowing for Pyre
             desc_helper.fill_2d_tma_descriptor(
@@ -1450,7 +1461,7 @@ def matmul_fp8_row(
         desc_helper.init_tma_descriptor("b_scale")
         desc_helper.init_tma_descriptor("bias")
 
-        def persistent_grid_tma(META: Dict[str, int]) -> Tuple[int]:
+        def persistent_grid_tma(META: dict[str, int]) -> tuple[int]:
             nonlocal desc_helper  # noqa: F824
             assert a_scale is not None  # Type narrowing for Pyre
             desc_helper.fill_2d_tma_descriptor(
@@ -2113,7 +2124,7 @@ def matmul_fp8_block(
         raise Exception("'b_scale' must be on the same device as 'a'")
 
     # noqa: E731:
-    def grid(META: Dict[str, int]) -> Tuple[int, int]:
+    def grid(META: dict[str, int]) -> tuple[int, int]:
         return (
             triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
             META["SPLIT_K"],
@@ -2205,7 +2216,7 @@ def matmul_fp8_block_meta(
     return torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
 
 
-def get_matmul_tune(M: int, N: int, K: int) -> Tuple[int, int, int]:
+def get_matmul_tune(M: int, N: int, K: int) -> tuple[int, int, int]:
     """
     Generate a simplified matmul tune key for A @ B.T
     with [M, K] A and [N, K] B to reduce excessive autotuning.
@@ -2234,7 +2245,7 @@ def prep_matmul(
     a: Union[TensorWrapper, torch.Tensor],
     b: Union[TensorWrapper, torch.Tensor],
     dot_out_dtype: Optional[torch.dtype],
-) -> Tuple[
+) -> tuple[
     int, int, int, int, int, int, torch.Tensor, tl.dtype, tl.dtype, torch.device
 ]:
     """
@@ -2464,7 +2475,7 @@ def triton_quantize_fp8_row(
     scale_ub: Optional[Tensor] = None,
     zero_start_index_M: Optional[Tensor] = None,
     align_rows_to: Optional[int] = None,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     """
     Call the triton quantize fp8 row kernel to quantize a tensor to fp8 with row-wise scalings.
 
@@ -2739,7 +2750,7 @@ def triton_quantize_fp8_packed_row(
     scale_ub: Optional[Tensor] = None,
     zero_start_index_M: Optional[Tensor] = None,
     return_only_packed: Optional[bool] = False,
-) -> Tuple[Optional[Tensor], Optional[Tensor], Tensor]:
+) -> tuple[Optional[Tensor], Optional[Tensor], Tensor]:
     """
     Call the triton quantize fp8 row kernel to quantize a tensor to fp8 with row-wise scalings.
 
@@ -2832,7 +2843,7 @@ def quantize_fp8_packed_row(
     zero_start_index_M: Optional[Tensor] = None,
     use_triton: bool = True,
     output_device: Optional[torch.device] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a to fp8 with row-wise scalings and optionally move to output device.
 
@@ -2930,7 +2941,7 @@ def quantize_fp8_row(
     use_triton: bool = True,
     output_device: Optional[torch.device] = None,
     align_rows_to: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a to fp8 with row-wise scalings and optionally move to output device.
 
@@ -2990,7 +3001,7 @@ def quantize_fp8_row_meta(
     use_triton: bool = True,
     output_device: Optional[torch.device] = None,
     align_rows_to: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Shape function for torch compile."""
     if output_device is None:
         output_device = a.device
@@ -3209,7 +3220,7 @@ def triton_quantize_fp8_block(
     block_k: int = 256,
     scale_ub: Optional[torch.Tensor] = None,
     k_major: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to fp8 with block-wise scalings.
 
@@ -3287,7 +3298,7 @@ def quantize_fp8_block(
     use_triton: bool = True,
     output_device: Optional[torch.device] = None,
     k_major: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to fp8 with block-wise scalings and optionally move to output device.
 
@@ -3520,7 +3531,7 @@ def triton_quantize_fp8_group(
     scale_ub: Optional[torch.Tensor] = None,
     m_sizes: Optional[torch.Tensor] = None,
     k_major: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to fp8 with group-wise scalings.
 
@@ -3590,7 +3601,7 @@ def quantize_fp8_group(
     k_major: bool = True,
     use_triton: bool = True,
     output_device: Optional[torch.device] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to fp8 with group-wise scalings and optionally move to output device.
 
@@ -3803,264 +3814,67 @@ def get_full_non_persistent_tuning_space():
                                                     num_stages=num_stages,
                                                 )
                                             )
-    logger.info(f"all configs #: {len(configs)}")
     return configs
 
 
-MATMUL_CONFIGS_NON_PERSISTENT: List[Config] = get_full_non_persistent_tuning_space()
+MATMUL_CONFIGS_NON_PERSISTENT: list[Config] = get_full_non_persistent_tuning_space()
+# (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, SPLIT_K, waves_per_eu, matrix_instr_nonkdim, kpack, num_warps, num_stages)
+_MATMUL_CONFIG_TUPLES_PINGPONG_4K_8K_16K = [
+    (16, 16, 256, 1, 1, 8, 16, 2, 2, 2),
+    (16, 16, 256, 1, 1, 0, 16, 2, 2, 2),
+    (32, 64, 512, 1, 1, 2, 16, 2, 8, 2),
+    (64, 64, 256, 1, 1, 2, 16, 2, 4, 2),
+    (256, 256, 128, 32, 1, 2, 16, 1, 8, 2),
+    (256, 256, 128, 2, 1, 0, 32, 2, 8, 2),
+    (256, 256, 128, 1, 1, 0, 32, 2, 8, 2),
+    (256, 256, 128, 2, 1, 0, 16, 1, 8, 2),
+    (256, 256, 64, 2, 1, 2, 16, 1, 8, 2),
+    (128, 256, 64, 2, 1, 2, 16, 1, 4, 2),
+    (256, 128, 128, 4, 1, 0, 16, 1, 8, 2),
+    (128, 128, 128, 1, 1, 2, 16, 2, 4, 2),
+    (128, 128, 256, 1, 1, 2, 16, 2, 8, 2),
+    (128, 128, 64, 4, 1, 2, 16, 2, 4, 2),
+    (128, 128, 64, 1, 1, 2, 16, 2, 4, 2),
+    (128, 64, 64, 4, 1, 0, 16, 2, 4, 2),
+    (128, 64, 64, 1, 1, 0, 16, 2, 4, 2),
+    (256, 128, 128, 1, 1, 2, 16, 1, 8, 2),
+    (128, 256, 128, 2, 1, 2, 16, 2, 4, 1),
+    (256, 128, 64, 2, 1, 2, 16, 1, 4, 2),
+]
+
+
+def _should_skip_config(block_k, matrix_instr_nonkdim):
+    """Skip config if BLOCK_K=64 and matrix_instr_nonkdim=16 on GFX95+"""
+    try:
+        return (
+            block_k == 64
+            and matrix_instr_nonkdim == 16
+            and torch.version.hip is not None
+            and torch.cuda.get_device_capability() >= (9, 5)
+        )
+    except RuntimeError:
+        # If no HIP GPUs are available, we can't check device capability
+        # so we don't skip any configs
+        return False
+
+
 MATMUL_CONFIGS_NON_PERSISTENT_PINGPONG_4K_8K_16K = [
     triton.Config(
         {
-            "BLOCK_M": 16,
-            "BLOCK_N": 16,
-            "BLOCK_K": 256,
-            "GROUP_M": 1,
-            "SPLIT_K": 1,
-            "waves_per_eu": 8,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 2,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+            "GROUP_M": group_m,
+            "SPLIT_K": split_k,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+            "kpack": kpack,
         },
-        num_warps=2,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 16,
-            "BLOCK_N": 16,
-            "BLOCK_K": 256,
-            "GROUP_M": 1,
-            "SPLIT_K": 1,
-            "waves_per_eu": 0,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 2,
-        },
-        num_warps=2,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 32,
-            "BLOCK_N": 64,
-            "BLOCK_K": 512,
-            "GROUP_M": 1,
-            "SPLIT_K": 1,
-            "waves_per_eu": 2,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 2,
-        },
-        num_warps=8,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 64,
-            "BLOCK_N": 64,
-            "BLOCK_K": 256,
-            "GROUP_M": 1,
-            "SPLIT_K": 1,
-            "waves_per_eu": 2,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 2,
-        },
-        num_warps=4,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 256,
-            "BLOCK_K": 128,
-            "GROUP_M": 32,
-            "SPLIT_K": 1,
-            "waves_per_eu": 2,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 1,
-        },
-        num_warps=8,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 256,
-            "BLOCK_K": 128,
-            "GROUP_M": 2,
-            "SPLIT_K": 1,
-            "waves_per_eu": 0,
-            "matrix_instr_nonkdim": 32,
-            "kpack": 2,
-        },
-        num_warps=8,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 256,
-            "BLOCK_K": 128,
-            "GROUP_M": 1,
-            "SPLIT_K": 1,
-            "waves_per_eu": 0,
-            "matrix_instr_nonkdim": 32,
-            "kpack": 2,
-        },
-        num_warps=8,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 256,
-            "BLOCK_K": 128,
-            "GROUP_M": 2,
-            "SPLIT_K": 1,
-            "waves_per_eu": 0,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 1,
-        },
-        num_warps=8,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 256,
-            "BLOCK_K": 64,
-            "GROUP_M": 2,
-            "SPLIT_K": 1,
-            "waves_per_eu": 2,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 1,
-        },
-        num_warps=8,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 128,
-            "BLOCK_N": 256,
-            "BLOCK_K": 64,
-            "GROUP_M": 2,
-            "SPLIT_K": 1,
-            "waves_per_eu": 2,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 1,
-        },
-        num_warps=4,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "BLOCK_K": 128,
-            "GROUP_M": 4,
-            "SPLIT_K": 1,
-            "waves_per_eu": 0,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 1,
-        },
-        num_warps=8,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "BLOCK_K": 128,
-            "GROUP_M": 1,
-            "SPLIT_K": 1,
-            "waves_per_eu": 2,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 2,
-        },
-        num_warps=4,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "BLOCK_K": 256,
-            "GROUP_M": 1,
-            "SPLIT_K": 1,
-            "waves_per_eu": 2,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 2,
-        },
-        num_warps=8,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "BLOCK_K": 64,
-            "GROUP_M": 4,
-            "SPLIT_K": 1,
-            "waves_per_eu": 2,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 2,
-        },
-        num_warps=4,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "BLOCK_K": 64,
-            "GROUP_M": 1,
-            "SPLIT_K": 1,
-            "waves_per_eu": 2,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 2,
-        },
-        num_warps=4,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 128,
-            "BLOCK_N": 64,
-            "BLOCK_K": 64,
-            "GROUP_M": 4,
-            "SPLIT_K": 1,
-            "waves_per_eu": 0,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 2,
-        },
-        num_warps=4,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 128,
-            "BLOCK_N": 64,
-            "BLOCK_K": 64,
-            "GROUP_M": 1,
-            "SPLIT_K": 1,
-            "waves_per_eu": 0,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 2,
-        },
-        num_warps=4,
-        num_stages=2,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "BLOCK_K": 128,
-            "GROUP_M": 1,
-            "SPLIT_K": 1,
-            "waves_per_eu": 2,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 1,
-        },
-        num_warps=8,
-        num_stages=2,
-    ),
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    for block_m, block_n, block_k, group_m, split_k, waves_per_eu, matrix_instr_nonkdim, kpack, num_warps, num_stages in _MATMUL_CONFIG_TUPLES_PINGPONG_4K_8K_16K
+    if not _should_skip_config(block_k, matrix_instr_nonkdim)
 ]
 
 # Set this to enable full autotuning for proper benchmarking.
@@ -4323,7 +4137,7 @@ def dequantize_fp8_row(
     M = xq.shape[0]
     use_int64 = xq.numel() > 2**31
 
-    def grid(meta: Dict[str, int]) -> Tuple[int]:
+    def grid(meta: dict[str, int]) -> tuple[int]:
         return (triton.cdiv(M, meta["BLOCK_M"]),)
 
     with torch.cuda.device(xq.device.index):
@@ -4434,7 +4248,7 @@ def dequantize_fp8_packed_row(
     M = actual_xq.shape[0]
     use_int64 = actual_xq.numel() > 2**31
 
-    def grid(meta: Dict[str, int]) -> Tuple[int]:
+    def grid(meta: dict[str, int]) -> tuple[int]:
         return (triton.cdiv(M, meta["BLOCK_M"]),)
 
     with torch.cuda.device(actual_xq.device.index):
@@ -4514,7 +4328,7 @@ def dequantize_fp8_block(
     M, K = xq.size()
     x_dequant = torch.empty_like(xq, dtype=torch.bfloat16)
 
-    def grid(meta: Dict[str, int]) -> Tuple[int, int]:
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
         return (
             triton.cdiv(M, meta["BLOCK_M"]),
             triton.cdiv(K, meta["BLOCK_K"]),

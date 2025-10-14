@@ -24,6 +24,7 @@
 #endif
 
 #include <fbgemm_gpu/utils/vec_quant.cuh>
+#include "fbgemm_gpu/utils/kernel_launcher.cuh"
 
 template <typename func_t>
 void set_gpu_max_dynamic_shared_memory(
@@ -80,16 +81,16 @@ template <
     CacheLogicalDtype KVDataType>
 __global__ void __launch_bounds__(kThreadsPerWarp* kSplitKWarpsPerBlock, 1)
     gqa_attn_splitk_wmma_kernel(
-        const at::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits>
-            XQ,
-        const at::PackedTensorAccessor64<kv_t, 4, at::RestrictPtrTraits>
+        const pta::
+            PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> XQ,
+        const pta::PackedTensorAccessor64<kv_t, 4, at::RestrictPtrTraits>
             cache_K,
-        const at::PackedTensorAccessor64<kv_t, 4, at::RestrictPtrTraits>
+        const pta::PackedTensorAccessor64<kv_t, 4, at::RestrictPtrTraits>
             cache_V,
-        at::PackedTensorAccessor32<float, 4, at::RestrictPtrTraits> out_splitK,
-        const at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+        pta::PackedTensorAccessor32<float, 4, at::RestrictPtrTraits> out_splitK,
+        const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
             seq_positions,
-        at::PackedTensorAccessor32<float, 4, at::RestrictPtrTraits> metadata,
+        pta::PackedTensorAccessor32<float, 4, at::RestrictPtrTraits> metadata,
         float qk_scale) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
   // Need kWarpsPerBlock == blockDim.y;
@@ -784,14 +785,14 @@ __global__ void __launch_bounds__(kThreadsPerWarp* kSplitKWarpsPerBlock, 1)
 
 __global__ void gqa_attn_splitk_reduce_wmma_kernel(
     // {B, H, num_split_ks, D_H}
-    const at::PackedTensorAccessor32<float, 4, at::RestrictPtrTraits>
+    const pta::PackedTensorAccessor32<float, 4, at::RestrictPtrTraits>
         out_splitK,
     // {B, H, 2, num_split_ks, 1},
-    const at::PackedTensorAccessor32<float, 4, at::RestrictPtrTraits> metadata,
-    const at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+    const pta::PackedTensorAccessor32<float, 4, at::RestrictPtrTraits> metadata,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
         seq_positions,
     // [B, 1, H, D]
-    at::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> O) {
+    pta::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> O) {
   const auto b = blockIdx.x;
   const auto h = blockIdx.y;
   const auto num_split_ks = out_splitK.size(1);
@@ -832,12 +833,13 @@ __global__ void gqa_attn_splitk_reduce_wmma_kernel(
 }
 
 __global__ void gqa_attn_splitk_qk_kernel(
-    const at::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> XQ,
-    const at::PackedTensorAccessor64<at::BFloat16, 4, at::RestrictPtrTraits>
+    const pta::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits>
+        XQ,
+    const pta::PackedTensorAccessor64<at::BFloat16, 4, at::RestrictPtrTraits>
         cache_K,
-    const at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
         seq_positions,
-    at::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> QK_out) {
+    pta::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> QK_out) {
   static_assert(kWarpsPerBlock <= kThreadsPerWarp, "");
 
   // Each block handles a single batch and head
@@ -935,11 +937,13 @@ __global__ void gqa_attn_splitk_qk_kernel(
 
 template <int KVQuantNumGroups = 1>
 __global__ void gqa_attn_splitk_qk_int4_kernel(
-    const at::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> XQ,
-    const at::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits> cache_K,
-    const at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+    const pta::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits>
+        XQ,
+    const pta::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits>
+        cache_K,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
         seq_positions,
-    at::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> QK_out) {
+    pta::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> QK_out) {
   static_assert(kWarpsPerBlock <= kThreadsPerWarp, "");
 
   // Each block handles a single batch and head
@@ -1055,9 +1059,10 @@ __global__ void gqa_attn_splitk_qk_int4_kernel(
 
 // TODO: can also fuse RoPe into this kernel. Doesn't seem worth it.
 __global__ void gqa_attn_splitk_attn_kernel(
-    at::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> XQ_out,
-    at::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> attn_out,
-    at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> seq_positions,
+    pta::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> XQ_out,
+    pta::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> attn_out,
+    pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+        seq_positions,
     float qk_scale) {
   static_assert(kWarpsPerBlock <= kThreadsPerWarp, "");
 
@@ -1130,10 +1135,10 @@ __global__ void gqa_attn_splitk_attn_kernel(
 
 // TODO: can also fuse RoPe into this kernel. Doesn't seem worth it.
 __global__ void gqa_attn_splitk_v_kernel(
-    at::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> attn_out,
-    at::PackedTensorAccessor64<at::BFloat16, 4, at::RestrictPtrTraits> cache_V,
-    at::PackedTensorAccessor32<float, 5, at::RestrictPtrTraits> O,
-    at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+    pta::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> attn_out,
+    pta::PackedTensorAccessor64<at::BFloat16, 4, at::RestrictPtrTraits> cache_V,
+    pta::PackedTensorAccessor32<float, 5, at::RestrictPtrTraits> O,
+    pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
         seq_positions) {
   static_assert(kWarpsPerBlock <= kThreadsPerWarp, "");
 
@@ -1235,10 +1240,10 @@ __global__ void gqa_attn_splitk_v_kernel(
 // TODO: can also fuse RoPe into this kernel. Doesn't seem worth it.
 template <int KVQuantNumGroups = 1>
 __global__ void gqa_attn_splitk_v_int4_kernel(
-    at::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> attn_out,
-    at::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits> cache_V,
-    at::PackedTensorAccessor32<float, 5, at::RestrictPtrTraits> O,
-    at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+    pta::PackedTensorAccessor32<float, 3, at::RestrictPtrTraits> attn_out,
+    pta::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits> cache_V,
+    pta::PackedTensorAccessor32<float, 5, at::RestrictPtrTraits> O,
+    pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
         seq_positions) {
   static_assert(kWarpsPerBlock <= kThreadsPerWarp, "");
 
@@ -1445,25 +1450,29 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gqa_attn_splitk_wmma_impl(
           (t_per_block_round_up + kSplitKWarpsPerBlock + D_H) * sizeof(float) +
       smem_staging_size;
 
-#define CALL_GQA_ATTN_SPLITK_WMMA(                                          \
-    CACHE_TYPE, NUM_GROUPS, KV_LOAD_T, KV_DATA_TYPE)                        \
-  const auto gqa_fn = gqa_attn_splitk_wmma_kernel<                          \
-      CACHE_TYPE,                                                           \
-      NUM_GROUPS,                                                           \
-      KV_LOAD_T,                                                            \
-      KV_DATA_TYPE>;                                                        \
-  if (smem > SMEM_ADJUST_THRESHOLD) {                                       \
-    set_gpu_max_dynamic_shared_memory(gqa_fn, smem, XQ.get_device());       \
-  }                                                                         \
-  gqa_fn<<<blocks, threads, smem, at::cuda::getCurrentCUDAStream()>>>(      \
-      XQ.packed_accessor32<at::BFloat16, 4, at::RestrictPtrTraits>(),       \
-      cache_K.packed_accessor64<CACHE_TYPE, 4, at::RestrictPtrTraits>(),    \
-      cache_V.packed_accessor64<CACHE_TYPE, 4, at::RestrictPtrTraits>(),    \
-      out_splitK.packed_accessor32<float, 4, at::RestrictPtrTraits>(),      \
-      seq_positions.packed_accessor32<int32_t, 1, at::RestrictPtrTraits>(), \
-      metadata.packed_accessor32<float, 4, at::RestrictPtrTraits>(),        \
-      qk_scale);                                                            \
-  C10_CUDA_KERNEL_LAUNCH_CHECK()
+#define CALL_GQA_ATTN_SPLITK_WMMA(                                    \
+    CACHE_TYPE, NUM_GROUPS, KV_LOAD_T, KV_DATA_TYPE)                  \
+  auto gqa_fn = gqa_attn_splitk_wmma_kernel<                          \
+      CACHE_TYPE,                                                     \
+      NUM_GROUPS,                                                     \
+      KV_LOAD_T,                                                      \
+      KV_DATA_TYPE>;                                                  \
+  if (smem > SMEM_ADJUST_THRESHOLD) {                                 \
+    set_gpu_max_dynamic_shared_memory(gqa_fn, smem, XQ.get_device()); \
+  }                                                                   \
+  FBGEMM_LAUNCH_KERNEL(                                               \
+      (gqa_fn),                                                       \
+      blocks,                                                         \
+      threads,                                                        \
+      smem,                                                           \
+      at::cuda::getCurrentCUDAStream(),                               \
+      PTA_B(XQ, at::BFloat16, 4, 32),                                 \
+      PTA_B(cache_K, CACHE_TYPE, 4, 64),                              \
+      PTA_B(cache_V, CACHE_TYPE, 4, 64),                              \
+      PTA_B(out_splitK, float, 4, 32),                                \
+      PTA_B(seq_positions, int32_t, 1, 32),                           \
+      PTA_B(metadata, float, 4, 32),                                  \
+      qk_scale);
 
   if (cache_K.dtype() == at::kBFloat16) {
     CALL_GQA_ATTN_SPLITK_WMMA(
@@ -1486,16 +1495,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gqa_attn_splitk_wmma_impl(
 
 #undef CALL_GQA_ATTN_SPLITK_WMMA
 
-  gqa_attn_splitk_reduce_wmma_kernel<<<
+  FBGEMM_LAUNCH_KERNEL(
+      (gqa_attn_splitk_reduce_wmma_kernel),
       dim3(B, H),
       dim3(kThreadsPerWarp, D_H / kThreadsPerWarp),
       0,
-      at::cuda::getCurrentCUDAStream()>>>(
-      out_splitK.packed_accessor32<float, 4, at::RestrictPtrTraits>(),
-      metadata.packed_accessor32<float, 4, at::RestrictPtrTraits>(),
-      seq_positions.packed_accessor32<int32_t, 1, at::RestrictPtrTraits>(),
-      O.packed_accessor32<at::BFloat16, 4, at::RestrictPtrTraits>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      at::cuda::getCurrentCUDAStream(),
+      PTA_B(out_splitK, float, 4, 32),
+      PTA_B(metadata, float, 4, 32),
+      PTA_B(seq_positions, int32_t, 1, 32),
+      PTA_B(O, at::BFloat16, 4, 32));
   return {O, out_splitK, metadata};
 }
 
@@ -1545,30 +1554,32 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gqa_attn_splitk_impl(
     dim3 threads(kThreadsPerWarp, kWarpsPerBlock);
 
     if (cache_K.dtype() == at::kBFloat16) {
-      gqa_attn_splitk_qk_kernel<<<
+      FBGEMM_LAUNCH_KERNEL(
+          (gqa_attn_splitk_qk_kernel),
           blocks,
           threads,
           0,
-          at::cuda::getCurrentCUDAStream()>>>(
-          XQ.packed_accessor32<at::BFloat16, 4, at::RestrictPtrTraits>(),
-          cache_K.packed_accessor64<at::BFloat16, 4, at::RestrictPtrTraits>(),
-          seq_positions.packed_accessor32<int32_t, 1, at::RestrictPtrTraits>(),
-          QK_out.packed_accessor32<float, 3, at::RestrictPtrTraits>());
-      C10_CUDA_KERNEL_LAUNCH_CHECK();
+          at::cuda::getCurrentCUDAStream(),
+          PTA_B(XQ, at::BFloat16, 4, 32),
+          PTA_B(cache_K, at::BFloat16, 4, 64),
+          PTA_B(seq_positions, int32_t, 1, 32),
+          PTA_B(QK_out, float, 3, 32));
     } else {
-#define CALL_MQA_ATTN_SPLITK_QK_INT4_GROUPWISE_KERNEL(NUM_GROUPS, ...)    \
-  gqa_attn_splitk_qk_int4_kernel<NUM_GROUPS>                              \
-      <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(         \
-          XQ.packed_accessor32<at::BFloat16, 4, at::RestrictPtrTraits>(), \
-          cache_K.packed_accessor64<uint8_t, 4, at::RestrictPtrTraits>(), \
-          seq_positions                                                   \
-              .packed_accessor32<int32_t, 1, at::RestrictPtrTraits>(),    \
-          QK_out.packed_accessor32<float, 3, at::RestrictPtrTraits>());
+#define CALL_MQA_ATTN_SPLITK_QK_INT4_GROUPWISE_KERNEL(NUM_GROUPS, ...) \
+  FBGEMM_LAUNCH_KERNEL(                                                \
+      (gqa_attn_splitk_qk_int4_kernel<NUM_GROUPS>),                    \
+      blocks,                                                          \
+      threads,                                                         \
+      0,                                                               \
+      at::cuda::getCurrentCUDAStream(),                                \
+      PTA_B(XQ, at::BFloat16, 4, 32),                                  \
+      PTA_B(cache_K, uint8_t, 4, 64),                                  \
+      PTA_B(seq_positions, int32_t, 1, 32),                            \
+      PTA_B(QK_out, float, 3, 32));
 
       auto num_groups_ = num_groups ? num_groups.value() : 1;
       CALL_INT4_KERNEL_WITH_KV_GROUPWISE_QUANT_CHECK(
           CALL_MQA_ATTN_SPLITK_QK_INT4_GROUPWISE_KERNEL, num_groups_);
-      C10_CUDA_KERNEL_LAUNCH_CHECK();
 
 #undef CALL_MQA_ATTN_SPLITK_QK_INT4_GROUPWISE_KERNEL
     }
@@ -1589,16 +1600,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gqa_attn_splitk_impl(
           gqa_attn_splitk_attn_kernel, smem, device);
     }
 
-    gqa_attn_splitk_attn_kernel<<<
+    FBGEMM_LAUNCH_KERNEL(
+        (gqa_attn_splitk_attn_kernel),
         blocks,
         threads,
         smem,
-        at::cuda::getCurrentCUDAStream()>>>(
-        QK_out.packed_accessor32<float, 3, at::RestrictPtrTraits>(),
-        attn_out.packed_accessor32<float, 3, at::RestrictPtrTraits>(),
-        seq_positions.packed_accessor32<int32_t, 1, at::RestrictPtrTraits>(),
+        at::cuda::getCurrentCUDAStream(),
+        PTA_B(QK_out, float, 3, 32),
+        PTA_B(attn_out, float, 3, 32),
+        PTA_B(seq_positions, int32_t, 1, 32),
         qk_scale);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   auto O = at::empty({split_k, B, 1, H, D_H}, XQ.options().dtype(at::kFloat));
   {
@@ -1614,29 +1625,32 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gqa_attn_splitk_impl(
         set_gpu_max_dynamic_shared_memory(
             gqa_attn_splitk_v_kernel, smem, device);
       }
-      gqa_attn_splitk_v_kernel<<<
+      FBGEMM_LAUNCH_KERNEL(
+          (gqa_attn_splitk_v_kernel),
           blocks,
           threads,
           smem,
-          at::cuda::getCurrentCUDAStream()>>>(
-          attn_out.packed_accessor32<float, 3, at::RestrictPtrTraits>(),
-          cache_V.packed_accessor64<at::BFloat16, 4, at::RestrictPtrTraits>(),
-          O.packed_accessor32<float, 5, at::RestrictPtrTraits>(),
-          seq_positions.packed_accessor32<int32_t, 1, at::RestrictPtrTraits>());
-      C10_CUDA_KERNEL_LAUNCH_CHECK();
+          at::cuda::getCurrentCUDAStream(),
+          PTA_B(attn_out, float, 3, 32),
+          PTA_B(cache_V, at::BFloat16, 4, 64),
+          PTA_B(O, float, 5, 32),
+          PTA_B(seq_positions, int32_t, 1, 32));
     } else {
-#define CALL_MQA_ATTN_SPLITKV_INT4_GROUPWISE_KERNEL(NUM_GROUPS, ...)      \
-  if (set_max_dynamic_smem) {                                             \
-    set_gpu_max_dynamic_shared_memory(                                    \
-        gqa_attn_splitk_v_int4_kernel<NUM_GROUPS>, smem, device);         \
-  }                                                                       \
-  gqa_attn_splitk_v_int4_kernel<NUM_GROUPS>                               \
-      <<<blocks, threads, smem, at::cuda::getCurrentCUDAStream()>>>(      \
-          attn_out.packed_accessor32<float, 3, at::RestrictPtrTraits>(),  \
-          cache_V.packed_accessor64<uint8_t, 4, at::RestrictPtrTraits>(), \
-          O.packed_accessor32<float, 5, at::RestrictPtrTraits>(),         \
-          seq_positions                                                   \
-              .packed_accessor32<int32_t, 1, at::RestrictPtrTraits>());
+#define CALL_MQA_ATTN_SPLITKV_INT4_GROUPWISE_KERNEL(NUM_GROUPS, ...) \
+  if (set_max_dynamic_smem) {                                        \
+    set_gpu_max_dynamic_shared_memory(                               \
+        gqa_attn_splitk_v_int4_kernel<NUM_GROUPS>, smem, device);    \
+  }                                                                  \
+  FBGEMM_LAUNCH_KERNEL(                                              \
+      (gqa_attn_splitk_v_int4_kernel<NUM_GROUPS>),                   \
+      blocks,                                                        \
+      threads,                                                       \
+      smem,                                                          \
+      at::cuda::getCurrentCUDAStream(),                              \
+      PTA_B(attn_out, float, 3, 32),                                 \
+      PTA_B(cache_V, uint8_t, 4, 64),                                \
+      PTA_B(O, float, 5, 32),                                        \
+      PTA_B(seq_positions, int32_t, 1, 32));
 
       auto num_groups_ = num_groups ? num_groups.value() : 1;
       CALL_INT4_KERNEL_WITH_KV_GROUPWISE_QUANT_CHECK(
@@ -1738,11 +1752,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gqa_attn_splitk(
 
 // TODO: can also fuse RoPe into this kernel. Doesn't seem worth it.
 __global__ void mqa_attn_kernel(
-    at::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> XQ,
-    at::PackedTensorAccessor64<at::BFloat16, 4, at::RestrictPtrTraits> cache_K,
-    at::PackedTensorAccessor64<at::BFloat16, 4, at::RestrictPtrTraits> cache_V,
-    at::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> O,
-    at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> seq_positions,
+    pta::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> XQ,
+    pta::PackedTensorAccessor64<at::BFloat16, 4, at::RestrictPtrTraits> cache_K,
+    pta::PackedTensorAccessor64<at::BFloat16, 4, at::RestrictPtrTraits> cache_V,
+    pta::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> O,
+    pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+        seq_positions,
     float qk_scale) {
   static_assert(kWarpsPerBlock <= kThreadsPerWarp, "");
 
@@ -1943,11 +1958,12 @@ __global__ void mqa_attn_kernel(
 
 #if CUDART_VERSION >= 12000
 __global__ void mqa_attn_fp8_kernel(
-    at::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> XQ,
-    at::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits> cache_K,
-    at::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits> cache_V,
-    at::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> O,
-    at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> seq_positions,
+    pta::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> XQ,
+    pta::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits> cache_K,
+    pta::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits> cache_V,
+    pta::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> O,
+    pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+        seq_positions,
     float qk_scale) {
   static_assert(kWarpsPerBlock <= kThreadsPerWarp, "");
 
@@ -2178,11 +2194,12 @@ __global__ void mqa_attn_fp8_kernel(
 // TODO: can also fuse RoPe into this kernel. Doesn't seem worth it.
 template <int KVQuantNumGroups = 1>
 __global__ void mqa_attn_int4_kernel(
-    at::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> XQ,
-    at::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits> cache_K,
-    at::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits> cache_V,
-    at::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> O,
-    at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> seq_positions,
+    pta::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> XQ,
+    pta::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits> cache_K,
+    pta::PackedTensorAccessor64<uint8_t, 4, at::RestrictPtrTraits> cache_V,
+    pta::PackedTensorAccessor32<at::BFloat16, 4, at::RestrictPtrTraits> O,
+    pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+        seq_positions,
     float qk_scale) {
   static_assert(kWarpsPerBlock <= kThreadsPerWarp, "");
 
@@ -2528,18 +2545,18 @@ at::Tensor mqa_attn(
     if (set_max_dynamic_smem) {
       set_gpu_max_dynamic_shared_memory(mqa_attn_kernel, smem, XQ.get_device());
     }
-    mqa_attn_kernel<<<
+    FBGEMM_LAUNCH_KERNEL(
+        (mqa_attn_kernel),
         blocks,
         threads,
         smem,
-        at::cuda::getCurrentCUDAStream()>>>(
-        XQ.packed_accessor32<at::BFloat16, 4, at::RestrictPtrTraits>(),
-        cache_K.packed_accessor64<at::BFloat16, 4, at::RestrictPtrTraits>(),
-        cache_V.packed_accessor64<at::BFloat16, 4, at::RestrictPtrTraits>(),
-        O.packed_accessor32<at::BFloat16, 4, at::RestrictPtrTraits>(),
-        seq_positions.packed_accessor32<int32_t, 1, at::RestrictPtrTraits>(),
+        at::cuda::getCurrentCUDAStream(),
+        PTA_B(XQ, at::BFloat16, 4, 32),
+        PTA_B(cache_K, at::BFloat16, 4, 64),
+        PTA_B(cache_V, at::BFloat16, 4, 64),
+        PTA_B(O, at::BFloat16, 4, 32),
+        PTA_B(seq_positions, int32_t, 1, 32),
         qk_scale);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
     if (cache_logical_dtype == CacheLogicalDtype::FP8) {
 #if (defined(CUDA_VERSION) && CUDA_VERSION >= 12000)
@@ -2547,35 +2564,39 @@ at::Tensor mqa_attn(
         set_gpu_max_dynamic_shared_memory(
             mqa_attn_fp8_kernel, smem, XQ.get_device());
       }
-      mqa_attn_fp8_kernel<<<
+      FBGEMM_LAUNCH_KERNEL(
+          (mqa_attn_fp8_kernel),
           blocks,
           threads,
           smem,
-          at::cuda::getCurrentCUDAStream()>>>(
-          XQ.packed_accessor32<at::BFloat16, 4, at::RestrictPtrTraits>(),
-          cache_K.packed_accessor64<uint8_t, 4, at::RestrictPtrTraits>(),
-          cache_V.packed_accessor64<uint8_t, 4, at::RestrictPtrTraits>(),
-          O.packed_accessor32<at::BFloat16, 4, at::RestrictPtrTraits>(),
-          seq_positions.packed_accessor32<int32_t, 1, at::RestrictPtrTraits>(),
+          at::cuda::getCurrentCUDAStream(),
+          PTA_B(XQ, at::BFloat16, 4, 32),
+          PTA_B(cache_K, uint8_t, 4, 64),
+          PTA_B(cache_V, uint8_t, 4, 64),
+          PTA_B(O, at::BFloat16, 4, 32),
+          PTA_B(seq_positions, int32_t, 1, 32),
           qk_scale);
 #else
       throw std::runtime_error("CUDA version is older than 12.0");
 #endif
     } else {
-#define CALL_MQA_ATTN_INT4_GROUPWISE_KERNEL(NUM_GROUPS, ...)              \
-  if (set_max_dynamic_smem) {                                             \
-    set_gpu_max_dynamic_shared_memory(                                    \
-        mqa_attn_int4_kernel<NUM_GROUPS>, smem, XQ.get_device());         \
-  }                                                                       \
-  mqa_attn_int4_kernel<NUM_GROUPS>                                        \
-      <<<blocks, threads, smem, at::cuda::getCurrentCUDAStream()>>>(      \
-          XQ.packed_accessor32<at::BFloat16, 4, at::RestrictPtrTraits>(), \
-          cache_K.packed_accessor64<uint8_t, 4, at::RestrictPtrTraits>(), \
-          cache_V.packed_accessor64<uint8_t, 4, at::RestrictPtrTraits>(), \
-          O.packed_accessor32<at::BFloat16, 4, at::RestrictPtrTraits>(),  \
-          seq_positions                                                   \
-              .packed_accessor32<int32_t, 1, at::RestrictPtrTraits>(),    \
-          qk_scale);
+#define CALL_MQA_ATTN_INT4_GROUPWISE_KERNEL(NUM_GROUPS, ...)      \
+  if (set_max_dynamic_smem) {                                     \
+    set_gpu_max_dynamic_shared_memory(                            \
+        mqa_attn_int4_kernel<NUM_GROUPS>, smem, XQ.get_device()); \
+  }                                                               \
+  FBGEMM_LAUNCH_KERNEL(                                           \
+      (mqa_attn_int4_kernel<NUM_GROUPS>),                         \
+      blocks,                                                     \
+      threads,                                                    \
+      smem,                                                       \
+      at::cuda::getCurrentCUDAStream(),                           \
+      PTA_B(XQ, at::BFloat16, 4, 32),                             \
+      PTA_B(cache_K, uint8_t, 4, 64),                             \
+      PTA_B(cache_V, uint8_t, 4, 64),                             \
+      PTA_B(O, at::BFloat16, 4, 32),                              \
+      PTA_B(seq_positions, int32_t, 1, 32),                       \
+      qk_scale);
 
       auto num_groups_ = num_groups ? num_groups.value() : 1;
       CALL_INT4_KERNEL_WITH_KV_GROUPWISE_QUANT_CHECK(

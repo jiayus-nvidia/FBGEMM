@@ -21,10 +21,9 @@
 #include <type_traits>
 
 #ifndef HAVE_SVE
-#if defined(__aarch64__) && __ARM_FEATURE_SVE
+#if defined(__aarch64__) && __ARM_FEATURE_SVE && \
+    __has_include(<arm_neon_sve_bridge.h>)
 #define HAVE_SVE 1
-#include <arm_neon_sve_bridge.h> // @manual
-#include <arm_sve.h>
 #else
 #define HAVE_SVE 0
 #endif
@@ -176,6 +175,11 @@ FBGEMM_API bool fbgemmHasAvx2Support();
  * @brief Are we running on a AVX512_VNNI supported cpu?
  */
 FBGEMM_API bool fbgemmHasAvx512VnniSupport();
+
+/**
+ * @brief Are we running on a AVX512_BF16 supported cpu?
+ */
+FBGEMM_API bool fbgemmHasAvx512Bf16Support();
 
 /**
  * @brief Are we running on a ARM Neon supported cpu?

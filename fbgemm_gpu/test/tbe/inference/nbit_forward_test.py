@@ -8,9 +8,10 @@
 # pyre-strict
 # pyre-ignore-all-errors[56]
 
+import os
 import random
 import unittest
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Union
 
 import hypothesis.strategies as st
 import numpy as np
@@ -51,7 +52,7 @@ VERBOSITY: Verbosity = Verbosity.verbose
 
 
 # pyre-ignore
-additional_decorators: Dict[str, List[Callable]] = {
+additional_decorators: dict[str, list[Callable]] = {
     "test_faketensor__test_nbit_forward_uvm_cache": [
         unittest.skip("CUDA Assert"),
     ],
@@ -123,6 +124,12 @@ additional_decorators: Dict[str, List[Callable]] = {
 
 @optests.generate_opcheck_tests(fast=True, additional_decorators=additional_decorators)
 class NBitFowardTest(NBitFowardTestCommon):
+    def _is_cpu_output_on_pinned_memory(self) -> bool:
+        return (
+            os.getenv("FBGEMM_TBE_CPU_OUTPUT_DISABLE_PINNED_MEMORY") != "1"
+            and torch.cuda.is_available()
+        )
+
     def execute_nbit_forward_fused_pooled_emb_quant_(
         self,
         T: int,
@@ -587,7 +594,7 @@ class NBitFowardTest(NBitFowardTestCommon):
     @settings(deadline=None)
     @unittest.skipIf(*gpu_unavailable)
     def test_nbit_forward_gpu_no_cache_max_sizes(
-        self, indices_dtype: torch.dtype, weights_ty_and_D: Tuple[SparseType, int]
+        self, indices_dtype: torch.dtype, weights_ty_and_D: tuple[SparseType, int]
     ) -> None:
         weights_ty, D = weights_ty_and_D
         self.execute_nbit_forward_(
@@ -876,7 +883,7 @@ class NBitFowardTest(NBitFowardTestCommon):
         quant_cc.fill_random_weights()
         raw_embedding_weights = quant_cc.split_embedding_weights()
         # we mimic 1.0 scale, 0.0 bias for better results comparison
-        embedding_weights: List[Tuple[torch.Tensor, Optional[torch.Tensor]]] = [
+        embedding_weights: list[tuple[torch.Tensor, Optional[torch.Tensor]]] = [
             (table_weight, torch.tensor([1, 0], dtype=torch.float16).view(torch.uint8))
             for table_weight, _ in raw_embedding_weights
         ]
@@ -898,6 +905,9 @@ class NBitFowardTest(NBitFowardTestCommon):
         lengths = torch.cat(lengths_list, 0)
         offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
         quant_cc_output = quant_cc(indices.int(), offsets.int())
+        self.assertEqual(
+            quant_cc_output.is_pinned(), self._is_cpu_output_on_pinned_memory()
+        )
         tables_rows = [
             T for T, _, _ in quant_cc.split_embedding_weights_with_scale_bias(0)
         ]

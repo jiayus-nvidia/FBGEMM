@@ -943,7 +943,7 @@ std::tuple<Tensor, Tensor, std::optional<Tensor>> permute_1D_sparse_data_cpu(
         FBGEMM_DISPATCH_ALL_TYPES(
             indices.scalar_type(), "permute_1D_indices_weights_kernel_2", [&] {
               using indices_t = scalar_t;
-              FBGEMM_DISPATCH_FLOAT_ONLY(
+              FBGEMM_DISPATCH_FLOAT_AND_DOUBLE(
                   weights.has_value() ? weights.value().scalar_type()
                                       : at::ScalarType::Float,
                   "permute_1D_indices_weights_kernel_3",
@@ -1386,9 +1386,9 @@ void _block_bucketize_sparse_features_2d_weights_cpu_kernel(
     const std::optional<Tensor>& total_num_blocks,
     const int64_t my_size,
     const int64_t weights_dim,
-    Tensor new_lengths,
-    Tensor new_indices,
-    Tensor new_weights,
+    const Tensor& new_lengths,
+    const Tensor& new_indices,
+    const Tensor& new_weights,
     std::optional<Tensor> new_pos,
     const std::optional<Tensor>& unbucketize_permute,
     const std::optional<Tensor>& batch_size_per_feature,
@@ -1417,8 +1417,8 @@ void _block_bucketize_sparse_features_2d_weights_cpu_kernel(
   const index_t* const block_sizes_data = block_sizes.data_ptr<index_t>();
   offset_t* batch_sizes_data = nullptr;
   const auto variable_batch_size = batch_size_per_feature.has_value();
-  const auto variable_bucket_sizes = block_bucketize_pos.has_value() &&
-      block_bucketize_pos.value().size() != 0;
+  const auto variable_bucket_sizes =
+      block_bucketize_pos.has_value() && !block_bucketize_pos.value().empty();
   using uindex_t = std::make_unsigned_t<index_t>;
   using uoffset_t = std::make_unsigned_t<offset_t>;
   std::vector<int64_t> lower_bounds(indices.numel(), 0);
@@ -2971,7 +2971,7 @@ std::tuple<Tensor, Tensor, std::optional<Tensor>> permute_sparse_features_cpu(
   permuted_indices = at::empty(permuted_lengths_sum, indices.options());
   AT_DISPATCH_INDEX_TYPES(
       input_offsets.scalar_type(), "permute_data_kernel_1", ([&] {
-        FBGEMM_DISPATCH_FLOAT_ONLY(
+        FBGEMM_DISPATCH_FLOAT_AND_DOUBLE(
             weights.has_value() ? weights.value().scalar_type()
                                 : at::ScalarType::Float,
             "permute_data_kernel_2",

@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 import triton  # @manual
@@ -275,7 +275,7 @@ def triton_quantize_mx4_unpack(
     mbits: int = 1,
     rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
     stochastic_casting: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to mx4 format using efficient triton kernels.
 
@@ -701,7 +701,7 @@ def triton_silu_quantize_mx4_unpack(
     mbits: int = 1,
     rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
     stochastic_casting: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to mx4 format using efficient triton kernels.
 
@@ -1126,7 +1126,7 @@ def triton_rms_quantize_mx4_unpack(
     rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
     stochastic_casting: bool = False,
     EPS: float = 1e-5,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to mx4 format using efficient triton kernels.
 
@@ -1240,6 +1240,55 @@ def triton_rms_quantize_mx4_unpack(
 
 
 @triton.jit
+def _fp32_to_e8m0(
+    unscale,
+    mbits: tl.constexpr,
+    scale_round_mode: tl.constexpr,
+):
+    E8M0_EXPONENT_BIAS: tl.constexpr = 127  # type: ignore[Incompatible variable type]
+    sign = tl.where(unscale < 0, -1.0, 1.0)
+    abs_tensor = tl.abs(unscale)
+
+    # MBITS_F32 = 23
+    if scale_round_mode == "even":
+        val_to_add = (1 << (23 - mbits - 1)) - 1
+    elif scale_round_mode == "ceil":
+        val_to_add = (1 << 23) - 1
+    else:
+        val_to_add = 0
+
+    mask_exponent = ((1 << (8 + 1)) - 1) << 23
+    mask_mantissa = (1 << 23) - 1
+
+    fp32_bits = tl.extra.cuda.libdevice.float_as_int(abs_tensor)
+    fp32_bits_exp = (fp32_bits + val_to_add) & mask_exponent
+    exponent = (fp32_bits_exp >> 23) & 0xFF
+
+    if scale_round_mode == "nv_round":
+        mantissa = fp32_bits & mask_mantissa
+        is_denormal = (exponent == 0) & (mantissa != 0)
+        is_normal = ~is_denormal
+        condition1 = is_normal & (exponent < 254) & (mantissa > 0)
+        condition2 = is_denormal & (mantissa / (2**23) > 0.5)
+
+        exponent = tl.where(condition1 | condition2, exponent + 1, exponent)
+
+    exponent = exponent.to(tl.float32)
+    e8m0_values = sign * tl.exp2(exponent - E8M0_EXPONENT_BIAS)
+
+    unscale = e8m0_values
+    # In case unscale=0 (scale will be inf), or unscale=inf or nan, we set the scale to 1.0
+    unscale_invalid_mask = (
+        (e8m0_values == 0)
+        | (e8m0_values == float("inf"))
+        | (e8m0_values == float("nan"))
+    )
+    unscale = tl.where(unscale_invalid_mask, 1.0, unscale)
+
+    return unscale
+
+
+@triton.jit
 def _kernel_nvfp4_quantize(
     A,
     input_global_scale_tensor,
@@ -1261,6 +1310,7 @@ def _kernel_nvfp4_quantize(
     GROUP_LOAD: tl.constexpr,
     USE_INT64: tl.constexpr,
     SCALE_K: tl.constexpr,
+    USE_E8M0_SCALE: tl.constexpr,
 ) -> None:
     """Quantize a 1D float tensor into a packed MX4 tensor.
 
@@ -1282,6 +1332,8 @@ def _kernel_nvfp4_quantize(
         FP4_EXP_BIAS (int): Exponent bias of target mx4 format.
         GROUP_LOAD (int): Number of groups to process simultaneously.
         USE_INT64 (bool): Whether to use int64 for indexing. This is needed for large tensors.
+        USE_E8M0_SCALE (bool): Whether to use E8M0 for quantization
+            (set to True when we want to mimic mx4's e8m0 scaling factor in nvfp4's fp8 local scale)
     """
     # Define Constant Expressions.
     BF16_MIN_NORMAL: tl.constexpr = 2 ** (-126)  # type: ignore[Incompatible variable type]
@@ -1347,13 +1399,19 @@ def _kernel_nvfp4_quantize(
         group_max = tl.max(tl.abs(a_groups), axis=1).to(tl.float32)
 
         # Next we scale A in preparation for quantization.
-        scale_ = group_max / 6.0 * input_global_scale
+        if USE_E8M0_SCALE:
+            scale_fp32 = group_max / 4.0 * input_global_scale
+            scale_fp32 = _fp32_to_e8m0(scale_fp32, mbits=1, scale_round_mode="even")
+        else:
+            scale_fp32 = group_max / 6.0 * input_global_scale
+        scale_ = scale_fp32.to(tl.float8e4nv)
         # Prevent infinite values in log.
         group_max = tl.where(group_max == 0, BF16_MIN_NORMAL, group_max)
 
         # Apply scale_ to input. We do this by broadcasting scale.
+        # scaled_a = a * global_scale (fp32) / local_scale (fp8)
         scaled_a = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE]) * tl.reshape(
-            6.0 / group_max, [GROUP_LOAD, 1]
+            input_global_scale / scale_, [GROUP_LOAD, 1]
         )
         # Reshape back to a flat array.
         scaled_a = tl.reshape(scaled_a, [GROUP_LOAD * GROUP_SIZE])
@@ -1417,7 +1475,7 @@ def _kernel_nvfp4_quantize(
         )
         tl.store(
             scale + actual_offset,
-            scale_.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+            scale_.to(tl.uint8, bitcast=True),
             # Prevent writing outside this chunk or the main array.
             mask=(exp_offset < SCALE_SIZE)
             & (exp_offset < (SCALE_CHUNK_SIZE * (pid + 1))),
@@ -1446,7 +1504,8 @@ def triton_scale_nvfp4_quant(
     rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
     stochastic_casting: bool = False,
     EPS: float = 1e-5,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    use_e8m0_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to nvfp4 format using efficient triton kernels.
 
@@ -1458,9 +1517,10 @@ def triton_scale_nvfp4_quant(
         rounding_mode (Union[RoundingMode, int]): Which type of rounding to use
         when calculating shared exponent. Defaults to pre-rounding to nearest even int.
         stochastic_casting (bool): Whether to use stochastic casting.
-
+        use_e8m0_scale (bool): Whether to use E8M0 for quantization
+            (set to True when we want to mimic mx4's e8m0 scaling factor in nvfp4's fp8 local scale)
     Returns:
-        torch.Tensor: [M / 2] nvfp4 scaled tensor packed into in8
+        torch.Tensor: [M / 2] nvfp4 scaled tensor packed into int8
         torch.Tensor: [M / group_size] nvfp4 shared exponents into int8
 
         eg.
@@ -1566,6 +1626,8 @@ def triton_scale_nvfp4_quant(
         USE_INT64=use_int64,
         # pyre-ignore[6]
         SCALE_K=rounded_K,
+        # pyre-ignore[6]
+        USE_E8M0_SCALE=use_e8m0_scale,
     )
 
     scale = scale.flatten()
@@ -1694,13 +1756,14 @@ def _kernel_nvfp4_quantize_silu(
         group_max = tl.max(tl.abs(a_groups), axis=1)
 
         # Next we scale A in preparation for quantization.
-        scale_ = group_max / 6.0 * input_global_scale
+        scale_ = (group_max / 6.0 * input_global_scale).to(tl.float8e4nv)
         # Prevent infinite values in log.
         group_max = tl.where(group_max == 0, BF16_MIN_NORMAL, group_max)
 
         # Apply scale_ to input. We do this by broadcasting scale.
+        # scaled_a = a * global_scale (fp32) / local_scale (fp8)
         scaled_a = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE]) * tl.reshape(
-            6.0 / group_max, [GROUP_LOAD, 1]
+            input_global_scale / scale_, [GROUP_LOAD, 1]
         )
         # Reshape back to a flat array.
         scaled_a = tl.reshape(scaled_a, [GROUP_LOAD * GROUP_SIZE])
@@ -1766,7 +1829,7 @@ def _kernel_nvfp4_quantize_silu(
         )
         tl.store(
             scale + actual_offset,
-            scale_.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+            scale_.to(tl.uint8, bitcast=True),
             # Prevent writing outside this chunk or the main array.
             mask=(exp_offset < SCALE_SIZE)
             & (exp_offset < (SCALE_CHUNK_SIZE * (pid + 1))),
@@ -1796,7 +1859,7 @@ def triton_scale_nvfp4_quant_silu(
     mbits: int = 1,
     rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
     stochastic_casting: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to nvfp4 format using efficient triton kernels.
 
@@ -2053,13 +2116,14 @@ def _kernel_nvfp4_quantize_rms(
         group_max = tl.max(tl.abs(a_groups), axis=1)
 
         # Next we scale A in preparation for quantization.
-        scale_ = group_max / 6.0 * input_global_scale
+        scale_ = (group_max / 6.0 * input_global_scale).to(tl.float8e4nv)
         # Prevent infinite values in log.
         group_max = tl.where(group_max == 0, BF16_MIN_NORMAL, group_max)
 
         # Apply scale_ to input. We do this by broadcasting scale.
+        # scaled_a = a * global_scale (fp32) / local_scale (fp8)
         scaled_a = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE]) * tl.reshape(
-            6.0 / group_max, [GROUP_LOAD, 1]
+            input_global_scale / scale_, [GROUP_LOAD, 1]
         )
         # Reshape back to a flat array.
         scaled_a = tl.reshape(scaled_a, [GROUP_LOAD * GROUP_SIZE])
@@ -2127,7 +2191,7 @@ def _kernel_nvfp4_quantize_rms(
         )
         tl.store(
             scale + actual_offset,
-            scale_.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+            scale_.to(tl.uint8, bitcast=True),
             # Prevent writing outside this chunk or the main array.
             mask=(exp_offset < SCALE_SIZE)
             & (exp_offset < (SCALE_CHUNK_SIZE * (pid + 1))),
@@ -2158,7 +2222,7 @@ def triton_scale_nvfp4_quant_rms(
     rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
     stochastic_casting: bool = False,
     EPS: float = 1e-5,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to nvfp4 format using efficient triton kernels.
 
@@ -2415,13 +2479,14 @@ def _kernel_nvfp4_quantize_stacked(
         group_max = tl.max(tl.abs(a_groups), axis=1).to(tl.float32)
 
         # Next we scale A in preparation for quantization.
-        scale_ = group_max / 6.0 * input_global_scale
+        scale_ = (group_max / 6.0 * input_global_scale).to(tl.float8e4nv)
         # Prevent infinite values in log.
         group_max = tl.where(group_max == 0, BF16_MIN_NORMAL, group_max)
 
         # Apply scale_ to input. We do this by broadcasting scale.
+        # scaled_a = a * global_scale (fp32) / local_scale (fp8)
         scaled_a = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE]) * tl.reshape(
-            6.0 / group_max, [GROUP_LOAD, 1]
+            input_global_scale / scale_, [GROUP_LOAD, 1]
         )
         # Reshape back to a flat array.
         scaled_a = tl.reshape(scaled_a, [GROUP_LOAD * GROUP_SIZE])
@@ -2489,7 +2554,7 @@ def _kernel_nvfp4_quantize_stacked(
 
         tl.store(
             scale + actual_scale_offset_permute,
-            scale_.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+            scale_.to(tl.uint8, bitcast=True),
             # Prevent writing outside this chunk or the main array.
             mask=(row_idx < M)
             & (exp_offset < (SCALE_CHUNK_SIZE * (pid + 1)))
@@ -2542,7 +2607,7 @@ def triton_nvfp4_quant_stacked(
     rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
     stochastic_casting: bool = False,
     EPS: float = 1e-5,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to nvfp4 format using efficient triton kernels.
 
@@ -3092,13 +3157,14 @@ def _kernel_nvfp4_quantize_stacked_silu(
         group_max = tl.max(tl.abs(a_groups), axis=1).to(tl.float32)
 
         # Next we scale A in preparation for quantization.
-        scale_ = group_max / 6.0 * input_global_scale
+        scale_ = (group_max / 6.0 * input_global_scale).to(tl.float8e4nv)
         # Prevent infinite values in log.
         group_max = tl.where(group_max == 0, BF16_MIN_NORMAL, group_max)
 
         # Apply scale_ to input. We do this by broadcasting scale.
+        # scaled_a = a * global_scale (fp32) / local_scale (fp8)
         scaled_a = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE]) * tl.reshape(
-            6.0 / group_max, [GROUP_LOAD, 1]
+            input_global_scale / scale_, [GROUP_LOAD, 1]
         )
         # Reshape back to a flat array.
         scaled_a = tl.reshape(scaled_a, [GROUP_LOAD * GROUP_SIZE])
@@ -3166,7 +3232,7 @@ def _kernel_nvfp4_quantize_stacked_silu(
 
         tl.store(
             scale + actual_scale_offset_permute,
-            scale_.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+            scale_.to(tl.uint8, bitcast=True),
             # Prevent writing outside this chunk or the main array.
             mask=(row_idx < M)
             & (exp_offset < (SCALE_CHUNK_SIZE * (pid + 1)))
@@ -3384,13 +3450,14 @@ def _mega_fp4_quantize_kernel(
             input_global_scale_tensor + tensor_idx, mask=tensor_idx_guard
         )
         # Next we scale A in preparation for quantization.
-        scale_ = group_max / 6.0 * input_global_scale
+        scale_ = (group_max / 6.0 * input_global_scale).to(tl.float8e4nv)
         # Prevent infinite values in log.
         group_max = tl.where(group_max == 0, BF16_MIN_NORMAL, group_max)
 
         # Apply scale_ to input. We do this by broadcasting scale.
+        # scaled_a = a * global_scale (fp32) / local_scale (fp8)
         scaled_a = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE]) * tl.reshape(
-            6.0 / group_max, [GROUP_LOAD, 1]
+            input_global_scale / scale_, [GROUP_LOAD, 1]
         )
         # Reshape back to a flat array.
         scaled_a = tl.reshape(scaled_a, [GROUP_LOAD * GROUP_SIZE])
@@ -3458,7 +3525,7 @@ def _mega_fp4_quantize_kernel(
 
         tl.store(
             scale + actual_scale_offset_permute,
-            scale_.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+            scale_.to(tl.uint8, bitcast=True),
             # Prevent writing outside this chunk or the main array.
             mask=(row_idx < M)
             & (exp_offset < (SCALE_CHUNK_SIZE * (pid + 1)))
@@ -3654,13 +3721,14 @@ def _mega_fp4_quantize_kernel_with_tensor_idx(
             input_global_scale_tensor + tensor_idx, mask=tensor_idx_guard
         )
         # Next we scale A in preparation for quantization.
-        scale_ = group_max / 6.0 * input_global_scale
+        scale_ = (group_max / 6.0 * input_global_scale).to(tl.float8e4nv)
         # Prevent infinite values in log.
         group_max = tl.where(group_max == 0, BF16_MIN_NORMAL, group_max)
 
         # Apply scale_ to input. We do this by broadcasting scale.
+        # scaled_a = a * global_scale (fp32) / local_scale (fp8)
         scaled_a = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE]) * tl.reshape(
-            6.0 / group_max, [GROUP_LOAD, 1]
+            input_global_scale / scale_, [GROUP_LOAD, 1]
         )
         # Reshape back to a flat array.
         scaled_a = tl.reshape(scaled_a, [GROUP_LOAD * GROUP_SIZE])
@@ -3728,7 +3796,7 @@ def _mega_fp4_quantize_kernel_with_tensor_idx(
 
         tl.store(
             scale + actual_scale_offset_permute,
-            scale_.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+            scale_.to(tl.uint8, bitcast=True),
             # Prevent writing outside this chunk or the main array.
             mask=(row_idx < M)
             & (exp_offset < (SCALE_CHUNK_SIZE * (pid + 1)))
@@ -3777,7 +3845,7 @@ def mega_fp4_quantize_kernel(
     rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
     stochastic_casting: bool = False,
     EPS: float = 1e-5,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     orig_shape = input.shape
     assert input.ndim >= 1, f"input.ndim needs to be >= 1, but got {input.ndim}."
@@ -3956,7 +4024,7 @@ def triton_nvfp4_quant_stacked_silu(
     rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
     stochastic_casting: bool = False,
     EPS: float = 1e-5,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to nvfp4 format using efficient triton kernels.
 
@@ -4238,13 +4306,14 @@ def _kernel_nvfp4_quantize_stacked_rms(
         group_max = tl.max(tl.abs(a_groups), axis=1).to(tl.float32)
 
         # Next we scale A in preparation for quantization.
-        scale_ = group_max / 6.0 * input_global_scale
+        scale_ = (group_max / 6.0 * input_global_scale).to(tl.float8e4nv)
         # Prevent infinite values in log.
         group_max = tl.where(group_max == 0, BF16_MIN_NORMAL, group_max)
 
         # Apply scale_ to input. We do this by broadcasting scale.
+        # scaled_a = a * global_scale (fp32) / local_scale (fp8)
         scaled_a = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE]) * tl.reshape(
-            6.0 / group_max, [GROUP_LOAD, 1]
+            input_global_scale / scale_, [GROUP_LOAD, 1]
         )
         # Reshape back to a flat array.
         scaled_a = tl.reshape(scaled_a, [GROUP_LOAD * GROUP_SIZE])
@@ -4312,7 +4381,7 @@ def _kernel_nvfp4_quantize_stacked_rms(
 
         tl.store(
             scale + actual_scale_offset_permute,
-            scale_.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+            scale_.to(tl.uint8, bitcast=True),
             # Prevent writing outside this chunk or the main array.
             mask=(row_idx < M)
             & (exp_offset < (SCALE_CHUNK_SIZE * (pid + 1)))
@@ -4366,7 +4435,7 @@ def triton_nvfp4_quant_stacked_rms(
     rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
     stochastic_casting: bool = False,
     EPS: float = 1e-5,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to nvfp4 format using efficient triton kernels.
 
@@ -4580,13 +4649,14 @@ def _mega_fp4_pack_kernel(
         group_max = tl.max(tl.abs(a_groups), axis=1).to(tl.float32)
 
         # Next we scale A in preparation for quantization.
-        scale_ = group_max / 6.0 * input_global_scale
+        scale_ = (group_max / 6.0 * input_global_scale).to(tl.float8e4nv)
         # Prevent infinite values in log.
         group_max = tl.where(group_max == 0, BF16_MIN_NORMAL, group_max)
 
         # Apply scale_ to input. We do this by broadcasting scale.
+        # scaled_a = a * global_scale (fp32) / local_scale (fp8)
         scaled_a = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE]) * tl.reshape(
-            6.0 / group_max, [GROUP_LOAD, 1]
+            input_global_scale / scale_, [GROUP_LOAD, 1]
         )
         # Reshape back to a flat array.
         scaled_a = tl.reshape(scaled_a, [GROUP_LOAD * GROUP_SIZE])
@@ -4638,7 +4708,7 @@ def _mega_fp4_pack_kernel(
 
         tl.store(
             out + exp_offset,
-            scale_.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+            scale_.to(tl.uint8, bitcast=True),
             # Prevent writing outside this chunk or the main array.
             mask=(exp_offset < (SCALE_CHUNK_SIZE * (pid + 1) + SCALE_SHIFT))
             & (exp_offset < SCALE_SIZE + SCALE_SHIFT),
@@ -4792,13 +4862,14 @@ def _mega_fp4_pack_kernel_per_tensor(
             input_global_scale_tensor + tensor_idx, mask=tensor_idx_guard
         )
         # Next we scale A in preparation for quantization.
-        scale_ = group_max / 6.0 * input_global_scale
+        scale_ = (group_max / 6.0 * input_global_scale).to(tl.float8e4nv)
         # Prevent infinite values in log.
         group_max = tl.where(group_max == 0, BF16_MIN_NORMAL, group_max)
 
         # Apply scale_ to input. We do this by broadcasting scale.
+        # scaled_a = a * global_scale (fp32) / local_scale (fp8)
         scaled_a = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE]) * tl.reshape(
-            6.0 / group_max, [GROUP_LOAD, 1]
+            input_global_scale / scale_, [GROUP_LOAD, 1]
         )
         # Reshape back to a flat array.
         scaled_a = tl.reshape(scaled_a, [GROUP_LOAD * GROUP_SIZE])
@@ -4850,7 +4921,7 @@ def _mega_fp4_pack_kernel_per_tensor(
 
         tl.store(
             out + exp_offset,
-            scale_.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+            scale_.to(tl.uint8, bitcast=True),
             # Prevent writing outside this chunk or the main array.
             mask=(exp_offset < (SCALE_CHUNK_SIZE * (pid + 1) + SCALE_SHIFT))
             & (exp_offset < (SCALE_SIZE + SCALE_SHIFT)),
@@ -5212,7 +5283,7 @@ def mega_fp4_unpack(
     m_sizes: torch.Tensor,
     input: torch.Tensor,
     group_size: int = 16,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     orig_shape = input.shape
     assert input.ndim >= 1, f"input.ndim needs to be >= 1, but got {input.ndim}."
@@ -5457,7 +5528,7 @@ def _calculate_group_max(
 def calculate_group_max(
     input: torch.Tensor,
     m_sizes: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
 
     assert input.ndim >= 1, f"input.ndim needs to be >= 1, but got {input.ndim}."
     other_dims = 1 if input.ndim == 1 else -1
@@ -5530,3 +5601,53 @@ def calculate_group_max(
         USE_INT64=use_int64,
     )
     return out, tensor_idx
+
+
+def get_nvfp4_global_scales_naive(
+    xs: list[torch.Tensor], ws: list[torch.Tensor]
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    """
+    Get global scales for each tensor in xs and ws.
+    This is done "naively" (not efficiently with a kernel). This function is used in unit tests or debugging.
+    """
+    global_scales = []
+    x_global_scales = []
+    w_global_scales = []
+
+    for x, w in zip(xs, ws):
+        # pyre-ignore
+        x_global_scale: torch.Tensor = (448.0 * 6.0) / torch.amax(
+            torch.abs(x.flatten()), dim=-1
+        ).to(torch.float32)
+        # pyre-ignore
+        w_global_scale: torch.Tensor = (448.0 * 6.0) / torch.amax(
+            torch.abs(w.flatten()), dim=-1
+        ).to(torch.float32)
+        # pyre-ignore
+        global_scale: torch.Tensor = 1 / (x_global_scale * w_global_scale)
+
+        global_scales.append(global_scale)
+        x_global_scales.append(x_global_scale)
+        w_global_scales.append(w_global_scale)
+
+    return global_scales, x_global_scales, w_global_scales
+
+
+def quantize_nvfp4_naive(
+    xs: list[torch.Tensor], global_scales: list[torch.Tensor]
+) -> tuple[
+    list[torch.Tensor],
+    list[torch.Tensor],
+]:
+    """
+    Quantize A to NVFP4 format.
+    This is done "naively" using a kernel for each group. This function is largely used in unit tests or debugging.
+    """
+    xqs, x_scales = zip(
+        *(
+            triton_scale_nvfp4_quant(x, global_scale)
+            for x, global_scale in zip(xs, global_scales)
+        )
+    )
+
+    return xqs, x_scales
