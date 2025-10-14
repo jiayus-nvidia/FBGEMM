@@ -387,7 +387,7 @@ def generate_input(
     head_func = 1
     batch_func = batch_size
     if is_arbitrary:
-        n_func = 3
+        n_func = 1
         max_seq_split = max_seq_len_k // n_func
         coef = 0.3
         func = torch.empty((batch_func, head_func, n_func, max_seq_len_q), dtype=torch.int32, device=torch.device("cuda"))

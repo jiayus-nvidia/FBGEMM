@@ -45,7 +45,7 @@ def hstu_attn_varlen_func(
 cd fbgemm_gpu/
 
 # Install HSTU-Ampere
-export HSTU_DISABLE_BACKWARD=TRUE; \
+export HSTU_DISABLE_BACKWARD=FLASE; \
 export HSTU_DISABLE_LOCAL=FALSE; \
 export HSTU_DISABLE_CAUSAL=FALSE; \
 export HSTU_DISABLE_CONTEXT=FALSE; \
