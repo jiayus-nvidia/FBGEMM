@@ -11,7 +11,7 @@ import logging
 import math
 import os
 import unittest
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
