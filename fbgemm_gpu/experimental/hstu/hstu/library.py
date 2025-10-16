@@ -30,23 +30,29 @@ if (
     and torch.version.cuda >= "12.4"
 ):
     if open_source:
-        torch.ops.load_library(
-            os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
-        )
-        torch.classes.load_library(
-            os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
-        )
-    else:
-        torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_gpu")
-
-        torch.ops.load_library(
-            "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm80"
-        )
-
-        if torch.cuda.get_device_capability() >= (9, 0):
+        if torch.cuda.get_device_capability() < (10, 0):
             torch.ops.load_library(
-                "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm90"
+                os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
             )
+            torch.classes.load_library(
+                os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
+            )
+        else:
+            from .src.hstu_blackwell import hstu_ops_gpu_sm100
+    else:
+        if torch.cuda.get_device_capability() < (10, 0):
+            torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_gpu")
+
+            torch.ops.load_library(
+                "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm80"
+            )
+
+            if torch.cuda.get_device_capability() >= (9, 0):
+                torch.ops.load_library(
+                    "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm90"
+                )
+        else:
+            from .src.hstu_blackwell import hstu_ops_gpu_sm100
 
 else:
     logging.warning("CUDA is not available for FBGEMM HSTU")

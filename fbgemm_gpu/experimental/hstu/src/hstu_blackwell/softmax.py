@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
-import flash_attn.cute.utils as utils
+import fbgemm_gpu.experimental.hstu.src.hstu_blackwell.utils as utils
 
 
 class Softmax:
@@ -276,7 +276,7 @@ class SoftmaxSm100(Softmax):
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )
-                        
+
     @cute.jit
     def scale_apply_exp2_convert(
         self,

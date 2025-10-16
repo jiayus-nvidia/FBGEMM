@@ -32,28 +32,28 @@ class SeqlenInfoQK:
         batch_idx: cutlass.Int32,
         seqlen_q_static: cutlass.Int32,
         seqlen_k_static: cutlass.Int32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
+        cu_seqlens_q: Optional[cute.Tensor] = None,
+        cu_seqlens_k: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
     ):
-        self.offset_q = 0 if cutlass.const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
-        self.offset_k = 0 if cutlass.const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
+        self.offset_q = 0 if cutlass.const_expr(cu_seqlens_q is None) else cu_seqlens_q[batch_idx]
+        self.offset_k = 0 if cutlass.const_expr(cu_seqlens_k is None) else cu_seqlens_k[batch_idx]
         if cutlass.const_expr(mSeqUsedQ is not None):
             self.seqlen_q = mSeqUsedQ[batch_idx]
         else:
             self.seqlen_q = (
                 seqlen_q_static
-                if cutlass.const_expr(mCuSeqlensQ is None)
-                else mCuSeqlensQ[batch_idx + 1] - self.offset_q
+                if cutlass.const_expr(cu_seqlens_q is None)
+                else cu_seqlens_q[batch_idx + 1] - self.offset_q
             )
         if cutlass.const_expr(mSeqUsedK is not None):
             self.seqlen_k = mSeqUsedK[batch_idx]
         else:
             self.seqlen_k = (
                 seqlen_k_static
-                if cutlass.const_expr(mCuSeqlensK is None)
-                else mCuSeqlensK[batch_idx + 1] - self.offset_k
+                if cutlass.const_expr(cu_seqlens_k is None)
+                else cu_seqlens_k[batch_idx + 1] - self.offset_k
             )
-        self.has_cu_seqlens_q: int = mCuSeqlensQ is not None
-        self.has_cu_seqlens_k: int = mCuSeqlensK is not None
+        self.has_cu_seqlens_q: int = cu_seqlens_q is not None
+        self.has_cu_seqlens_k: int = cu_seqlens_k is not None

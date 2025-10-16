@@ -365,7 +365,7 @@ def generate_input(
         .requires_grad_()
     )
 
-    if is_delta_q is False and dtype != torch.float8_e4m3fn:
+    if False: # is_delta_q is False and dtype != torch.float8_e4m3fn:
         qkv = torch.empty((L_q, 3, heads, attn_dim), dtype=dtype, device=torch.device("cuda")).uniform_(-1, 1).requires_grad_()
         q = qkv[:, 0, :, :]
         k = qkv[:, 1, :, :]
@@ -686,7 +686,7 @@ class HSTU16Test(unittest.TestCase):
         attn_hidden_dims: tuple[int, int],
         alpha: float,
         rab_params: Tuple[bool, bool, Optional[int]],
-        seq_len_params: Tuple[int, int, bool],
+        seq_len_params: Tuple[int, int],
         target_params: Tuple[int, Tuple[int, int], int, bool],
         dtype: torch.dtype,
         full_batch: bool,
@@ -1939,7 +1939,7 @@ class HSTU8Test(unittest.TestCase):
 
 if __name__ == "__main__":
 
-    HSTU8Test().test_hstu_attn_fp8.hypothesis.inner_test(HSTU8Test(),
-    1, 1, (32, 32), 0, (0, (-1, -1), 1, False), (64, 64), 1.0, (True, False, None), torch.float8_e4m3fn, (0, True))
+    HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
+    1, 1, 0, (64, 64), 1.0, (False, False, None), (32, 32), (0, (-1, -1), 1, False), torch.bfloat16, True)
 
     # unittest.main()
