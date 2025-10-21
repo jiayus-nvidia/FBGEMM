@@ -1692,33 +1692,27 @@ class HSTUAttentionBackwardSm100:
                 trailing_residual_masking, 0
             )
 
-            is_masked_tile = (
-                leading_causal_masking
-                or trailing_residual_masking
-            )
-
             # Compute P = silu(S)
             cute.copy(tiled_t2r, tTR_tST, tTR_rST)
             cute.copy(tiled_t2r, tTR_tST, tTR_rST_silu)
 
-            if is_masked_tile:
-                for i in cutlass.range(cute.size(tTR_rST), unroll_full=True):
-                    c_transpose = tTR_cST[i]
-                    pos = (
-                        cute.get(c_transpose, mode=[1])
-                        + iter_index * self.tile_shape_Q,
-                        cute.get(c_transpose, mode=[0])
-                        + blk_coord_k * self.tile_shape_K,
-                    )
-                    if cutlass.const_expr(self.is_causal):
-                        if pos[0] < pos[1] or not cute.elem_less(pos, (Q, K)):
-                            tTR_rST[i] = -cutlass.Float32.inf
-                    if self.mask_type != MaskType.NO_MASK and not cute.elem_less(
-                        pos, (Q, K)
-                    ):
+            for i in cutlass.range(cute.size(tTR_rST), unroll_full=True):
+                c_transpose = tTR_cST[i]
+                pos = (
+                    cute.get(c_transpose, mode=[1])
+                    + iter_index * self.tile_shape_Q,
+                    cute.get(c_transpose, mode=[0])
+                    + blk_coord_k * self.tile_shape_K,
+                )
+                if cutlass.const_expr(self.is_causal):
+                    if pos[0] < pos[1] or not cute.elem_less(pos, (Q, K)):
                         tTR_rST[i] = -cutlass.Float32.inf
+                if not cute.elem_less(
+                    pos, (Q, K)
+                ):
+                    tTR_rST[i] = -cutlass.Float32.inf
 
-            for i in cutlass.range(0, cute.size(tTR_rST), 2, unroll_full=True):
+            for i in cutlass.range(0, cute.size(tTR_rST), unroll_full=True):
                 sigmoid_v = 0.5 * cute.math.tanh(tTR_rST[i] * 0.5) + 0.5
                 out = tTR_rST[i] * sigmoid_v
                 temp = sigmoid_v * (1 + tTR_rST[i] * (1 - sigmoid_v))
@@ -1758,7 +1752,7 @@ class HSTUAttentionBackwardSm100:
             # Compute dS = dsilu(S, dP)
             cute.copy(tiled_t2r, tTR_tdPT, tTR_rdPT)
 
-            for i in cutlass.range(0, cute.size(tTR_rdPT), 2, unroll_full=True):
+            for i in cutlass.range(0, cute.size(tTR_rdPT), unroll_full=True):
                 tTR_rdPT[i] = tTR_rST[i] * tTR_rdPT[i]
 
             # convert fp32 dS to fp16 dS which will be used in the computation of dK and DQ
@@ -2526,7 +2520,7 @@ def run(
     )
 
     q_ref, q_tensor, q_torch = create_and_permute_tensor(
-        (b, h_k, h_r, s_q, d), (3, 4, 2, 1, 0), element_dtype, min_val=1, max_val=1, is_dynamic_layout=True
+        (b, h_k, h_r, s_q, d), (3, 4, 2, 1, 0), element_dtype, is_dynamic_layout=True
     )
     dq_ref, dq_tensor, dq_torch = create_and_permute_tensor(
         (b, h_k, h_r, s_q, d),
@@ -2536,7 +2530,7 @@ def run(
         zero_out=True,
     )
     k_ref, k_tensor, k_torch = create_and_permute_tensor(
-        (b, h_k, 1, s_k, d), (3, 4, 2, 1, 0), element_dtype, min_val=1, max_val=1, is_dynamic_layout=True
+        (b, h_k, 1, s_k, d), (3, 4, 2, 1, 0), element_dtype, is_dynamic_layout=True
     )
     dk_ref, dk_tensor, dk_torch = create_and_permute_tensor(
         (b, h_k, 1, s_k, d),
@@ -2696,9 +2690,6 @@ def run(
             window_size_right,
             upcast=False,
         )
-
-        # print(f"dq_ref: {dq_ref.permute(4, 3, 2, 1, 0)}")
-        # print(f"dq: {dq.permute(4, 3, 2, 1, 0)}")
 
         rtol = 2
         dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item()
@@ -2964,14 +2955,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--h_q",
         type=int,
-        default=2,
+        default=1,
         help="number of heads of Q",
     )
 
     parser.add_argument(
         "--h_k",
         type=int,
-        default=2,
+        default=1,
         help="number of heads of K",
     )
 
