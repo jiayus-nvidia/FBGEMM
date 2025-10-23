@@ -59,6 +59,8 @@ def hstu_varlen_fwd_100(
             head_dim=head_dim,
             kBlockM=kBlockM,
             kBlockN=kBlockN,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
         )
         hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(hstu_fwd_sm100, q_tensor, k_tensor, v_tensor, o_tensor, None, 1.0, current_stream, cu_seqlens_q_tensor, cu_seqlens_k_tensor)
 
