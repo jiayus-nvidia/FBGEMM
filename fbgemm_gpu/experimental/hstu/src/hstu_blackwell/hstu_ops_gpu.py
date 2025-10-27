@@ -36,13 +36,13 @@ def hstu_varlen_fwd_100(
     rab: torch.Tensor,
     func: torch.Tensor,
 ):
-    # asserts
-
     head_dim = q.shape[2]
-    kBlockM = 128
-    kBlockN = 128
+    head_dim_v = v.shape[2]
+    assert head_dim == head_dim_v, "head_dim and head_dim_v must be equal"
+    kBlockM = 128 
+    kBlockN = 128 
+    
     out = torch.empty_like(q)
-
     q_tensor, k_tensor, v_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (q, k, v, out)
@@ -52,28 +52,18 @@ def hstu_varlen_fwd_100(
         for t in (cu_seqlens_q, cu_seqlens_k)
     ]
     current_stream = cutlass_torch.default_stream()
-    compile_key = (head_dim, kBlockM, kBlockN)
+    compile_key = (head_dim, kBlockM, kBlockN, num_contexts, num_targets, target_group_size, window_size_left, window_size_right, rab, func)
 
     if compile_key not in hstu_varlen_fwd_100.compile_cache:
         hstu_fwd_sm100 = HSTUAttentionForwardSm100(
             head_dim=head_dim,
             kBlockM=kBlockM,
             kBlockN=kBlockN,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
         )
-        hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(hstu_fwd_sm100, q_tensor, k_tensor, v_tensor, o_tensor, current_stream, 1.0, cu_seqlens_q_tensor, cu_seqlens_k_tensor)
+        hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(hstu_fwd_sm100, q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, alpha, current_stream)
 
-    hstu_varlen_fwd_100.compile_cache[compile_key](
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        o_tensor,
-        current_stream,
-        1.0,
-        cu_seqlens_q_tensor,
-        cu_seqlens_k_tensor,
-    )
+    hstu_varlen_fwd_100.compile_cache[compile_key](q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, alpha, current_stream)
+    
     return out, None
 
 hstu_varlen_fwd_100.compile_cache = {}

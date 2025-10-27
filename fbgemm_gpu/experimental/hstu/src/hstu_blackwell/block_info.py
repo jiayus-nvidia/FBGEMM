@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 
-from .seqlen_info import SeqlenInfoQK
+from .seqlen_info import SeqlenInfo
 
 
 @dataclass(frozen=True)
@@ -20,7 +20,7 @@ class BlockInfo:
 
     @cute.jit
     def get_n_block_min_max(
-        self, seqlen_info: SeqlenInfoQK, m_block: cutlass.Int32
+        self, seqlen_info: SeqlenInfo, m_block: cutlass.Int32
     ) -> Tuple[cutlass.Int32, cutlass.Int32]:
         n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.n_block_size)
         if cutlass.const_expr(
@@ -44,7 +44,7 @@ class BlockInfo:
 
     @cute.jit
     def get_m_block_min_max(
-        self, seqlen_info: SeqlenInfoQK, m_block: cutlass.Int32
+        self, seqlen_info: SeqlenInfo, m_block: cutlass.Int32
     ) -> Tuple[cutlass.Int32, cutlass.Int32]:
         m_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.m_block_size)
 
@@ -57,7 +57,7 @@ class BlockInfo:
     @cute.jit
     def get_n_block_min_causal_local_mask(
         self,
-        seqlen_info: SeqlenInfoQK,
+        seqlen_info: SeqlenInfo,
         m_block: cutlass.Int32,
         n_block_min: cutlass.Int32,
     ) -> cutlass.Int32:
@@ -76,7 +76,7 @@ class BlockInfo:
     @cute.jit
     def get_n_block_min_before_local_mask(
         self,
-        seqlen_info: SeqlenInfoQK,
+        seqlen_info: SeqlenInfo,
         m_block: cutlass.Int32,
         n_block_min: cutlass.Int32,
     ) -> cutlass.Int32:

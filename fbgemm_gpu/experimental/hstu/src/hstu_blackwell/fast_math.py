@@ -8,7 +8,7 @@ from cutlass import Int32, Uint32, Float32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-import fbgemm_gpu.experimental.hstu.src.hstu_blackwell.utils as utils
+from .utils import tanhf
 
 @cute.jit
 def clz(x: Int32) -> Int32:
@@ -121,8 +121,8 @@ class FastSilU:
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 v0 = acc_S_row_frg[k, j] * self.score_scale * 0.5
                 v1 = acc_S_row_frg[k + 1, j] * self.score_scale * 0.5
-                tanh_v0 = utils.tanhf(v0)
-                tanh_v1 = utils.tanhf(v1)
+                tanh_v0 = tanhf(v0)
+                tanh_v1 = tanhf(v1)
                 out_v0 = v0 * tanh_v0 + v0
                 out_v1 = v1 * tanh_v1 + v1
                 acc_S_row_frg[k, j] = out_v0 if v0 > -10.0 else 0.0

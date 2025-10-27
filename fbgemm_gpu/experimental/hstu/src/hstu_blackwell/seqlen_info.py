@@ -13,47 +13,16 @@ class SeqlenInfo:
     def __init__(
         self,
         batch_idx: cutlass.Int32,
-        seqlen_static: cutlass.Int32,
-        cu_seqlens: Optional[cute.Tensor] = None,
-        seqused: Optional[cute.Tensor] = None,
-    ):
-        self.offset = 0 if cutlass.const_expr(cu_seqlens is None) else cu_seqlens[batch_idx]
-        if cutlass.const_expr(seqused is not None):
-            self.seqlen = seqused[batch_idx]
-        elif cutlass.const_expr(cu_seqlens is not None):
-            self.seqlen = cu_seqlens[batch_idx + 1] - cu_seqlens[batch_idx]
-        else:
-            self.seqlen = seqlen_static
-
-
-class SeqlenInfoQK:
-    def __init__(
-        self,
-        batch_idx: cutlass.Int32,
-        seqlen_q_static: cutlass.Int32,
-        seqlen_k_static: cutlass.Int32,
+        max_seqlen_q: cutlass.Int32,
+        max_seqlen_k: cutlass.Int32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
     ):
-        self.offset_q = 0 if cutlass.const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
-        self.offset_k = 0 if cutlass.const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
-        if cutlass.const_expr(mSeqUsedQ is not None):
-            self.seqlen_q = mSeqUsedQ[batch_idx]
-        else:
-            self.seqlen_q = (
-                seqlen_q_static
-                if cutlass.const_expr(mCuSeqlensQ is None)
-                else mCuSeqlensQ[batch_idx + 1] - self.offset_q
-            )
-        if cutlass.const_expr(mSeqUsedK is not None):
-            self.seqlen_k = mSeqUsedK[batch_idx]
-        else:
-            self.seqlen_k = (
-                seqlen_k_static
-                if cutlass.const_expr(mCuSeqlensK is None)
-                else mCuSeqlensK[batch_idx + 1] - self.offset_k
-            )
-        self.has_cu_seqlens_q: int = mCuSeqlensQ is not None
-        self.has_cu_seqlens_k: int = mCuSeqlensK is not None
+        assert mCuSeqlensQ is not None and mCuSeqlensK is not None
+        self.offset_q = mCuSeqlensQ[batch_idx]
+        self.offset_k = mCuSeqlensK[batch_idx]
+        self.seqlen_q = mCuSeqlensQ[batch_idx + 1] - self.offset_q
+        self.seqlen_k = mCuSeqlensK[batch_idx + 1] - self.offset_k
+
+        self.max_seqlen_q = max_seqlen_q
+        self.max_seqlen_k = max_seqlen_k
