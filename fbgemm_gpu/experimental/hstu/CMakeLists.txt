@@ -133,12 +133,12 @@ if("9.0" IN_LIST TORCH_CUDA_ARCH_LIST OR "9.0a" IN_LIST TORCH_CUDA_ARCH_LIST)
 endif()
 
 # Check if any sources were selected
-# if(NOT hstu_cpp_source_files AND NOT hstu_cpp_source_files_gpu)
-#   message(WARNING "HSTU: Neither Ampere (8.0) nor Hopper (9.0) architectures found in TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}, would compile both")
-#   list(APPEND hstu_cpp_source_files ${hstu_ampere_cpp_source_files} ${hstu_hopper_cpp_source_files})
-#   list(APPEND hstu_cuda_source_files ${hstu_ampere_cuda_source_files} ${hstu_hopper_cuda_source_files})
-#   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_80,code=sm_80 -gencode arch=compute_90a,code=sm_90a")
-# endif()
+if(NOT hstu_cpp_source_files AND NOT hstu_cpp_source_files_gpu AND NOT "10.0" IN_LIST TORCH_CUDA_ARCH_LIST)
+  message(WARNING "HSTU: Neither Ampere (8.0) nor Hopper (9.0) architectures found in TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}, would compile both")
+  list(APPEND hstu_cpp_source_files ${hstu_ampere_cpp_source_files} ${hstu_hopper_cpp_source_files})
+  list(APPEND hstu_cuda_source_files ${hstu_ampere_cuda_source_files} ${hstu_hopper_cuda_source_files})
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_80,code=sm_80 -gencode arch=compute_90a,code=sm_90a")
+endif()
 
 # Add specific NVCC flags for HSTU compilation
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math ${HSTU_CUDA_FLAGS}")
@@ -148,7 +148,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${HSTU_CUDA_FLAGS}")
 # Build Shared Library
 ################################################################################
 
-if(hstu_cpp_source_files AND hstu_cpp_source_files_gpu)
+if(hstu_cpp_source_files OR hstu_cpp_source_files_gpu)
   gpu_cpp_library(
     PREFIX
       fbgemm_gpu_experimental_hstu
@@ -174,12 +174,14 @@ if(hstu_cpp_source_files AND hstu_cpp_source_files_gpu)
   install(
     DIRECTORY hstu
     DESTINATION fbgemm_gpu/experimental)
-else()
+endif()
+
+if("10.0" IN_LIST TORCH_CUDA_ARCH_LIST)
   install(
     DIRECTORY hstu
     DESTINATION fbgemm_gpu/experimental)
 
   install(
     DIRECTORY src/hstu_blackwell
-    DESTINATION fbgemm_gpu/experimental/hstu/src)
+    DESTINATION fbgemm_gpu/experimental/hstu)
 endif()

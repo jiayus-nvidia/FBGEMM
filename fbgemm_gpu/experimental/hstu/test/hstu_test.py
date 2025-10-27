@@ -16,7 +16,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from fbgemm_gpu.experimental.hstu import hstu_attn_varlen_func, hstu_attn_qkvpacked_func, quantize_for_two_directions, quantize_for_block_scale, get_bm_and_bn_block_size_fwd, get_bm_and_bn_block_size_bwd, quantize_for_head_batch_tensor
+# from fbgemm_gpu.experimental.hstu import hstu_attn_varlen_func, hstu_attn_qkvpacked_func, quantize_for_two_directions, quantize_for_block_scale, get_bm_and_bn_block_size_fwd, get_bm_and_bn_block_size_bwd, quantize_for_head_batch_tensor
+from fbgemm_gpu.experimental.hstu.hstu import hstu_attn_varlen_func, hstu_attn_qkvpacked_func, quantize_for_two_directions, quantize_for_block_scale, get_bm_and_bn_block_size_fwd, get_bm_and_bn_block_size_bwd, quantize_for_head_batch_tensor
 
 from hypothesis import given, settings, strategies as st, Verbosity
 
@@ -821,10 +822,10 @@ class HSTU16Test(unittest.TestCase):
                 func=func,
             )
 
-        # print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
-        # print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
-        # print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
-        # print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
+        print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
+        print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
+        print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
+        print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
 
         assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
 
@@ -872,15 +873,15 @@ class HSTU16Test(unittest.TestCase):
                 dk_hstu = dqkv_hstu[:, 1, :, :]
                 dv_hstu = dqkv_hstu[:, 2, :, :]
 
-        # print(f"dV max diff: {(dv_hstu - dv_ref).abs().max().item()}")
-        # print(f"dV Pytorch max diff: {(dv_torch - dv_ref).abs().max().item()}")
-        # print(f"dK max diff: {(dk_hstu - dk_ref).abs().max().item()}")
-        # print(f"dK Pytorch max diff: {(dk_torch - dk_ref).abs().max().item()}")
-        # print(f"dQ max diff: {(dq_hstu - dq_ref).abs().max().item()}")
-        # print(f"dQ Pytorch max diff: {(dq_torch - dq_ref).abs().max().item()}")
-        # if has_drab:
-        #     print(f"dRab max diff: {(drab_hstu - drab_ref).abs().max().item()}")
-        #     print(f"dRab Pytorch max diff: {(drab_torch - drab_ref).abs().max().item()}")
+        print(f"dV max diff: {(dv_hstu - dv_ref).abs().max().item()}")
+        print(f"dV Pytorch max diff: {(dv_torch - dv_ref).abs().max().item()}")
+        print(f"dK max diff: {(dk_hstu - dk_ref).abs().max().item()}")
+        print(f"dK Pytorch max diff: {(dk_torch - dk_ref).abs().max().item()}")
+        print(f"dQ max diff: {(dq_hstu - dq_ref).abs().max().item()}")
+        print(f"dQ Pytorch max diff: {(dq_torch - dq_ref).abs().max().item()}")
+        if has_drab:
+            print(f"dRab max diff: {(drab_hstu - drab_ref).abs().max().item()}")
+            print(f"dRab Pytorch max diff: {(drab_torch - drab_ref).abs().max().item()}")
 
         assert (dv_hstu - dv_ref).abs().max().item() <= 5 * (  # pyre-ignore[58]
             dv_torch - dv_ref
@@ -1940,6 +1941,6 @@ class HSTU8Test(unittest.TestCase):
 if __name__ == "__main__":
 
     HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
-    1, 1, 0, (64, 64), 1.0, (False, False, None), (32, 32), (0, (-1, -1), 1, False), torch.bfloat16, True)
+    1, 2, 0, (64, 64), 1.0, (False, False, None), (32, 32), (0, (-1, -1), 1, False), torch.bfloat16, True)
 
     # unittest.main()

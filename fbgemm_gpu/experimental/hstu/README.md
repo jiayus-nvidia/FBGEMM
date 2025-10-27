@@ -106,6 +106,9 @@ export HSTU_DISABLE_DETERMINISTIC=TRUE; \
 export HSTU_DISABLE_86OR89=TRUE; \
 python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="8.0 9.0"
 
+# Install HSTU-Blackwell
+python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="10.0"
+
 # If you don't add -DTORCH_CUDA_ARCH_LIST, the default is "8.0 9.0".
 ```
 

@@ -96,56 +96,54 @@ class HSTUAttentionBackwardSm100:
     def __init__(
         self,
         element_dtype: Type[cutlass.Numeric],
-        acc_dtype: Type[cutlass.Numeric],
-        mma_tiler: Tuple[int, int, int],
-        varlen: bool,
-        mask_type: MaskType,
+        head_dim: int,
+        kBlockM: int,
+        kBlockN: int,
+        is_causal: bool = False,
     ):
         self.element_dtype = element_dtype
-        self.acc_dtype = acc_dtype
+        self.acc_dtype = Float32
         self.cta_tiler = (
-            mma_tiler[0],
-            mma_tiler[1],
-            mma_tiler[2],
+            kBlockM,
+            kBlockN,
+            head_dim,
         )
-        self.tile_shape_Q = mma_tiler[0]
-        self.tile_shape_K = mma_tiler[1]
-        self.tile_shape_dQ_K = mma_tiler[2]
-        self.tile_shape_dV_dO = mma_tiler[2]
+        self.tile_shape_Q = kBlockM
+        self.tile_shape_K = kBlockN
+        self.tile_shape_dQ_K = head_dim
+        self.tile_shape_dV_dO = head_dim
         # For S
         self.KQ_mma_tiler = (
-            mma_tiler[1],
-            mma_tiler[0],
-            mma_tiler[2],
+            kBlockN,
+            kBlockM,
+            head_dim,
         )
         # For dP
         self.VdO_mma_tiler = (
-            mma_tiler[1],
-            mma_tiler[0],
-            mma_tiler[2],
+            kBlockN,
+            kBlockM,
+            head_dim,
         )
         # For dV
         self.PdO_mma_tiler = (
-            mma_tiler[1],
-            mma_tiler[2],
-            mma_tiler[0],
+            kBlockN,
+            head_dim,
+            kBlockM,
         )
         # For dK
         self.dSQ_mma_tiler = (
-            mma_tiler[1],
-            mma_tiler[2],
-            mma_tiler[0],
+            kBlockN,
+            head_dim,
+            kBlockM,
         )
         # For dQ
         self.dSK_mma_tiler = (
-            mma_tiler[0],
-            mma_tiler[2],
-            mma_tiler[1],
+            kBlockM,
+            head_dim,
+            kBlockN,
         )
         self.cluster_shape_mn = (1, 1)
-        self.varlen = varlen
-        self.is_causal = mask_type == MaskType.CAUSAL_MASK_FOR_BACKWARD
-        self.mask_type = mask_type
+        self.is_causal = is_causal
 
         self.reduce_warp_id = (0, 1, 2, 3)
         self.compute_warp_id = (4, 5, 6, 7, 8, 9, 10, 11)
@@ -186,10 +184,10 @@ class HSTUAttentionBackwardSm100:
         )
 
         self.tmem_dK_offset = 0
-        self.tmem_dV_offset = self.tmem_dK_offset + mma_tiler[2]
-        self.tmem_dQ_offset = self.tmem_dV_offset + mma_tiler[2]
+        self.tmem_dV_offset = self.tmem_dK_offset + head_dim
+        self.tmem_dQ_offset = self.tmem_dV_offset + head_dim
         self.tmem_dP_offset = self.tmem_dQ_offset
-        self.tmem_S_offset = self.tmem_dQ_offset + max(mma_tiler[0], mma_tiler[2])
+        self.tmem_S_offset = self.tmem_dQ_offset + max(kBlockM, head_dim)
 
         self.num_regs_reduce = 152
         self.num_regs_compute = 128
@@ -221,8 +219,8 @@ class HSTUAttentionBackwardSm100:
         dK: cute.Tensor,
         dV: cute.Tensor,
         dO: cute.Tensor,
-        cumulative_s_q: Union[cute.Tensor, None],
-        cumulative_s_k: Union[cute.Tensor, None],
+        cu_seqlens_q: cute.Tensor,
+        cu_seqlens_k: cute.Tensor,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         workspace: cute.Tensor,
@@ -243,10 +241,6 @@ class HSTUAttentionBackwardSm100:
                         (Q.shape[0] * Q.shape[1], Q.shape[0] * Q.shape[1] * Q.shape[2]),
                         (
                             0
-                            if self.varlen
-                            else cute.assume(
-                                Q.shape[0] * Q.shape[1] * h_r * h_k, divby=64
-                            )
                         ),
                     ),
                 ),
@@ -264,10 +258,6 @@ class HSTUAttentionBackwardSm100:
                         (0, K.shape[0] * K.shape[1]),
                         (
                             0
-                            if self.varlen
-                            else cute.assume(
-                                K.shape[0] * K.shape[1] * 1 * h_k, divby=64
-                            )
                         ),
                     ),
                 ),
@@ -285,10 +275,6 @@ class HSTUAttentionBackwardSm100:
                         (0, V.shape[0] * V.shape[1]),
                         (
                             0
-                            if self.varlen
-                            else cute.assume(
-                                V.shape[0] * V.shape[1] * 1 * h_k, divby=64
-                            )
                         ),
                     ),
                 ),
@@ -571,7 +557,7 @@ class HSTUAttentionBackwardSm100:
         self.shared_storage = SharedStorage
 
         dQ_acc = self.get_workspace_tensor(
-            problem_shape, workspace, self.acc_dtype
+            problem_shape, workspace
         )
 
         dQ_smem_layout = cute.select(dQ_smem_layout_staged, mode=[0, 1])
@@ -604,8 +590,8 @@ class HSTUAttentionBackwardSm100:
             dK,
             dV,
             problem_shape,
-            cumulative_s_q,
-            cumulative_s_k,
+            cu_seqlens_q,
+            cu_seqlens_k,
             window_size_left,
             window_size_right,
             K_smem_layout_staged,
@@ -649,7 +635,7 @@ class HSTUAttentionBackwardSm100:
             dQ,
             problem_shape[0],
             problem_shape[2],
-            cumulative_s_q,
+            cu_seqlens_q,
         ).launch(
             grid=convert_grid,
             block=convert_block,
@@ -679,8 +665,8 @@ class HSTUAttentionBackwardSm100:
         dK: cute.Tensor,
         dV: cute.Tensor,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
-        cumulative_s_q: Union[cute.Tensor, None],
-        cumulative_s_k: Union[cute.Tensor, None],
+        cu_seqlens_q: Union[cute.Tensor, None],
+        cu_seqlens_k: Union[cute.Tensor, None],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         K_smem_layout_staged: cute.ComposedLayout,
@@ -837,23 +823,20 @@ class HSTUAttentionBackwardSm100:
         # get the current batch problem shape
 
         blk_coord = (Int32(0), bidx, Int32(0), ((Int32(0), bidy), bidz))
-        problem_shape_cur_batch = problem_shape
-        blk_offset = (Int32(0), Int32(0), Int32(0), ((Int32(0), Int32(0)), Int32(0)))
-        if cutlass.const_expr(self.varlen):
-            Q_len_cur_batch = cumulative_s_q[bidz + 1] - cumulative_s_q[bidz]
-            K_len_cur_batch = cumulative_s_k[bidz + 1] - cumulative_s_k[bidz]
-            problem_shape_cur_batch = (
-                Q_len_cur_batch,
-                K_len_cur_batch,
-                problem_shape[2],
-                problem_shape[3],
-            )
-            blk_offset = (
-                cumulative_s_q[bidz],
-                cumulative_s_k[bidz],
-                Int32(0),
-                ((Int32(0), Int32(0)), Int32(0)),
-            )
+        Q_len_cur_batch = cu_seqlens_q[bidz + 1] - cu_seqlens_q[bidz]
+        K_len_cur_batch = cu_seqlens_k[bidz + 1] - cu_seqlens_k[bidz]
+        problem_shape_cur_batch = (
+            Q_len_cur_batch,
+            K_len_cur_batch,
+            problem_shape[2],
+            problem_shape[3],
+        )
+        blk_offset = (
+            cu_seqlens_q[bidz],
+            cu_seqlens_k[bidz],
+            Int32(0),
+            ((Int32(0), Int32(0)), Int32(0)),
+        )
 
         iter_start, iter_count = self.get_Q_block_min_max(
             problem_shape_cur_batch[0],
@@ -1022,7 +1005,7 @@ class HSTUAttentionBackwardSm100:
         dQ: cute.Tensor,
         count: Int32,
         d_dim: Int32,
-        cumulative_s_q: Union[cute.Tensor, None],
+        cu_seqlens_q: Union[cute.Tensor, None],
     ):
         tidx, tidy, tidz = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -1030,9 +1013,8 @@ class HSTUAttentionBackwardSm100:
         seqlen = count
 
         offset = 0
-        if cutlass.const_expr(self.varlen):
-            offset = cumulative_s_q[bidy]
-            seqlen = cumulative_s_q[bidy + 1] - offset
+        offset = cu_seqlens_q[bidy]
+        seqlen = cu_seqlens_q[bidy + 1] - offset
 
         for idx_s_t in cutlass.range(tidy, self.block_seq, self.num_threads_seq):
             idx_s = idx_s_t + self.block_seq * bidz
@@ -2170,7 +2152,6 @@ class HSTUAttentionBackwardSm100:
         self,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
         workspace: cute.Tensor,
-        acc_dtype: Type[cutlass.Numeric],
     ) -> Tuple[cute.Tensor, cute.Tensor, cute.Tensor]:
         Q, D, HB = (
             problem_shape[0],
@@ -2182,7 +2163,7 @@ class HSTUAttentionBackwardSm100:
         D = cute.round_up(D, 8)
         Q = cute.round_up(Q, 8)
 
-        acc_bytes = acc_dtype.width // 8
+        acc_bytes = self.acc_dtype.width // 8
         dQ_acc_bytes = cute.assume(B * H * Q * D * acc_bytes, divby=acc_bytes)
 
         dQ_acc_iter = workspace.iterator
@@ -2211,8 +2192,9 @@ class HSTUAttentionBackwardSm100:
 
     @staticmethod
     def _get_workspace_size(
-        q: int, k: int, d: int, h: int, b: int, acc_dtype: Type[cutlass.Numeric]
+        q: int, k: int, d: int, h: int, b: int
     ):
+        acc_dtype = Float32
         d = (d + 7) // 8 * 8  # round up to 8
         q = (q + 7) // 8 * 8  # round up to 8
         workspace_bytes = 0
@@ -2445,6 +2427,8 @@ def run(
             .uniform_(min_val, max_val)
             .permute(permute_order)
         )
+        print(ref_tensor.shape)
+        print(ref_tensor.stride())
         if zero_out:
             ref_tensor.zero_()
 
@@ -2463,14 +2447,14 @@ def run(
         return ref_tensor, cute_tensor, dst_tensor
 
     # create sequence lengths for variable length inputs
-    cumulative_s_q = [0]
-    cumulative_s_k = [0]
+    cu_seqlens_q = [0]
+    cu_seqlens_k = [0]
     varlen = False
     if isinstance(s_q, tuple):
         varlen = True
         for i in range(b):
-            cumulative_s_q.append(cumulative_s_q[-1] + s_q[i])
-            cumulative_s_k.append(cumulative_s_k[-1] + s_k[i])
+            cu_seqlens_q.append(cu_seqlens_q[-1] + s_q[i])
+            cu_seqlens_k.append(cu_seqlens_k[-1] + s_k[i])
         s_q_max = max(s_q)
         s_k_max = max(s_k)
         s_q = sum(s_q)
@@ -2503,10 +2487,10 @@ def run(
 
     problem_shape = (s_q_max, s_k_max, d, ((h_r, h_k), orig_b))
     cumulative_s_q_torch_tensor = (
-        torch.tensor(cumulative_s_q, dtype=torch.int32).cuda() if varlen else None
+        torch.tensor(cu_seqlens_q, dtype=torch.int32).cuda() if varlen else None
     )
     cumulative_s_k_torch_tensor = (
-        torch.tensor(cumulative_s_k, dtype=torch.int32).cuda() if varlen else None
+        torch.tensor(cu_seqlens_k, dtype=torch.int32).cuda() if varlen else None
     )
     cumulative_s_q_cute_tensor = (
         from_dlpack(cumulative_s_q_torch_tensor).mark_layout_dynamic()
@@ -2560,7 +2544,7 @@ def run(
     )
 
     workspace_size = HSTUAttentionBackwardSm100._get_workspace_size(
-        s_q_max, s_k_max, d, h_q, orig_b, acc_dtype
+        s_q_max, s_k_max, d, h_q, orig_b
     )
     workspace_torch = torch.zeros(workspace_size, dtype=torch.uint8).cuda()
     workspace = from_dlpack(workspace_torch, assumed_align=16).mark_layout_dynamic()
@@ -2800,8 +2784,8 @@ def fmha_bwd_reference(
     K: torch.Tensor,  # [K, D, 1, H_K, B]
     V: torch.Tensor,  # [K, D, 1, H_K, B]
     dO: torch.Tensor,  # [Q, D, H_R, H_K, B]
-    cumulative_s_q: Union[torch.Tensor, None],
-    cumulative_s_k: Union[torch.Tensor, None],
+    cu_seqlens_q: Union[torch.Tensor, None],
+    cu_seqlens_k: Union[torch.Tensor, None],
     is_causal: bool,
     window_size_left=None,
     window_size_right=None,
@@ -2828,21 +2812,21 @@ def fmha_bwd_reference(
         return dy * sigmoid * (1 + x * (1 - sigmoid))
 
     for b in range(orig_b):
-        q_offset = cumulative_s_q[b] if cumulative_s_q is not None else 0
-        k_offset = cumulative_s_k[b] if cumulative_s_k is not None else 0
+        q_offset = cu_seqlens_q[b] if cu_seqlens_q is not None else 0
+        k_offset = cu_seqlens_k[b] if cu_seqlens_k is not None else 0
         s_q = (
-            cumulative_s_q[b + 1] - cumulative_s_q[b]
-            if cumulative_s_q is not None
+            cu_seqlens_q[b + 1] - cu_seqlens_q[b]
+            if cu_seqlens_q is not None
             else s_q_max
         )
         s_k = (
-            cumulative_s_k[b + 1] - cumulative_s_k[b]
-            if cumulative_s_k is not None
+            cu_seqlens_k[b + 1] - cu_seqlens_k[b]
+            if cu_seqlens_k is not None
             else s_k_max
         )
 
         for h_k_idx in range(h_k):
-            b_idx = b if cumulative_s_k is None else 0
+            b_idx = b if cu_seqlens_k is None else 0
             cur_K = K[k_offset : k_offset + s_k, :, 0, h_k_idx, b_idx]
             cur_V = V[k_offset : k_offset + s_k, :, 0, h_k_idx, b_idx]
             for h_r_idx in range(h_r):
@@ -2955,14 +2939,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--h_q",
         type=int,
-        default=1,
+        default=2,
         help="number of heads of Q",
     )
 
     parser.add_argument(
         "--h_k",
         type=int,
-        default=1,
+        default=2,
         help="number of heads of K",
     )
 

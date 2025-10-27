@@ -268,6 +268,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 cu_seqlens_kv_block_descale,
             )
         else:
+            # from fbgemm_gpu.experimental.hstu.hstu_blackwell import hstu_ops_gpu as _sm100
             from fbgemm_gpu.experimental.hstu.src.hstu_blackwell import hstu_ops_gpu as _sm100
             out, rab_padded = _sm100.hstu_varlen_fwd_100(
                 q,
@@ -467,6 +468,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 False,  # deterministic
             )
         else:
+            # from fbgemm_gpu.experimental.hstu.hstu_blackwell import hstu_ops_gpu as _sm100
             from fbgemm_gpu.experimental.hstu.src.hstu_blackwell import hstu_ops_gpu as _sm100
             dq, dk, dv, dRab = _sm100.hstu_varlen_bwd_100(
                 dout,
@@ -634,7 +636,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         k = qkv[:, 1, :, :].detach()
         v = qkv[:, 2, :, :].detach()
         major_version = torch.cuda.get_device_capability()[0]
-        assert major_version == 8 or major_version == 9, "Only support sm8x and sm90"
+        assert major_version == 8 or major_version == 9 or major_version == 10, "Only support sm8x and sm90 and sm100"
         if major_version == 8:
             out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_80(
                 q,
@@ -653,7 +655,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 rab,
                 func
             )
-        else:
+        elif major_version == 9:
             out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_90(
                 q,
                 k,
@@ -671,6 +673,26 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 rab,
                 func,
                 -1, # quant_mode
+            )
+        else:
+            # from fbgemm_gpu.experimental.hstu.hstu_blackwell import hstu_ops_gpu as _sm100
+            from fbgemm_gpu.experimental.hstu.src.hstu_blackwell import hstu_ops_gpu as _sm100
+            out, rab_padded = _sm100.hstu_varlen_fwd_100(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                num_contexts,
+                num_targets,
+                target_group_size,
+                window_size[0],
+                window_size[1],
+                alpha,
+                rab,
+                func,
             )
 
         ctx.save_for_backward(
@@ -717,7 +739,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         qkv_shape = (q.shape[0], 3, q.shape[1], q.shape[2])
         dqkv = torch.empty(qkv_shape, device=q.device, dtype=q.dtype)
         major_version = torch.cuda.get_device_capability()[0]
-        assert major_version == 8 or major_version == 9, "Only support sm8x and sm90"
+        assert major_version == 8 or major_version == 9 or major_version == 10, "Only support sm8x and sm90 and sm100"
         if major_version == 8:
             _, _, _, dRab = torch.ops.fbgemm.hstu_varlen_bwd_80(
                 dout,
@@ -742,7 +764,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 func,
                 False,  # deterministic
             )
-        else:
+        elif major_version == 9:
             _, _, _, dRab = torch.ops.fbgemm.hstu_varlen_bwd_90(
                 dout,
                 None,
@@ -779,6 +801,32 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 None,
                 None,
                 None,
+                False,  # deterministic
+            )
+        else:
+            # from fbgemm_gpu.experimental.hstu.hstu_blackwell import hstu_ops_gpu as _sm100
+            from fbgemm_gpu.experimental.hstu.src.hstu_blackwell import hstu_ops_gpu as _sm100
+            _, _, _, dRab = _sm100.hstu_varlen_bwd_100(
+                dout,
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dqkv[:,0,:,:], # dq
+                dqkv[:,1,:,:], # dk
+                dqkv[:,2,:,:], # dv
+                num_contexts,
+                num_targets,
+                target_group_size,
+                window_size_left,
+                window_size_right,
+                alpha,
+                rab_padded,
+                has_drab,
+                func,
                 False,  # deterministic
             )
         if has_drab:
