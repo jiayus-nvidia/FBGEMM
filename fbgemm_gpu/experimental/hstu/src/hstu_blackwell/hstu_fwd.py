@@ -57,6 +57,8 @@ class HSTUAttentionForwardSm100:
         # dtype: Type[cutlass.Numeric],
         head_dim: int,
         head_dim_v: Optional[int] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         is_causal: bool = False,
         is_local: bool = False,
@@ -77,6 +79,8 @@ class HSTUAttentionForwardSm100:
         self.same_hdim_kv_padded = self.head_dim_padded == self.head_dim_v_padded
         self.check_hdim_oob = head_dim != self.head_dim_padded
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
+        self.max_seqlen_q = max_seqlen_q
+        self.max_seqlen_k = max_seqlen_k
         self.kBlockM = kBlockM
         self.kBlockN = kBlockN
         self.q_stage = 2
@@ -1533,17 +1537,17 @@ class HSTUAttentionForwardSm100:
                     # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
-                    scale = sScale[tidx + stage * self.kBlockM]
-                    should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
+                    # scale = sScale[tidx + stage * self.kBlockM]
+                    # should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                     # should_rescale = True
                     # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
                     # Don't need O_full anymore, since by the time softmax has signaled the correction
                     # warps, S_i must have been done, so O_i-1 must have been done as well.
                     # cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase)
-                    if should_rescale:
-                        self.correction_rescale(
-                            thr_mma_pv, tOtOs[stage if self.q_stage == 2 else 0], tidx, scale
-                        )
+                    # if should_rescale:
+                    #     self.correction_rescale(
+                    #         thr_mma_pv, tOtOs[stage if self.q_stage == 2 else 0], tidx, scale
+                    #     )
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + (1 - stage))
                 softmax_corr_consumer_phase ^= 1
@@ -1580,8 +1584,8 @@ class HSTUAttentionForwardSm100:
                     LOG2_E = math.log2(math.e)
                     row_sum += utils.exp2f(learnable_sink_val[stage] * LOG2_E - row_max * softmax_scale_log2)
                 acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
-                stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
-                scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                # stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
+                scale = cutlass.Float32(1.0) / self.max_seqlen_q
                 cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase)
                 cute.arch.mbarrier_wait(mbar_ptr + self.mbar_corr_epi_empty_offset + stage, corr_epi_producer_phase)
                 self.correction_epilogue(
@@ -1779,10 +1783,10 @@ class HSTUAttentionForwardSm100:
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
             tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
-            # for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
-            #     tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
-            #         (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale),
-            #     )
+            for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
+                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
+                    (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale),
+                )
             tSMrO = cute.make_fragment(tOrO_frg.shape, self.o_dtype)
             o_vec = tOrO_frg.load()
             tSMrO.store(o_vec.to(self.o_dtype))
