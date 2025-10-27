@@ -39,8 +39,8 @@ def hstu_varlen_fwd_100(
     # asserts
 
     head_dim = q.shape[2]
-    kBlockM = 128 if head_dim <= 64 else 64
-    kBlockN = 128 if head_dim <= 64 else 64
+    kBlockM = 128 
+    kBlockN = 128 
     out = torch.empty_like(q)
 
     q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -62,16 +62,15 @@ def hstu_varlen_fwd_100(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
         )
-        hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(hstu_fwd_sm100, q_tensor, k_tensor, v_tensor, o_tensor, None, 1.0, current_stream, cu_seqlens_q_tensor, cu_seqlens_k_tensor)
+        hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(hstu_fwd_sm100, q_tensor, k_tensor, v_tensor, o_tensor, current_stream, 1.0, cu_seqlens_q_tensor, cu_seqlens_k_tensor)
 
     hstu_varlen_fwd_100.compile_cache[compile_key](
         q_tensor,
         k_tensor,
         v_tensor,
         o_tensor,
-        None,
-        1.0,
         current_stream,
+        1.0,
         cu_seqlens_q_tensor,
         cu_seqlens_k_tensor,
     )

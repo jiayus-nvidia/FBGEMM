@@ -4,10 +4,11 @@ from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Uint32
+from cutlass import Int32, Uint32, Float32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
+import fbgemm_gpu.experimental.hstu.src.hstu_blackwell.utils as utils
 
 @cute.jit
 def clz(x: Int32) -> Int32:
@@ -95,3 +96,37 @@ class FastDivmod:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return FastDivmod(*(tuple(obj_list)), loc=self._loc)
+
+class FastSilU:
+    def __init__(self, score_scale: Float32, loc=None, ip=None):
+        self._loc = loc
+        self.score_scale = score_scale
+
+    @cute.jit
+    def apply_silu_convert(
+        self,
+        acc_S_row: cute.Tensor,
+        acc_S_row_converted: cute.Tensor,
+    ):
+        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        frg_tile = 32
+        assert frg_tile % 2 == 0
+        frg_cnt = cute.size(acc_S_row) // frg_tile
+        assert cute.size(acc_S_row) % frg_tile == 0
+        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
+        acc_S_row_converted_frg = cute.logical_divide(
+            acc_S_row_converted, cute.make_layout(frg_tile)
+        )
+        for j in cutlass.range_constexpr(frg_cnt):
+            for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
+                v0 = acc_S_row_frg[k, j] * self.score_scale * 0.5
+                v1 = acc_S_row_frg[k + 1, j] * self.score_scale * 0.5
+                tanh_v0 = utils.tanhf(v0)
+                tanh_v1 = utils.tanhf(v1)
+                out_v0 = v0 * tanh_v0 + v0
+                out_v1 = v1 * tanh_v1 + v1
+                acc_S_row_frg[k, j] = out_v0 if v0 > -10.0 else 0.0
+                acc_S_row_frg[k + 1, j] = out_v1 if v1 > -10.0 else 0.0
+            acc_S_row_converted_frg[None, j].store(
+                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+            )
