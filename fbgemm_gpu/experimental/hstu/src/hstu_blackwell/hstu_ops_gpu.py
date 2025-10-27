@@ -39,8 +39,8 @@ def hstu_varlen_fwd_100(
     # asserts
 
     head_dim = q.shape[2]
-    kBlockM = 128 
-    kBlockN = 128 
+    kBlockM = 128
+    kBlockN = 128
     out = torch.empty_like(q)
 
     q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -150,13 +150,14 @@ def hstu_varlen_bwd_100(
     ]
 
     current_stream = cutlass_torch.default_stream()
-    problem_shape = (Int32(max_seqlen_q), Int32(max_seqlen_k), Int32(head_dim), ((Int32(1), Int32(num_heads)), Int32(1)))
+    problem_shape = (Int32(max_seqlen_q), Int32(max_seqlen_k), Int32(head_dim), ((Int32(1), Int32(num_heads)), Int32(batch_size)))
     compile_key = (head_dim, kBlockM, kBlockN)
 
     if compile_key not in hstu_varlen_bwd_100.compile_cache:
         hstu_bwd_sm100 = HSTUAttentionBackwardSm100(
             element_dtype=Float16 if q_dtype == torch.float16 else BFloat16,
             head_dim=head_dim,
+            max_seqlen_q=max_seqlen_q,
             kBlockM=kBlockM,
             kBlockN=kBlockN,
         )

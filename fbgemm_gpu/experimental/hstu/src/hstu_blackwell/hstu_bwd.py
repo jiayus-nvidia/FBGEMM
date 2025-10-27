@@ -97,12 +97,14 @@ class HSTUAttentionBackwardSm100:
         self,
         element_dtype: Type[cutlass.Numeric],
         head_dim: int,
+        max_seqlen_q: int,
         kBlockM: int,
         kBlockN: int,
         is_causal: bool = False,
     ):
         self.element_dtype = element_dtype
         self.acc_dtype = Float32
+        self.max_seqlen_q = Float32(max_seqlen_q)
         self.cta_tiler = (
             kBlockM,
             kBlockN,
@@ -1848,7 +1850,7 @@ class HSTUAttentionBackwardSm100:
             cute.copy(tiled_t2r, tTR_tdQ, tTR_rdQ)
 
             for i in cutlass.range(0, cute.size(tTR_rdQ), unroll_full=True):
-                tTR_rdQ[i] /= problem_shape[0]
+                tTR_rdQ[i] /= self.max_seqlen_q
 
             cute.arch.fence_view_async_tmem_load()
 
@@ -2123,7 +2125,7 @@ class HSTUAttentionBackwardSm100:
         cute.copy(tiled_t2r_dV, tTR_tdV, tTR_rdV)
 
         for i in cutlass.range(cute.size(tTR_rdV), unroll_full=True):
-            tTR_rdV[i] /= problem_shape[0]
+            tTR_rdV[i] /= self.max_seqlen_q
 
         # Store tdVgdV
         self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
@@ -2139,7 +2141,7 @@ class HSTUAttentionBackwardSm100:
         cute.copy(tiled_t2r_dK, tTR_tdK, tTR_rdK)
 
         for i in cutlass.range(cute.size(tTR_rdK), unroll_full=True):
-            tTR_rdK[i] /= problem_shape[0]
+            tTR_rdK[i] /= self.max_seqlen_q
 
         # Store tdKgdK
         self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
