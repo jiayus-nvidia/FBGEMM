@@ -23,23 +23,7 @@ class BlockInfo:
         self, seqlen_info: SeqlenInfo, m_block: cutlass.Int32
     ) -> Tuple[cutlass.Int32, cutlass.Int32]:
         n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.n_block_size)
-        if cutlass.const_expr(
-            self.is_causal or (self.is_local and self.window_size_right is not None)
-        ):
-            m_idx_max = (m_block + 1) * self.m_block_size
-            if cutlass.const_expr(self.qhead_per_kvhead_packgqa > 1):
-                m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
-            n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
-            n_idx_right = n_idx if cutlass.const_expr(self.is_causal) else n_idx + self.window_size_right
-            n_block_max = min(n_block_max, cute.ceil_div(n_idx_right, self.n_block_size))
         n_block_min = 0
-        if cutlass.const_expr(self.is_local and self.window_size_left is not None):
-            m_idx_min = m_block * self.m_block_size
-            if cutlass.const_expr(self.qhead_per_kvhead_packgqa > 1):
-                m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa
-            n_idx = m_idx_min + seqlen_info.seqlen_k - seqlen_info.seqlen_q
-            n_idx_left = n_idx - self.window_size_left
-            n_block_min = cutlass.max(n_idx_left // self.n_block_size, 0)
         return n_block_min, n_block_max
 
     @cute.jit

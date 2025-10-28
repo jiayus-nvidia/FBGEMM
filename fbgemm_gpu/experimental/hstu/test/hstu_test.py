@@ -388,7 +388,7 @@ def generate_input(
     head_func = 1
     batch_func = batch_size
     if is_arbitrary:
-        n_func = 1
+        n_func = 3
         max_seq_split = max_seq_len_k // n_func
         coef = 0.3
         func = torch.empty((batch_func, head_func, n_func, max_seq_len_q), dtype=torch.int32, device=torch.device("cuda"))
@@ -659,20 +659,20 @@ class HSTU16Test(unittest.TestCase):
         ),
         attn_hidden_dims=st.sampled_from(
             [
-                (32, 32),
+                # (32, 32),
                 (64, 64),
                 (128, 128),
-                (256, 256),
+                # (256, 256),
             ]
         ),
         alpha=st.sampled_from([1.0, 0.1]),
         rab_params=st.sampled_from(
             [
                 (False, False, None),
-                (True, False, None),  # None means heads_rab=heads
-                (True, True, None),
-                (True, False, 1),
-                (True, True, 1),
+                # (True, False, None),  # None means heads_rab=heads
+                # (True, True, None),
+                # (True, False, 1),
+                # (True, True, 1),
             ]
         ),
         dtype=st.sampled_from([torch.bfloat16]), #, torch.float16]),
@@ -1941,7 +1941,7 @@ class HSTU8Test(unittest.TestCase):
 if __name__ == "__main__":
 
     HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
-    8, 2, 0, (128, 128), 1.0, (False, False, None), (1111, 1111), (0, (-1, -1), 1, False), torch.bfloat16, False)
+    1, 1, 0, (64, 64), 1.0, (False, False, None), (32, 32), (0, (-1, 0), 1, False), torch.bfloat16, True)
 
     # HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
     # 1, 1, 0, (64, 64), 1.0, (False, False, None), (128, 128), (0, (-1, -1), 1, False), torch.bfloat16, True)

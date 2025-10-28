@@ -15,14 +15,18 @@ class SeqlenInfo:
         batch_idx: cutlass.Int32,
         max_seqlen_q: cutlass.Int32,
         max_seqlen_k: cutlass.Int32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
+        cu_seqlens_q: cute.Tensor,
+        cu_seqlens_k: cute.Tensor,
+        num_contexts: Optional[cute.Tensor],
+        num_targets: Optional[cute.Tensor],
     ):
-        assert mCuSeqlensQ is not None and mCuSeqlensK is not None
-        self.offset_q = mCuSeqlensQ[batch_idx]
-        self.offset_k = mCuSeqlensK[batch_idx]
-        self.seqlen_q = mCuSeqlensQ[batch_idx + 1] - self.offset_q
-        self.seqlen_k = mCuSeqlensK[batch_idx + 1] - self.offset_k
+        assert cu_seqlens_q is not None and cu_seqlens_k is not None
+        self.offset_q = cu_seqlens_q[batch_idx]
+        self.offset_k = cu_seqlens_k[batch_idx]
+        self.seqlen_q = cu_seqlens_q[batch_idx + 1] - self.offset_q
+        self.seqlen_k = cu_seqlens_k[batch_idx + 1] - self.offset_k
+        self.seqlen_c = num_contexts[batch_idx] if num_contexts is not None else 0
+        self.seqlen_h = self.seqlen_k - num_targets[batch_idx] if num_targets is not None else self.seqlen_k
 
         self.max_seqlen_q = max_seqlen_q
         self.max_seqlen_k = max_seqlen_k

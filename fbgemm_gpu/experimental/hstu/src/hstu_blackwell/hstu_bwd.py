@@ -32,6 +32,7 @@ import math
 import random
 import time
 from typing import Type, Tuple, Union, Optional
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -47,6 +48,8 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Float32, Float8E4M3FN, Float16, BFloat16, Boolean
+
+from .mask import AttentionMask
 
 """
 A fused multi-head attention (FMHA) backward pass example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -97,14 +100,20 @@ class HSTUAttentionBackwardSm100:
         self,
         element_dtype: Type[cutlass.Numeric],
         head_dim: int,
-        max_seqlen_q: int,
         kBlockM: int,
         kBlockN: int,
         is_causal: bool = False,
+        is_local: bool = False,
+        is_context: bool = False,
+        is_target: bool = False,
+        target_group_size: int = 1,
+        is_arbitrary: bool = False,
+        func_num: int = 0,
     ):
         self.element_dtype = element_dtype
         self.acc_dtype = Float32
-        self.max_seqlen_q = Float32(max_seqlen_q)
+        self.kBlockM = kBlockM
+        self.kBlockN = kBlockN
         self.cta_tiler = (
             kBlockM,
             kBlockN,
@@ -146,6 +155,12 @@ class HSTUAttentionBackwardSm100:
         )
         self.cluster_shape_mn = (1, 1)
         self.is_causal = is_causal
+        self.is_local = is_local
+        self.is_context = is_context
+        self.is_target = is_target
+        self.target_group_size = target_group_size
+        self.is_arbitrary = is_arbitrary
+        self.func_num = func_num
 
         self.reduce_warp_id = (0, 1, 2, 3)
         self.compute_warp_id = (4, 5, 6, 7, 8, 9, 10, 11)
@@ -225,6 +240,9 @@ class HSTUAttentionBackwardSm100:
         cu_seqlens_k: cute.Tensor,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        num_contexts: Optional[cute.Tensor],
+        num_targets: Optional[cute.Tensor],
+        func: Optional[cute.Tensor],
         workspace: cute.Tensor,
         stream: cuda.CUstream,
     ):
@@ -596,6 +614,9 @@ class HSTUAttentionBackwardSm100:
             cu_seqlens_k,
             window_size_left,
             window_size_right,
+            num_contexts,
+            num_targets,
+            func,
             K_smem_layout_staged,
             Q_smem_layout_staged,
             V_smem_layout_staged,
@@ -671,6 +692,9 @@ class HSTUAttentionBackwardSm100:
         cu_seqlens_k: Union[cute.Tensor, None],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        num_contexts: Optional[cute.Tensor],
+        num_targets: Optional[cute.Tensor],
+        func: Optional[cute.Tensor],
         K_smem_layout_staged: cute.ComposedLayout,
         Q_smem_layout_staged: cute.ComposedLayout,
         V_smem_layout_staged: cute.ComposedLayout,
@@ -825,8 +849,12 @@ class HSTUAttentionBackwardSm100:
         # get the current batch problem shape
 
         blk_coord = (Int32(0), bidx, Int32(0), ((Int32(0), bidy), bidz))
+        max_seqlen_q = Float32(problem_shape[0])
         Q_len_cur_batch = cu_seqlens_q[bidz + 1] - cu_seqlens_q[bidz]
         K_len_cur_batch = cu_seqlens_k[bidz + 1] - cu_seqlens_k[bidz]
+        num_contexts_cur_batch = num_contexts[bidz] if num_contexts is not None else 0
+        num_history_cur_batch = K_len_cur_batch - num_targets[bidz] if num_targets is not None else K_len_cur_batch
+        func = func[0, None, None] if func is not None else None
         problem_shape_cur_batch = (
             Q_len_cur_batch,
             K_len_cur_batch,
@@ -845,6 +873,15 @@ class HSTUAttentionBackwardSm100:
             problem_shape_cur_batch[1],
             blk_coord[1],
         )
+
+        AttentionMaskCls = partial(
+            AttentionMask, self.kBlockM, self.kBlockN,
+            self.is_arbitrary, self.is_causal, self.is_local, self.is_context, self.is_target,
+            target_group_size=self.target_group_size, func_num=self.func_num,
+            window_size_left=window_size_left, window_size_right=window_size_right,
+            swapAB=True,
+        )
+        mask = AttentionMaskCls(offset_q=cu_seqlens_q[bidz], seqlen_q=Q_len_cur_batch, seqlen_k=K_len_cur_batch, seqlen_c=num_contexts_cur_batch, seqlen_h=num_history_cur_batch, func=func)
 
         if bidx * self.tile_shape_K < problem_shape_cur_batch[1]:
             iter_count -= iter_start
@@ -948,15 +985,18 @@ class HSTUAttentionBackwardSm100:
                         dV,
                         tdKtdK,
                         tdVtdV,
+                        KQ_tiled_mma.get_slice(0),
                         PdO_tiled_mma,
                         dSQ_tiled_mma,
                         blk_coord,
                         blk_offset,
                         problem_shape_cur_batch,
+                        max_seqlen_q,
                         iter_count,
                         iter_start,
                         window_size_left,
                         window_size_right,
+                        mask,
                         (
                             mma_compute_S_pipeline,
                             compute_mma_P_pipeline,
@@ -992,6 +1032,7 @@ class HSTUAttentionBackwardSm100:
                         sdQ,
                         blk_coord,
                         problem_shape_cur_batch,
+                        max_seqlen_q,
                         iter_count,
                         iter_start,
                         (mma_reduce_dQ_pipeline, reduce_tma_store_pipeline),
@@ -1049,11 +1090,6 @@ class HSTUAttentionBackwardSm100:
     ):
         Q_block_max = cute.ceil_div(seq_Q, self.tile_shape_Q)
         Q_block_min = cutlass.Int32(0)
-        if cutlass.const_expr(self.is_causal):
-            Q_block_min_tmp = (
-                blk_coord_k * self.tile_shape_K + seq_Q - seq_K - self.window_size_right
-            ) // self.tile_shape_Q
-            Q_block_min = max(Q_block_min_tmp, Q_block_min)
         return Q_block_min, Q_block_max
 
     @cute.jit
@@ -1567,15 +1603,18 @@ class HSTUAttentionBackwardSm100:
         dV: cute.Tensor,
         tdKtdK: cute.Tensor,
         tdVtdV: cute.Tensor,
+        KQ_thr_mma: cute.TiledMma,
         PdO_tiled_mma: cute.TiledMma,
         dSQ_tiled_mma: cute.TiledMma,
         blk_coord: cute.Coord,
         blk_offset: cute.Shape,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
+        max_seqlen_q: Float32,
         iter_count: Int32,
         iter_index: Int32,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        mask: AttentionMask,
         # (mma_compute_S_pipeline, compute_mma_P_pipeline, mma_compute_dP_pipeline, compute_mma_dS_pipeline, mma_compute_dKdV_pipeline)
         pipeline_args: tuple,
     ):
@@ -1632,7 +1671,6 @@ class HSTUAttentionBackwardSm100:
         tTR_cST = thr_t2r.partition_D(cST)
         tTR_cST = self.split_wg(tTR_cST, num_warp_groups, wg_idx)
         tTR_rST = cute.make_fragment(tTR_cST.shape, self.acc_dtype)
-        tTR_rST_silu = cute.make_fragment(tTR_cST.shape, self.acc_dtype)
 
         tTR_tST = thr_t2r.partition_S(tSTtST)
         tTR_tST = self.split_wg(tTR_tST, num_warp_groups, wg_idx)
@@ -1657,44 +1695,48 @@ class HSTUAttentionBackwardSm100:
 
         is_residual_k = blk_coord_k * self.tile_shape_K + self.tile_shape_K >= K
         last_iter = iter_count - 1 + iter_index
+        mask_fn = partial(
+            mask.apply_mask, n_block=blk_coord_k, thr_mma=KQ_thr_mma, thr_tmem_load=thr_t2r,
+        )
 
         while iter_count > 0:
             # Wait for S and P
             mma_compute_S_pipeline.consumer_wait(mma_compute_S_consumer_state)
             compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
 
-            leading_causal_masking = cutlass.Boolean(False)
-            if cutlass.const_expr(self.is_causal):
-                leading_causal_masking = iter_index == blk_coord_k
-                leading_causal_masking = cute.arch.shuffle_sync(
-                    leading_causal_masking, 0
-                )
+            # leading_causal_masking = cutlass.Boolean(False)
+            # if cutlass.const_expr(self.is_causal):
+            #     leading_causal_masking = iter_index == blk_coord_k
+            #     leading_causal_masking = cute.arch.shuffle_sync(
+            #         leading_causal_masking, 0
+            #     )
 
-            trailing_residual_masking = cutlass.Boolean(False)
-            trailing_residual_masking = iter_index == last_iter or is_residual_k
-            trailing_residual_masking = cute.arch.shuffle_sync(
-                trailing_residual_masking, 0
-            )
+            # trailing_residual_masking = cutlass.Boolean(False)
+            # trailing_residual_masking = iter_index == last_iter or is_residual_k
+            # trailing_residual_masking = cute.arch.shuffle_sync(
+            #     trailing_residual_masking, 0
+            # )
 
             # Compute P = silu(S)
             cute.copy(tiled_t2r, tTR_tST, tTR_rST)
-            cute.copy(tiled_t2r, tTR_tST, tTR_rST_silu)
+            mask_fn(tTR_rST, m_block=iter_count - 1)
+            tTR_rST_silu = cute.make_fragment_like(tTR_rST)
 
-            for i in cutlass.range(cute.size(tTR_rST), unroll_full=True):
-                c_transpose = tTR_cST[i]
-                pos = (
-                    cute.get(c_transpose, mode=[1])
-                    + iter_index * self.tile_shape_Q,
-                    cute.get(c_transpose, mode=[0])
-                    + blk_coord_k * self.tile_shape_K,
-                )
-                if cutlass.const_expr(self.is_causal):
-                    if pos[0] < pos[1] or not cute.elem_less(pos, (Q, K)):
-                        tTR_rST[i] = -cutlass.Float32.inf
-                if not cute.elem_less(
-                    pos, (Q, K)
-                ):
-                    tTR_rST[i] = -cutlass.Float32.inf
+            # for i in cutlass.range(cute.size(tTR_rST), unroll_full=True):
+            #     c_transpose = tTR_cST[i]
+            #     pos = (
+            #         cute.get(c_transpose, mode=[1])
+            #         + iter_index * self.tile_shape_Q,
+            #         cute.get(c_transpose, mode=[0])
+            #         + blk_coord_k * self.tile_shape_K,
+            #     )
+            #     if cutlass.const_expr(self.is_causal):
+            #         if pos[0] < pos[1] or not cute.elem_less(pos, (Q, K)):
+            #             tTR_rST[i] = -cutlass.Float32.inf
+            #     if not cute.elem_less(
+            #         pos, (Q, K)
+            #     ):
+            #         tTR_rST[i] = -cutlass.Float32.inf
 
             for i in cutlass.range(0, cute.size(tTR_rST), unroll_full=True):
                 sigmoid_v = 0.5 * cute.math.tanh(tTR_rST[i] * 0.5) + 0.5
@@ -1774,6 +1816,7 @@ class HSTUAttentionBackwardSm100:
             blk_coord,
             blk_offset,
             problem_shape,
+            max_seqlen_q,
             dK,
             dV,
             tdKtdK,
@@ -1791,6 +1834,7 @@ class HSTUAttentionBackwardSm100:
         sdQ: cute.Tensor,
         blk_coord: cute.Coord,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
+        max_seqlen_q: Float32,
         iter_count: Int32,
         iter_index: Int32,
         # (mma_reduce_dQ_pipeline, reduce_tma_store_pipeline)
@@ -1850,7 +1894,7 @@ class HSTUAttentionBackwardSm100:
             cute.copy(tiled_t2r, tTR_tdQ, tTR_rdQ)
 
             for i in cutlass.range(0, cute.size(tTR_rdQ), unroll_full=True):
-                tTR_rdQ[i] /= self.max_seqlen_q
+                tTR_rdQ[i] /= max_seqlen_q
 
             cute.arch.fence_view_async_tmem_load()
 
@@ -2041,6 +2085,7 @@ class HSTUAttentionBackwardSm100:
         blk_coord: cute.Coord,
         blk_offset: cute.Shape,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
+        max_seqlen_q: Float32,
         dK: cute.Tensor,
         dV: cute.Tensor,
         tdKtdK: cute.Tensor,
@@ -2125,7 +2170,7 @@ class HSTUAttentionBackwardSm100:
         cute.copy(tiled_t2r_dV, tTR_tdV, tTR_rdV)
 
         for i in cutlass.range(cute.size(tTR_rdV), unroll_full=True):
-            tTR_rdV[i] /= self.max_seqlen_q
+            tTR_rdV[i] /= max_seqlen_q
 
         # Store tdVgdV
         self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
@@ -2141,7 +2186,7 @@ class HSTUAttentionBackwardSm100:
         cute.copy(tiled_t2r_dK, tTR_tdK, tTR_rdK)
 
         for i in cutlass.range(cute.size(tTR_rdK), unroll_full=True):
-            tTR_rdK[i] /= self.max_seqlen_q
+            tTR_rdK[i] /= max_seqlen_q
 
         # Store tdKgdK
         self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))

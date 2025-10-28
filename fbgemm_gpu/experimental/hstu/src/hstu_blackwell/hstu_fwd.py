@@ -49,10 +49,15 @@ class HSTUAttentionForwardSm100:
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         is_causal: bool = False,
         is_local: bool = False,
+        is_context: bool = False,
+        is_target: bool = False,
+        target_group_size: int = 1,
+        is_arbitrary: bool = False,
+        func_num: int = 0,
+        alpha: float = 1.0,
         kBlockM: int = 128,
         kBlockN: int = 128,
         is_persistent: bool = True,
-        has_buffers: cutlass.Constexpr = False,
     ):
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -79,6 +84,12 @@ class HSTUAttentionForwardSm100:
         self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = is_local
+        self.is_context = is_context
+        self.is_target = is_target
+        self.is_arbitrary = is_arbitrary
+        self.func_num = func_num
+        self.target_group_size = target_group_size
+        self.alpha = alpha
         self.qhead_per_kvhead = qhead_per_kvhead
         # Does S1 need to wait for S0 to finish
         self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
@@ -157,12 +168,15 @@ class HSTUAttentionForwardSm100:
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
-        mCuSeqlensQ: cute.Tensor,
-        mCuSeqlensK: cute.Tensor,
+        cu_seqlens_q: cute.Tensor,
+        cu_seqlens_k: cute.Tensor,
+        num_contexts: Optional[cute.Tensor],
+        num_targets: Optional[cute.Tensor],
         score_scale: Float32,
         stream: cuda.CUstream,
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
+        window_size_left: Int32 | int,
+        window_size_right: Int32 | int,
+        func: Optional[cute.Tensor],
         buffers = None  # Not typing for now since conversion behaves a lil funny
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -187,21 +201,21 @@ class HSTUAttentionForwardSm100:
         # Assume all strides are divisible by 128 bits except the last stride
         new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mQ, mK, mV, mO)]
-        # QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+        # QO_layout_transpose = [1, 3, 2, 0] if const_expr(cu_seqlens_q is None) else [0, 2, 1]
         QO_layout_transpose = [0, 2, 1]
         mQ, mO = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=QO_layout_transpose))
             for t in (mQ, mO)
         ]
         # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
-        # KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
+        # KV_layout_transpose = [1, 3, 2, 0] if const_expr(cu_seqlens_k is None) else [0, 2, 1]
         KV_layout_transpose = [0, 2, 1]
         mK, mV = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
             for t in (mK, mV)
         ]
         # (s, d, h, b) -> (d, s, h, b)
-        # V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
+        # V_layout_transpose = [1, 0, 2, 3] if const_expr(cu_seqlens_k is None) else [1, 0, 2]
         V_layout_transpose = [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
 
@@ -313,13 +327,13 @@ class HSTUAttentionForwardSm100:
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), self.cta_tiler[0]),
             cute.size(mQ.shape[2]),
-            cute.size(mCuSeqlensQ.shape[0] - 1),
+            cute.size(cu_seqlens_q.shape[0] - 1),
             cute.size(mK.shape[0]),
             mQ.shape[1],
             mV.shape[0],  # Note that this is different from Sm90 since we transpose mV in Sm100
             total_q=cute.size(mQ.shape[0]),
             tile_shape_mn=self.cta_tiler[:2],
-            mCuSeqlensQ=mCuSeqlensQ,
+            cu_seqlens_q=cu_seqlens_q,
             qhead_per_kvhead_packgqa=1,
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,
@@ -381,14 +395,17 @@ class HSTUAttentionForwardSm100:
             mO,
             max_seqlen_q,
             max_seqlen_k,
-            mCuSeqlensQ,
-            mCuSeqlensK,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            num_contexts,
+            num_targets,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
             score_scale,
             window_size_left,
             window_size_right,
+            func,
             sQ_layout,
             sK_layout,
             tP_layout,
@@ -417,14 +434,17 @@ class HSTUAttentionForwardSm100:
         mO: cute.Tensor,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
-        mCuSeqlensQ: cute.Tensor,
-        mCuSeqlensK: cute.Tensor,
+        cu_seqlens_q: cute.Tensor,
+        cu_seqlens_k: cute.Tensor,
+        num_contexts: Optional[cute.Tensor],
+        num_targets: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         score_scale: Float32,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        func: Optional[cute.Tensor],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
@@ -543,12 +563,15 @@ class HSTUAttentionForwardSm100:
             SeqlenInfo,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            num_contexts=num_contexts, num_targets=num_targets,
         )
         AttentionMaskCls = partial(
             AttentionMask, self.kBlockM, self.kBlockN,
+            self.is_arbitrary, self.is_causal, self.is_local, self.is_context, self.is_target,
+            target_group_size=self.target_group_size, func_num=self.func_num,
             window_size_left=window_size_left, window_size_right=window_size_right,
-            qhead_per_kvhead_packgqa=1,
+            swapAB=False,
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
@@ -641,6 +664,7 @@ class HSTUAttentionForwardSm100:
                 SeqlenInfoCls=SeqlenInfoCls,
                 AttentionMaskCls=AttentionMaskCls,
                 TileSchedulerCls=TileSchedulerCls,
+                func=func,
                 buffers=buffers,
                 fastdiv_mods=fastdiv_mods,
             )
@@ -707,12 +731,12 @@ class HSTUAttentionForwardSm100:
             gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
 
             head_idx_kv = head_idx // self.qhead_per_kvhead
-            
+
             mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
             mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, head_idx_kv])
             gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
             gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
-            
+
             tSgQ = thr_mma_qk.partition_A(gQ)
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
@@ -981,6 +1005,7 @@ class HSTUAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
+        func: Optional[cute.Tensor],
         buffers = None,
         fastdiv_mods = (None, None)
     ):
@@ -1025,9 +1050,11 @@ class HSTUAttentionForwardSm100:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-            mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
+            # func: (head_func, n_func, L_func) -> (n_func, L_func)
+            func_tensor = func[0, None, None] if func is not None else None
+            mask = AttentionMaskCls(offset_q=seqlen.offset_q, seqlen_q=seqlen.seqlen_q, seqlen_k=seqlen.seqlen_k, seqlen_c=seqlen.seqlen_c, seqlen_h=seqlen.seqlen_h, func=func_tensor)
             mask_fn = partial(
-                mask.apply_mask_sm100, m_block=self.q_stage * m_block + stage, thr_mma=thr_mma_qk, thr_tmem_load=thr_tmem_load, mask_causal=self.is_causal, mask_local=self.is_local
+                mask.apply_mask, m_block=self.q_stage * m_block + stage, thr_mma=thr_mma_qk, thr_tmem_load=thr_tmem_load,
             )
             fastsilu = FastSilU(
                 score_scale=score_scale,
@@ -1052,7 +1079,7 @@ class HSTUAttentionForwardSm100:
             )
 
             # 1 masking iter
-            mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block_max - 1, is_first=True, mask_fn=partial(mask_fn, mask_seqlen=True))
+            mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block_max - 1, is_first=True, mask_fn=partial(mask_fn))
             n_block_max -= 1
             # Next couple of iterations with causal masking
             if const_expr(self.is_causal or self.is_local):
@@ -1061,7 +1088,7 @@ class HSTUAttentionForwardSm100:
                 )
                 for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
                     n_block = n_block_max - 1 - n_tile
-                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_seqlen=False))
+                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
                 n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
             # The remaining iterations have no masking
             n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
@@ -1069,13 +1096,13 @@ class HSTUAttentionForwardSm100:
             )
             for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                 n_block = n_block_max - n_tile - 1
-                mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block)
+                mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
             # Separate iterations with local masking on the left
             if const_expr(self.is_local and block_info.window_size_left is not None):
                 n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
                 for n_tile in cutlass.range(0, n_block_max - n_block_min, unroll=1):
                     n_block = n_block_max - 1 - n_tile
-                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_seqlen=False))
+                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
                     # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
             # if tidx % 32 == 0: cute.printf("softmax over warp idx = %d\n", cute.arch.warp_idx())
@@ -1131,6 +1158,8 @@ class HSTUAttentionForwardSm100:
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_fragment(tScS_t2r_shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)  # copy from tmem to rmem
+        for i in cutlass.range_constexpr(cute.size(tSrS_t2r), unroll_full=True):
+            tSrS_t2r[i] *= self.alpha
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
 
@@ -1233,7 +1262,7 @@ class HSTUAttentionForwardSm100:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             for stage in cutlass.range_constexpr(self.q_stage):
-                offset = seqlen.offset_q + (self.q_stage * m_block + stage) * self.kBlockM 
+                offset = seqlen.offset_q + (self.q_stage * m_block + stage) * self.kBlockM
                 mO_cur = cute.domain_offset((offset, 0), mO[None, None, head_idx])
                 gO = cute.local_tile(mO_cur, (self.kBlockM, self.head_dim_v_padded), (0, 0))
                 cO = cute.domain_offset(
