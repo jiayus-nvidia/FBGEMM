@@ -60,9 +60,11 @@ def hstu_varlen_fwd_100(
             kBlockM=kBlockM,
             kBlockN=kBlockN,
         )
-        hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(hstu_fwd_sm100, q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, alpha, current_stream)
+        with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
+            hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(hstu_fwd_sm100, q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, alpha, current_stream)
 
-    hstu_varlen_fwd_100.compile_cache[compile_key](q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, alpha, current_stream)
+    with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
+        hstu_varlen_fwd_100.compile_cache[compile_key](q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, alpha, current_stream)
     
     return out, None
 
@@ -156,24 +158,10 @@ def hstu_varlen_bwd_100(
         )
         workspace_torch = torch.zeros(workspace_size, dtype=torch.uint8).cuda()
         workspace = from_dlpack(workspace_torch, assumed_align=16).mark_layout_dynamic()
-        hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(hstu_bwd_sm100, problem_shape, q_tensor, k_tensor, v_tensor, dq_tensor, dk_tensor, dv_tensor, do_tensor, cu_seqlens_q_tensor, cu_seqlens_k_tensor, Int32(window_size_left), Int32(window_size_right), workspace, current_stream)
-
-    hstu_varlen_bwd_100.compile_cache[compile_key](
-        problem_shape,
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        dq_tensor,
-        dk_tensor,
-        dv_tensor,
-        do_tensor,
-        cu_seqlens_q_tensor,
-        cu_seqlens_k_tensor,
-        Int32(window_size_left),
-        Int32(window_size_right),
-        workspace,
-        current_stream
-    )
+        with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
+            hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(hstu_bwd_sm100, problem_shape, q_tensor, k_tensor, v_tensor, dq_tensor, dk_tensor, dv_tensor, do_tensor, cu_seqlens_q_tensor, cu_seqlens_k_tensor, Int32(window_size_left), Int32(window_size_right), workspace, current_stream)
+    with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
+        hstu_varlen_bwd_100.compile_cache[compile_key](problem_shape, q_tensor, k_tensor, v_tensor, dq_tensor, dk_tensor, dv_tensor, do_tensor, cu_seqlens_q_tensor, cu_seqlens_k_tensor, Int32(window_size_left), Int32(window_size_right), workspace, current_stream)
 
     dq = dq.squeeze(4).squeeze(2).permute(0, 2, 1)
     dk = dk.squeeze(4).squeeze(2).permute(0, 2, 1)

@@ -90,19 +90,25 @@ class HSTUAttentionForwardSm100:
         self.mma_warp_id = 12
         self.load_warp_id = 13
         self.empty_warp_ids = (14, 15)
-        SM100_TMEM_CAPACITY_COLUMNS = 512
-        self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
+        self.num_regs_silu = 200
+        self.num_regs_epilogue = 64
+        self.num_regs_other = 48
+
+        self.num_regs_empty = 40
         self.threads_per_cta = cute.arch.WARP_SIZE * len(
             (
                 *self.silu0_warp_ids,
                 *self.silu1_warp_ids,
+                *self.epilogue_warp_ids,
                 self.mma_warp_id,
                 self.load_warp_id,
-                *self.epilogue_warp_ids,
                 *self.empty_warp_ids,
             )
         )
+
+        SM100_TMEM_CAPACITY_COLUMNS = 512
+        self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         self.tmem_alloc_sync_bar_id = 1
 
@@ -112,16 +118,6 @@ class HSTUAttentionForwardSm100:
         assert self.tmem_total <= SM100_TMEM_CAPACITY_COLUMNS
         self.tmem_s_to_p_offset = self.kBlockN // 2
         self.tmem_p_offset = [self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(2)]  # 0, 128
-
-        if self.head_dim_padded < 96:
-            self.num_regs_silu = 160  # 200 defalut
-            self.num_regs_epilogue = 64
-            self.num_regs_other = 48
-        else:
-            self.num_regs_silu = 160  # 192 if self.is_causal or self.is_local else 184
-            self.num_regs_epilogue = 64
-            self.num_regs_other = 64 if self.is_causal or self.is_local else 80
-        self.num_regs_empty = 24
 
         self.buffer_align_bytes = 1024
 
@@ -145,7 +141,7 @@ class HSTUAttentionForwardSm100:
         # 128 * 160, so that indexing the 0th and 2nd stages will get the right address,
         # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
         self.uneven_kv_smem = self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
-        self.uneven_kv_smem_offset = self.kBlockM * (self.head_dim_padded - self.head_dim_v_padded) // 2 if self.uneven_kv_smem else 0
+        self.uneven_kv_smem_offset = self.kBlockM * (self.head_dim_padded - self.head_dim_v_padded) // 2 if self.uneven_kv_smem else 0 
         assert self.uneven_kv_smem_offset % 1024 == 0
 
     @cute.jit
@@ -187,21 +183,16 @@ class HSTUAttentionForwardSm100:
         # Assume all strides are divisible by 128 bits except the last stride
         new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mQ, mK, mV, mO)]
-        # QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         QO_layout_transpose = [0, 2, 1]
         mQ, mO = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=QO_layout_transpose))
             for t in (mQ, mO)
         ]
-        # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
-        # KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         KV_layout_transpose = [0, 2, 1]
         mK, mV = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
             for t in (mK, mV)
         ]
-        # (s, d, h, b) -> (d, s, h, b)
-        # V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         V_layout_transpose = [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
 
@@ -521,7 +512,7 @@ class HSTUAttentionForwardSm100:
 
         tStSs = tuple(cute.make_tensor(tStS.iterator + self.tmem_s_offset[stage], tStS.layout)
                       for stage in range(2))
-        tOtOs = tuple(cute.make_tensor(tOtO.iterator + self.tmem_o_offset[stage], tOtO.layout)
+        tOtOs = tuple(cute.make_tensor(tStSs[0].iterator + self.tmem_o_offset[stage], tOtO.layout)
                       for stage in range(self.q_stage))
 
         tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
@@ -556,7 +547,7 @@ class HSTUAttentionForwardSm100:
         #  EMPTY
         # ///////////////////////////////////////////////////////////////////////////////
         if const_expr(len(self.empty_warp_ids) > 0):
-            if warp_idx == self.empty_warp_ids[0]:
+            if warp_idx >= self.empty_warp_ids[0] and warp_idx <= self.empty_warp_ids[-1]:
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -627,10 +618,11 @@ class HSTUAttentionForwardSm100:
             cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  Softmax
+        #  SilU
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.silu0_warp_ids[0] and warp_idx <= self.silu1_warp_ids[-1]:
             # increase register after decreasing
+            tidx = cute.arch.thread_idx()[0]
             cute.arch.warpgroup_reg_alloc(self.num_regs_silu)
             silu_loop = partial(
                 self.silu_loop,
@@ -1182,14 +1174,15 @@ class HSTUAttentionForwardSm100:
         coord: cute.Tensor,
         tensor_shape: cute.Shape,
     ):
+        copy_bits = 32
         copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.o_dtype,
-            num_bits_per_copy=128,
+            num_bits_per_copy=copy_bits,
         )
         copy_op = cute.make_cotiled_copy(
             copy_atom,
-            cute.make_layout((1, 128 // self.o_dtype.width)),
+            cute.make_layout((1, copy_bits // self.o_dtype.width)),
             regs.layout,
         )
         thr_copy = copy_op.get_slice(0)
@@ -1220,8 +1213,12 @@ class HSTUAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
+        # load_op = cute.make_copy_atom(
+        #     tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)),
+        #     self.pv_acc_dtype,
+        # )
         load_op = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)),
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(1)),
             self.pv_acc_dtype,
         )
         epi_consumer_phase = Int32(0)
@@ -1258,7 +1255,6 @@ class HSTUAttentionForwardSm100:
                         (tOrO_t2r[j], tOrO_t2r[j + 1]), (scale, scale),
                     )
                 self.store(tOgO_r2g, tOrO_t2r, tOcO_r2g, (seqlen.seqlen_q, self.head_dim_v_padded))
-            # if tidx % 32 == 0: cute.printf("epilogue over warp idx = %d\n", cute.arch.warp_idx())
             # Advance to next tile
             epi_consumer_phase ^= 1
             tile_scheduler.advance_to_next_work()
