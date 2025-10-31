@@ -35,6 +35,7 @@ from .block_info import BlockInfo
 import fbgemm_gpu.experimental.hstu.src.hstu_blackwell.blackwell_helpers as sm100_utils
 from .fast_math import FastDivmod, FastSilU
 from .tile_scheduler import TileSchedulerArguments, SingleTileVarlenScheduler, ParamsBase
+from .named_barrier import NamedBarrierFwd
 
 
 class HSTUAttentionForwardSm100:
@@ -83,6 +84,10 @@ class HSTUAttentionForwardSm100:
         # Does S1 need to wait for S0 to finish
         self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         # self.s0_s1_barrier = True
+        self.overlap_sO_sQ = self.head_dim_padded == 192 and self.head_dim_v_padded >= 64
+        if self.overlap_sO_sQ:
+            assert self.head_dim_padded >= self.head_dim_v_padded  # We assume sQ is larger than sO
+            self.is_persistent = False
 
         self.silu0_warp_ids = (0, 1, 2, 3)
         self.silu1_warp_ids = (4, 5, 6, 7)
@@ -257,6 +262,9 @@ class HSTUAttentionForwardSm100:
         sV_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_pv, self.mma_tiler_pv, self.v_dtype, self.kv_stage,
         )
+        sO_layout = sm100_utils_basic.make_smem_layout_epi(
+            self.o_dtype, self.o_layout, self.epi_tile, self.epi_stage,
+        )
         if const_expr(not self.same_hdim_kv_padded):
             # sK and sV are using the same physical smem so we need to adjust the stride so that they line up
             stride_sK = const_expr(max(sK_layout.outer.stride[-1], 0))  # take max to turn tuple to Int32
@@ -296,6 +304,24 @@ class HSTUAttentionForwardSm100:
             self.cluster_layout_vmnk.shape,
         )
 
+        num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
+        universal_copy_bits = 128
+        async_copy_elems = universal_copy_bits // self.o_dtype.width
+        atom_universal_copy = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.o_dtype,
+            num_bits_per_copy=universal_copy_bits,
+        )
+        tO_shape_dim_1 = sO_layout.outer.shape[1][0] // async_copy_elems
+        tO_layout = cute.make_ordered_layout(
+            (num_epilogue_threads // tO_shape_dim_1, tO_shape_dim_1),
+            order=(1, 0),
+        )
+        # So that we don't have to check if we overshoot kBlockM when we store O
+        assert self.kBlockM % tO_layout.shape[0] == 0
+        vO_layout = cute.make_layout((1, async_copy_elems))
+        gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
+
         self.tma_copy_q_bytes = cute.size_in_bytes(self.q_dtype, cute.select(sQ_layout, mode=[0, 1, 2]))
         self.tma_copy_k_bytes = cute.size_in_bytes(self.k_dtype, cute.select(sK_layout, mode=[0, 1, 2]))
         self.tma_copy_v_bytes = cute.size_in_bytes(self.v_dtype, cute.select(sV_layout, mode=[0, 1, 2]))
@@ -319,6 +345,8 @@ class HSTUAttentionForwardSm100:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
+        
+        cute.printf(f"grid_dim: {grid_dim}")
 
         self.mbar_load_q_full_offset = 0
         self.mbar_load_q_empty_offset = self.mbar_load_q_full_offset + self.q_stage
@@ -331,6 +359,8 @@ class HSTUAttentionForwardSm100:
         self.mbar_tmem_dealloc_offset = self.mbar_s0_s1_sequence_offset + 8
         self.mbar_P_full_2_offset = self.mbar_tmem_dealloc_offset + 1
         self.mbar_total = self.mbar_P_full_2_offset + 2
+
+        sO_size = cute.cosize(sO_layout) if const_expr(not self.overlap_sO_sQ) else 0
 
         @cute.struct
         class SharedStorage:
@@ -347,6 +377,10 @@ class HSTUAttentionForwardSm100:
             sK: cute.struct.Align[
                 # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
                 cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                self.buffer_align_bytes,
+            ]
+            sO: cute.struct.Align[
+                cute.struct.MemRange[self.o_dtype, sO_size],
                 self.buffer_align_bytes,
             ]
         self.shared_storage = SharedStorage
@@ -384,6 +418,8 @@ class HSTUAttentionForwardSm100:
             sK_layout,
             tP_layout,
             sV_layout,
+            sO_layout,
+            gmem_tiled_copy_O,
             tiled_mma_qk,
             tiled_mma_pv,
             tile_sched_params,
@@ -420,6 +456,8 @@ class HSTUAttentionForwardSm100:
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
+        sO_layout: cute.ComposedLayout,
+        gmem_tiled_copy_O: cute.TiledCopy,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
@@ -495,6 +533,11 @@ class HSTUAttentionForwardSm100:
         # (MMA, MMA_K, MMA_D, PIPE)
         # Strip swizzle info to reuse smem
         sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+        
+        if const_expr(not self.overlap_sO_sQ):
+            sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
+        else:
+            sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner), sO_layout.outer)
 
         thr_mma_qk = tiled_mma_qk.get_slice(0)  # default 1SM
         thr_mma_pv = tiled_mma_pv.get_slice(0)  # default 1SM
@@ -662,7 +705,7 @@ class HSTUAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_epilogue)
-            self.epilogue_t2g(thr_mma_pv, tOtOs, mO, mbar_ptr, SeqlenInfoCls, TileSchedulerCls)
+            self.epilogue_t2g(gmem_tiled_copy_O, thr_mma_pv, tOtOs, mO, sO, mbar_ptr, SeqlenInfoCls, TileSchedulerCls)
             cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
         return
 
@@ -1121,7 +1164,7 @@ class HSTUAttentionForwardSm100:
 
         # Wait for Si
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
-        tSrS_t2r = cute.make_fragment(tScS_t2r_shape, self.qk_acc_dtype)
+        tSrS_t2r = cute.make_rmem_tensor(tScS_t2r_shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)  # copy from tmem to rmem
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
@@ -1129,7 +1172,7 @@ class HSTUAttentionForwardSm100:
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_wait(mbar_ptr + mbar_s0_s1_sequence_offset + stage * 4, s0_s1_sequence_phase)
-        tSrP_r2t_f32 = cute.make_fragment(thr_tmem_store.partition_S(tScP).shape, Float32)
+        tSrP_r2t_f32 = cute.make_rmem_tensor(thr_tmem_store.partition_S(tScP).shape, Float32)
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout,
         )
@@ -1150,111 +1193,92 @@ class HSTUAttentionForwardSm100:
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage) # split P in kBlockN, issue two mma instructions in sm100
         return mma_si_consumer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
-    @cute.jit
-    def quantize(
-        self,
-        input: cute.Tensor,
-        frg_cnt: Int32,
-    ) -> cute.Tensor:
-        tidx, tidy, tidz = cute.arch.thread_idx()
-        output = cute.make_fragment(input.shape, self.o_dtype)
-        frg_tile = cute.size(input) // frg_cnt
-        t_frg = cute.logical_divide(input, cute.make_layout(frg_cnt))
-        output_frg = cute.make_tensor(output.iterator, t_frg.layout)
-        for i in cutlass.range(frg_tile, unroll_full=True):
-            frg_vec = t_frg[None, i].load()
-            output_frg[None, i].store(frg_vec.to(self.o_dtype))
-        return output
-
-    @cute.jit
-    def store(
-        self,
-        gmem: cute.Tensor,
-        regs: cute.Tensor,
-        coord: cute.Tensor,
-        tensor_shape: cute.Shape,
-    ):
-        copy_bits = 32
-        copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.o_dtype,
-            num_bits_per_copy=copy_bits,
-        )
-        copy_op = cute.make_cotiled_copy(
-            copy_atom,
-            cute.make_layout((1, copy_bits // self.o_dtype.width)),
-            regs.layout,
-        )
-        thr_copy = copy_op.get_slice(0)
-
-        tCg = thr_copy.partition_D(gmem)
-        tCr = thr_copy.partition_S(self.quantize(regs, 4))
-        tPc = thr_copy.partition_D(coord)
-
-        preds_shape = (tPc.shape[0][1], tPc.shape[1], tPc.shape[2], tPc.shape[3])
-        preds = cute.make_fragment(preds_shape, Boolean)
-        for v in cutlass.range_constexpr(preds.shape[0]):
-            for m in cutlass.range_constexpr(preds.shape[1]):
-                for n in cutlass.range_constexpr(preds.shape[2]):
-                    for k in cutlass.range_constexpr(preds.shape[3]):
-                        lhs = tPc[(0, v), m, n, k]
-                        val = cute.elem_less(lhs, tensor_shape)
-                        preds[v, m, n, k] = val
-
-        cute.copy(copy_atom, tCr, tCg, pred=preds)
 
     @cute.jit
     def epilogue_t2g(
         self,
-        thr_mma_pv: cute.core.ThrMma,
+        gmem_tiled_copy_O: cute.TiledCopy,
+        thr_mma_pv: cute.ThrMma,
         tOtOs: cute.Tensor,
         mO: cute.Tensor,
+        sO: cute.Tensor,
         mbar_ptr: cute.Pointer,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
-        # load_op = cute.make_copy_atom(
-        #     tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)),
-        #     self.pv_acc_dtype,
-        # )
-        load_op = cute.make_copy_atom(
-            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(1)),
-            self.pv_acc_dtype,
-        )
         epi_consumer_phase = Int32(0)
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.epilogue_warp_ids))
-        # if tidx % 32 == 0: cute.printf("epilogue begin warp idx = %d\n", cute.arch.warp_idx())
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            scale = cute.arch.rcp_approx(seqlen.max_seqlen_q)
             for stage in cutlass.range_constexpr(self.q_stage):
                 offset = seqlen.offset_q + (self.q_stage * m_block + stage) * self.kBlockM 
                 mO_cur = cute.domain_offset((offset, 0), mO[None, None, head_idx])
                 gO = cute.local_tile(mO_cur, (self.kBlockM, self.head_dim_v_padded), (0, 0))
-                cO = cute.domain_offset(
-                    ((self.q_stage * m_block + stage) * self.kBlockM, 0),
-                    cute.make_identity_tensor((self.kBlockM, self.head_dim_v_padded)),
-                )
+                cO = cute.make_identity_tensor((self.kBlockM, self.head_dim_v_padded))
+                dim_tile_size = 128 // self.o_dtype.width
                 tOtO = tOtOs[stage]
-                tOtO = tOtO[(None, None), 0, 0]
-                # 1. wait for O0 / O1 final
-                cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, epi_consumer_phase)
-                # 2. copy tO0/O1 to rmem and rmem to gmem
-                tiled_tmem_load = tcgen05.make_tmem_copy(load_op, tOtO)
+                tOsO = thr_mma_pv.partition_C(sO[None, None, stage])
+          
+                tOtO_i = cute.logical_divide(tOtO, cute.make_layout((self.kBlockM, dim_tile_size)))
+                tOsO_i = cute.logical_divide(tOsO, cute.make_layout((self.kBlockM, dim_tile_size)))
+
+                epi_subtile = (self.epi_tile[0], dim_tile_size)
+                tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
+                    self.mma_tiler_pv,
+                    self.o_layout,
+                    self.o_dtype,
+                    self.pv_acc_dtype,
+                    epi_subtile,
+                    use_2cta_instrs=False,
+                )
+                tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_i[(None, None), 0])
                 thr_tmem_load = tiled_tmem_load.get_slice(tidx)
-                tOtO_t2r = thr_tmem_load.partition_S(tOtO)
-                tOgO_r2g = thr_tmem_load.partition_D(gO)
-                tOcO_r2g = thr_tmem_load.partition_D(cO)
-                tOrO_t2r = cute.make_fragment(tOcO_r2g.shape, self.pv_acc_dtype)
-                cute.copy(tiled_tmem_load, tOtO_t2r, tOrO_t2r)
-                scale = cute.arch.rcp_approx(seqlen.max_seqlen_q)
-                for j in cutlass.range_constexpr(0, cute.size(tOrO_t2r), 2):
-                    tOrO_t2r[j], tOrO_t2r[j + 1] = cute.arch.mul_packed_f32x2(
-                        (tOrO_t2r[j], tOrO_t2r[j + 1]), (scale, scale),
-                    )
-                self.store(tOgO_r2g, tOrO_t2r, tOcO_r2g, (seqlen.seqlen_q, self.head_dim_v_padded))
+                smem_copy_atom = sm100_utils_basic.get_smem_store_op(
+                    self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
+                )
+                tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
+                tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
+                tOsO_r2s = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
+
+                cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, epi_consumer_phase)
+                for i in cutlass.range_constexpr(self.head_dim_v_padded // dim_tile_size):
+                    tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
+                    tOsO_r2s_i = tOsO_r2s[None, 0, 0, i]
+                    tOrO_frg = cute.make_rmem_tensor(tOsO_r2s[None, 0, 0, i].shape, self.pv_acc_dtype)
+                    cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
+                    for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
+                        tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
+                            (tOrO_frg[j], tOrO_frg[j + 1]),
+                            (scale, scale),
+                        )
+                    tOrO_frg_cvt = cute.make_rmem_tensor(tOrO_frg.shape, self.o_dtype)
+                    tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
+                    cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
+                # wait for sO ready
+                cute.arch.barrier(barrier_id=NamedBarrierFwd.Epilogue, number_of_threads=cute.arch.WARP_SIZE * len(self.epilogue_warp_ids))
+                # s2r and r2g
+                gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+                tOsO = gmem_thr_copy_O.partition_S(sO[None, None, stage])
+                tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
+                tOgO = gmem_thr_copy_O.partition_D(gO)
+                tOcO = gmem_thr_copy_O.partition_S(cO)
+                t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
+                tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
+                for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
+                    # 1% better performance than tOcO[0, rest_m, 0][0] < seqlen.seqlen_q - (self.q_stage * m_block + stage) * self.kBlockM
+                    if t0OcO[0, rest_m, 0][0] < seqlen.seqlen_q - (self.q_stage * m_block + stage) * self.kBlockM - tOcO[0][0]: 
+                        cute.autovec_copy(tOsO[None, rest_m, None], tOrO[None, rest_m, None])
+                        cute.copy(
+                            gmem_tiled_copy_O, 
+                            tOrO[None, rest_m, None], 
+                            tOgO[None, rest_m, None],
+                            pred=tOpO[None, rest_m, None] if self.check_hdim_v_oob else None,
+                        )
+
             # Advance to next tile
             epi_consumer_phase ^= 1
             tile_scheduler.advance_to_next_work()
