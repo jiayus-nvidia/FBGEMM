@@ -83,7 +83,6 @@ class HSTUAttentionForwardSm100:
         self.qhead_per_kvhead = qhead_per_kvhead
         # Does S1 need to wait for S0 to finish
         self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
-        # self.s0_s1_barrier = True
         self.overlap_sO_sQ = self.head_dim_padded == 192 and self.head_dim_v_padded >= 64
         if self.overlap_sO_sQ:
             assert self.head_dim_padded >= self.head_dim_v_padded  # We assume sQ is larger than sO
@@ -345,8 +344,6 @@ class HSTUAttentionForwardSm100:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
-        
-        cute.printf(f"grid_dim: {grid_dim}")
 
         self.mbar_load_q_full_offset = 0
         self.mbar_load_q_empty_offset = self.mbar_load_q_full_offset + self.q_stage
@@ -1023,7 +1020,6 @@ class HSTUAttentionForwardSm100:
         """
         tidx = cute.arch.thread_idx()[0] % (
             cute.arch.WARP_SIZE
-            # * (len(self.silu0_warp_ids) if stage == 0 else len(self.silu1_warp_ids)
             * (len(self.silu0_warp_ids)
             )
         )
@@ -1031,7 +1027,7 @@ class HSTUAttentionForwardSm100:
         cS_base = cute.make_identity_tensor((self.mma_tiler_qk[0], self.mma_tiler_qk[1]))
         tScS = thr_mma_qk.partition_C(cS_base)
 
-        tilePlikeFP32 = self.mma_tiler_qk[1] // 32 * self.v_dtype.width
+        tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tStP_layout = cute.composition(tStSi.layout, cute.make_layout((self.kBlockM, tilePlikeFP32)))
         tStP = cute.make_tensor(tStSi.iterator + self.tmem_s_to_p_offset, tStP_layout)
 
@@ -1177,7 +1173,6 @@ class HSTUAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout,
         )
         fastsilu.apply_silu_convert(tSrS_t2r, tSrP_r2t)
-
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)

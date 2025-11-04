@@ -8,7 +8,7 @@ from cutlass import Int32, Uint32, Float32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-from .utils import tanhf
+from .utils import tanhf, mul_packed_f32x2, fma_packed_f32x2
 
 @cute.jit
 def clz(x: Int32) -> Int32:
@@ -100,7 +100,7 @@ class FastDivmod:
 class FastSilU:
     def __init__(self, score_scale: Float32, loc=None, ip=None):
         self._loc = loc
-        self.score_scale = score_scale
+        self.score_scale = score_scale * 0.5
 
     @cute.jit
     def apply_silu_convert(
@@ -119,12 +119,17 @@ class FastSilU:
         )
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
-                v0 = acc_S_row_frg[k, j] * self.score_scale * 0.5
-                v1 = acc_S_row_frg[k + 1, j] * self.score_scale * 0.5
+                v0, v1 = mul_packed_f32x2(
+                    (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
+                    (self.score_scale, self.score_scale),
+                )
                 tanh_v0 = tanhf(v0)
                 tanh_v1 = tanhf(v1)
-                out_v0 = v0 * tanh_v0 + v0
-                out_v1 = v1 * tanh_v1 + v1
+                out_v0, out_v1 = fma_packed_f32x2(
+                    (v0, v1),
+                    (tanh_v0, tanh_v1),
+                    (v0, v1),
+                )
                 acc_S_row_frg[k, j] = out_v0 if v0 > -10.0 else 0.0
                 acc_S_row_frg[k + 1, j] = out_v1 if v1 > -10.0 else 0.0
             acc_S_row_converted_frg[None, j].store(
