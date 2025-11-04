@@ -173,6 +173,9 @@ def hstu_varlen_bwd_100(
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1) if t is not None else None
         for t in (num_contexts, num_targets, func)
     ]
+    workspace_size = ((max_seqlen_q + 7) // 8 * 8) * num_heads * head_dim * batch_size * Float32.width // 8
+    workspace_torch = torch.zeros(workspace_size, dtype=torch.uint8).cuda()
+    workspace = from_dlpack(workspace_torch, assumed_align=16).mark_layout_dynamic()
 
     current_stream = cutlass_torch.default_stream()
     problem_shape = (Int32(max_seqlen_q), Int32(max_seqlen_k), Int32(head_dim), ((Int32(1), Int32(num_heads)), Int32(batch_size)))
@@ -192,11 +195,6 @@ def hstu_varlen_bwd_100(
             is_arbitrary=is_arbitrary,
             func_num=func_num,
         )
-        workspace_size = HSTUAttentionBackwardSm100._get_workspace_size(
-            max_seqlen_q, max_seqlen_k, head_dim, num_heads, batch_size
-        )
-        workspace_torch = torch.zeros(workspace_size, dtype=torch.uint8).cuda()
-        workspace = from_dlpack(workspace_torch, assumed_align=16).mark_layout_dynamic()
         hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(hstu_bwd_sm100, problem_shape, q_tensor, k_tensor, v_tensor, dq_tensor, dk_tensor, dv_tensor, do_tensor, cu_seqlens_q_tensor, cu_seqlens_k_tensor, Int32(window_size_left), Int32(window_size_right), num_contexts_tensor, num_targets_tensor, func_tensor, workspace, current_stream)
 
     hstu_varlen_bwd_100.compile_cache[compile_key](

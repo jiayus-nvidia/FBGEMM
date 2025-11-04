@@ -35,6 +35,7 @@ from .block_info import BlockInfo
 import fbgemm_gpu.experimental.hstu.src.hstu_blackwell.blackwell_helpers as sm100_utils
 from .fast_math import FastDivmod, FastSilU
 from .tile_scheduler import TileSchedulerArguments, SingleTileVarlenScheduler, ParamsBase
+from .named_barrier import NamedBarrierFwd
 
 
 class HSTUAttentionForwardSm100:
@@ -354,6 +355,7 @@ class HSTUAttentionForwardSm100:
         self.mbar_tmem_dealloc_offset = self.mbar_s0_s1_sequence_offset + 8
         self.mbar_P_full_2_offset = self.mbar_tmem_dealloc_offset + 1
         self.mbar_total = self.mbar_P_full_2_offset + 2
+        self.MaxValidBlock = 64 * 1024 // self.kBlockN if self.is_arbitrary else 1
 
         @cute.struct
         class SharedStorage:
@@ -361,6 +363,7 @@ class HSTUAttentionForwardSm100:
             mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mbar_total]
             # Tmem holding buffer
             tmem_holding_buf: Int32
+            sn_valid_block_max: cute.struct.MemRange[Int32, 1]
             # Smem tensors
             sQ: cute.struct.Align[
                 cute.struct.MemRange[self.q_dtype, cute.cosize(sQ_layout)],
@@ -370,6 +373,15 @@ class HSTUAttentionForwardSm100:
             sK: cute.struct.Align[
                 # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
                 cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                self.buffer_align_bytes,
+            ]
+            # Smem tensor for valid block ids
+            sValidBlockIds: cute.struct.Align[
+                cute.struct.MemRange[Int32, self.MaxValidBlock],
+                self.buffer_align_bytes,
+            ]
+            sBlockBound: cute.struct.Align[
+                cute.struct.MemRange[Int32, self.func_num + 1],
                 self.buffer_align_bytes,
             ]
         self.shared_storage = SharedStorage
@@ -553,11 +565,24 @@ class HSTUAttentionForwardSm100:
             tOrP.layout,
         ) for stage in range(2)]
 
+        func_tensor = func[0, None, None] if func is not None else None
+        sValidBlockIdsTensor = cute.make_tensor(storage.sValidBlockIds.data_ptr(), self.MaxValidBlock)
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
             self.cta_tiler[0], self.cta_tiler[1], self.is_causal, self.is_local,
+            self.is_context, self.is_target, self.target_group_size,
             window_size_left, window_size_right,
-            qhead_per_kvhead_packgqa=1,
+            storage.sn_valid_block_max.data_ptr(), sValidBlockIdsTensor,
+            storage.sBlockBound.data_ptr(), self.func_num, func_tensor,
+            NamedBarrierFwd.Arbitrary, cute.arch.WARP_SIZE
+                * len(
+                    (
+                        self.load_warp_id,
+                        self.mma_warp_id,
+                        *self.silu0_warp_ids,
+                        *self.silu1_warp_ids,
+                    )
+                )
         )
         SeqlenInfoCls = partial(
             SeqlenInfo,
@@ -780,22 +805,36 @@ class HSTUAttentionForwardSm100:
                 K_or_V="V",
             )
 
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history = block_info.get_n_block_info(seqlen, m_block)
+            if const_expr(self.is_arbitrary):
+                n_block_max, n_block_min = block_info.get_valid_block_ids(seqlen, m_block, n_block_max, n_block_min, is_calwarp=True)
+            sValidBlockIds = block_info.sValidBlockIds
+            n_block = n_block_max - 1
+            n_block = sValidBlockIds[n_block] if self.is_arbitrary else n_block
             load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
-            load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=None)  # K0
+            load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)  # K0
             kv_producer_state.advance()
             if const_expr(self.q_stage == 2):
                 load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1
             q_producer_phase ^= 1
-            load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=None)  # V0
+            load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)  # V0
             kv_producer_state.advance()
-            for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
-                n_block = n_block_max - 2 - i
-                # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
+            masking_step = 0
+            n_block_valid = n_block_max - 1
+            if is_jump and masking_step == n_masking_steps - 1:
+                n_block_valid = min(n_block_valid, n_block_history)
+            masking_step += 1
+            n_block_valid -= 1
+            while n_block_valid >= n_block_min:
+                n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
                 load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)  # Ki
                 kv_producer_state.advance()
                 load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)  # Vi
                 kv_producer_state.advance()
+                if is_jump and masking_step == n_masking_steps - 1:
+                    n_block_valid = min(n_block_valid, n_block_history)
+                masking_step += 1
+                n_block_valid -= 1
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -861,7 +900,10 @@ class HSTUAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history = block_info.get_n_block_info(seqlen, m_block)
+            if const_expr(self.is_arbitrary):
+                n_block_max, n_block_min = block_info.get_valid_block_ids(seqlen, m_block, n_block_max, n_block_min, is_calwarp=False)
+            sValidBlockIds = block_info.sValidBlockIds
 
             for stage in cutlass.range_constexpr(self.q_stage):
                 # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
@@ -894,7 +936,13 @@ class HSTUAttentionForwardSm100:
 
             # O hasn't been accumulated yet, its first MMA calculation doesn't need to accumulate
             O_should_accumulate = False
-            for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+            n_block_valid = n_block_max - 1
+            masking_step = 0
+            if is_jump and masking_step == n_masking_steps - 1:
+                n_block_valid = min(n_block_valid, n_block_history)
+            masking_step += 1
+            n_block_valid -= 1
+            while n_block_valid >= n_block_min:
                 # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                 # 1. wait for V0
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
@@ -951,6 +999,11 @@ class HSTUAttentionForwardSm100:
                 mma_kv_consumer_state.advance()
                 P_full_O_rescaled_phase ^= 1
                 O_should_accumulate = True
+
+                if is_jump and masking_step == n_masking_steps - 1:
+                    n_block_valid = min(n_block_valid, n_block_history)
+                masking_step += 1
+                n_block_valid -= 1
             # End of seqlen_kv loop
 
             # release Q0 & Q1
@@ -1049,7 +1102,10 @@ class HSTUAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history = block_info.get_n_block_info(seqlen, m_block)
+            if const_expr(self.is_arbitrary):
+                n_block_max, n_block_min = block_info.get_valid_block_ids(seqlen, m_block, n_block_max, n_block_min, is_calwarp=False)
+            sValidBlockIds = block_info.sValidBlockIds
             # func: (head_func, n_func, L_func) -> (n_func, L_func)
             func_tensor = func[0, None, None] if func is not None else None
             mask = AttentionMaskCls(offset_q=seqlen.offset_q, seqlen_q=seqlen.seqlen_q, seqlen_k=seqlen.seqlen_k, seqlen_c=seqlen.seqlen_c, seqlen_h=seqlen.seqlen_h, func=func_tensor)
@@ -1078,34 +1134,16 @@ class HSTUAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
             )
 
-            # 1 masking iter
-            mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block_max - 1, is_first=True, mask_fn=partial(mask_fn))
-            n_block_max -= 1
-            # Next couple of iterations with causal masking
-            if const_expr(self.is_causal or self.is_local):
-                n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
-                    seqlen, m_block, n_block_min
-                )
-                for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
-                    n_block = n_block_max - 1 - n_tile
-                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
-                n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
-            # The remaining iterations have no masking
-            n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
-                seqlen, m_block, n_block_min
-            )
-            for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
-                n_block = n_block_max - n_tile - 1
+            n_block_valid = n_block_max - 1
+            masking_step = 0
+            while n_block_valid >= n_block_min:
+                n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
                 mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
-            # Separate iterations with local masking on the left
-            if const_expr(self.is_local and block_info.window_size_left is not None):
-                n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
-                for n_tile in cutlass.range(0, n_block_max - n_block_min, unroll=1):
-                    n_block = n_block_max - 1 - n_tile
-                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
-                    # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
+                if is_jump and masking_step == n_masking_steps - 1:
+                    n_block_valid = min(n_block_valid, n_block_history)
+                masking_step += 1
+                n_block_valid -= 1
 
-            # if tidx % 32 == 0: cute.printf("softmax over warp idx = %d\n", cute.arch.warp_idx())
             # Advance to next tile
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -1133,7 +1171,6 @@ class HSTUAttentionForwardSm100:
         buffers = None,
         fastdiv_mods = (None, None),
         mask_fn: Optional[Callable] = None,
-        is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32]:
         """Perform a single step of the silu computation on a block of attention scores. It also handles
         optional masking of attention scores.
@@ -1257,7 +1294,6 @@ class HSTUAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.epilogue_warp_ids))
-        # if tidx % 32 == 0: cute.printf("epilogue begin warp idx = %d\n", cute.arch.warp_idx())
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
@@ -1287,7 +1323,6 @@ class HSTUAttentionForwardSm100:
                         (tOrO_t2r[j], tOrO_t2r[j + 1]), (scale, scale),
                     )
                 self.store(tOgO_r2g, tOrO_t2r, tOcO_r2g, (seqlen.seqlen_q, self.head_dim_v_padded))
-            # if tidx % 32 == 0: cute.printf("epilogue over warp idx = %d\n", cute.arch.warp_idx())
             # Advance to next tile
             epi_consumer_phase ^= 1
             tile_scheduler.advance_to_next_work()
