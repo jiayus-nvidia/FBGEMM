@@ -50,6 +50,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Float32, Float8E4M3FN, Float16, BFloat16, Boolean
 
 from .mask import AttentionMask
+from .utils import split_wg
 
 """
 A fused multi-head attention (FMHA) backward pass example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -1669,18 +1670,18 @@ class HSTUAttentionBackwardSm100:
         thr_t2r = tiled_t2r.get_slice(dp_idx)
 
         tTR_cST = thr_t2r.partition_D(cST)
-        tTR_cST = self.split_wg(tTR_cST, num_warp_groups, wg_idx)
+        tTR_cST = split_wg(tTR_cST, num_warp_groups, wg_idx)
         tTR_rST = cute.make_fragment(tTR_cST.shape, self.acc_dtype)
 
         tTR_tST = thr_t2r.partition_S(tSTtST)
-        tTR_tST = self.split_wg(tTR_tST, num_warp_groups, wg_idx)
+        tTR_tST = split_wg(tTR_tST, num_warp_groups, wg_idx)
 
         tTR_cdPT_p = thr_t2r.partition_D(cdPT)
-        tTR_cdPT = self.split_wg(tTR_cdPT_p, num_warp_groups, wg_idx)
+        tTR_cdPT = split_wg(tTR_cdPT_p, num_warp_groups, wg_idx)
         tTR_rdPT = cute.make_fragment(tTR_cdPT.shape, self.acc_dtype)
 
         tTR_tdPT = thr_t2r.partition_S(tdPTtdPT)
-        tTR_tdPT = self.split_wg(tTR_tdPT, num_warp_groups, wg_idx)
+        tTR_tdPT = split_wg(tTR_tdPT, num_warp_groups, wg_idx)
 
         tdVcST = PdO_tiled_mma.get_slice(0).partition_A(cST)
 
@@ -1688,15 +1689,16 @@ class HSTUAttentionBackwardSm100:
         thr_r2t = tiled_r2t.get_slice(dp_idx)
 
         tRT_tP = thr_r2t.partition_D(tdVrP)
-        tRT_tP = self.split_wg(tRT_tP, num_warp_groups, wg_idx)
+        tRT_tP = split_wg(tRT_tP, num_warp_groups, wg_idx)
 
         tRT_cST = thr_r2t.partition_S(tdVcST)
-        tRT_cST = self.split_wg(tRT_cST, num_warp_groups, wg_idx)
+        tRT_cST = split_wg(tRT_cST, num_warp_groups, wg_idx)
 
         is_residual_k = blk_coord_k * self.tile_shape_K + self.tile_shape_K >= K
         last_iter = iter_count - 1 + iter_index
         mask_fn = partial(
-            mask.apply_mask, n_block=blk_coord_k, thr_mma=KQ_thr_mma, thr_tmem_load=thr_t2r,
+            mask.apply_mask_swapAB, n_block=blk_coord_k, wg_idx=wg_idx,
+            thr_mma=KQ_thr_mma, thr_tmem_load=thr_t2r,
         )
 
         while iter_count > 0:
@@ -1796,7 +1798,7 @@ class HSTUAttentionBackwardSm100:
             sdS_slice_p = cute.composition(
                 sdS_slice_tmp[dp_idx, None], cute.make_layout(tTR_cdPT_p.shape)
             )
-            sdS_slice = self.split_wg(sdS_slice_p, num_warp_groups, wg_idx)
+            sdS_slice = split_wg(sdS_slice_p, num_warp_groups, wg_idx)
 
             cute.autovec_copy(tTR_rdST, sdS_slice)
 
@@ -1936,40 +1938,40 @@ class HSTUAttentionBackwardSm100:
 
         reduce_tma_store_pipeline.producer_tail()
 
-    @cute.jit
-    def split_wg(
-        self,
-        t: cute.Tensor,
-        num_warp_groups: Int32,
-        wg_idx: Int32,
-    ) -> cute.Tensor:
-        ret = None
-        if cutlass.const_expr(cute.rank(t.layout) == 3):
-            p = cute.composition(
-                t,
-                cute.make_layout(
-                    (
-                        t.shape[0],
-                        t.shape[1],
-                        (num_warp_groups, cute.size(t, mode=[2]) // num_warp_groups),
-                    )
-                ),
-            )
-            ret = p[None, None, (wg_idx, None)]
-        else:
-            p = cute.composition(
-                t,
-                cute.make_layout(
-                    (
-                        t.shape[0],
-                        t.shape[1],
-                        t.shape[2],
-                        (num_warp_groups, cute.size(t, mode=[3]) // num_warp_groups),
-                    )
-                ),
-            )
-            ret = p[None, None, None, (wg_idx, None)]
-        return ret
+    # @cute.jit
+    # def split_wg(
+    #     self,
+    #     t: cute.Tensor,
+    #     num_warp_groups: Int32,
+    #     wg_idx: Int32,
+    # ) -> cute.Tensor:
+    #     ret = None
+    #     if cutlass.const_expr(cute.rank(t.layout) == 3):
+    #         p = cute.composition(
+    #             t,
+    #             cute.make_layout(
+    #                 (
+    #                     t.shape[0],
+    #                     t.shape[1],
+    #                     (num_warp_groups, cute.size(t, mode=[2]) // num_warp_groups),
+    #                 )
+    #             ),
+    #         )
+    #         ret = p[None, None, (wg_idx, None)]
+    #     else:
+    #         p = cute.composition(
+    #             t,
+    #             cute.make_layout(
+    #                 (
+    #                     t.shape[0],
+    #                     t.shape[1],
+    #                     t.shape[2],
+    #                     (num_warp_groups, cute.size(t, mode=[3]) // num_warp_groups),
+    #                 )
+    #             ),
+    #         )
+    #         ret = p[None, None, None, (wg_idx, None)]
+    #     return ret
 
     @cute.jit
     def quantize(
@@ -2018,13 +2020,16 @@ class HSTUAttentionBackwardSm100:
         # {$nv-internal-release end}
         preds_shape = (tPc.shape[0][1], tPc.shape[1], tPc.shape[2], tPc.shape[3])
         preds = cute.make_fragment(preds_shape, Boolean)
-        for v in cutlass.range_constexpr(preds.shape[0]):
-            for m in cutlass.range_constexpr(preds.shape[1]):
-                for n in cutlass.range_constexpr(preds.shape[2]):
-                    for k in cutlass.range_constexpr(preds.shape[3]):
-                        lhs = tPc[(0, v), m, n, k]
-                        val = cute.elem_less(lhs, tensor_shape)
-                        preds[v, m, n, k] = val
+        
+        tPc_fake = cute.group_modes(tPc, 1, 4)
+        preds_shape_fake = (tPc_fake.shape[0][1], cute.size(tPc_fake, mode=[1]))
+        preds_fake = cute.make_tensor(preds.iterator, preds_shape_fake)
+
+        for i in cutlass.range_constexpr(0, cute.size(preds_fake, mode=[0])):
+            for j in cutlass.range_constexpr(0, cute.size(preds_fake, mode=[1])):
+                lhs = tPc_fake[(0, i), j]
+                val = cute.elem_less(lhs, tensor_shape)
+                preds_fake[i, j] = val
 
         cute.copy(copy_atom, tCr, tCg, pred=preds)
 
@@ -2127,12 +2132,12 @@ class HSTUAttentionBackwardSm100:
         thread_t2r_dK = tiled_t2r_dK.get_slice(dp_idx)
 
         tTR_cdK = thread_t2r_dK.partition_D(cdK)
-        tTR_cdK = self.split_wg(tTR_cdK, num_warp_groups, wg_idx)
+        tTR_cdK = split_wg(tTR_cdK, num_warp_groups, wg_idx)
         tTR_gdK = thread_t2r_dK.partition_D(gdK)
-        tTR_gdK = self.split_wg(tTR_gdK, num_warp_groups, wg_idx)
+        tTR_gdK = split_wg(tTR_gdK, num_warp_groups, wg_idx)
         tTR_rdK = cute.make_fragment(tTR_cdK.shape, self.acc_dtype)
         tTR_tdK = thread_t2r_dK.partition_S(tdKtdK)
-        tTR_tdK = self.split_wg(tTR_tdK, num_warp_groups, wg_idx)
+        tTR_tdK = split_wg(tTR_tdK, num_warp_groups, wg_idx)
 
         mdV_in = cute.make_tensor(
             dV.iterator, cute.make_layout((K, self.cta_tiler[2], HB), stride=dV.stride)
@@ -2157,12 +2162,12 @@ class HSTUAttentionBackwardSm100:
         thread_t2r_dV = tiled_t2r_dV.get_slice(dp_idx)
 
         tTR_cdV = thread_t2r_dV.partition_D(cdV)
-        tTR_cdV = self.split_wg(tTR_cdV, num_warp_groups, wg_idx)
+        tTR_cdV = split_wg(tTR_cdV, num_warp_groups, wg_idx)
         tTR_gdV = thread_t2r_dV.partition_D(gdV)
-        tTR_gdV = self.split_wg(tTR_gdV, num_warp_groups, wg_idx)
+        tTR_gdV = split_wg(tTR_gdV, num_warp_groups, wg_idx)
         tTR_rdV = cute.make_fragment(tTR_cdV.shape, self.acc_dtype)
         tTR_tdV = thread_t2r_dV.partition_S(tdVtdV)
-        tTR_tdV = self.split_wg(tTR_tdV, num_warp_groups, wg_idx)
+        tTR_tdV = split_wg(tTR_tdV, num_warp_groups, wg_idx)
 
         mma_compute_dKdV_pipeline.consumer_wait(mma_compute_dKdV_consumer_state)
 

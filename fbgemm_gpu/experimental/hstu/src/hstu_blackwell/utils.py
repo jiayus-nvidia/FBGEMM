@@ -728,3 +728,38 @@ def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
     vec = cute.make_fragment(1, dtype)
     vec[0] = a
     return vec.load()
+
+
+@cute.jit
+def split_wg(
+    t: cute.Tensor,
+    num_warp_groups: Int32,
+    wg_idx: Int32,
+) -> cute.Tensor:
+    ret = None
+    if cutlass.const_expr(cute.rank(t.layout) == 3):
+        p = cute.composition(
+            t,
+            cute.make_layout(
+                (
+                    t.shape[0],
+                    t.shape[1],
+                    (num_warp_groups, cute.size(t, mode=[2]) // num_warp_groups),
+                )
+            ),
+        )
+        ret = p[None, None, (wg_idx, None)]
+    else:
+        p = cute.composition(
+            t,
+            cute.make_layout(
+                (
+                    t.shape[0],
+                    t.shape[1],
+                    t.shape[2],
+                    (num_warp_groups, cute.size(t, mode=[3]) // num_warp_groups),
+                )
+            ),
+        )
+        ret = p[None, None, None, (wg_idx, None)]
+    return ret
