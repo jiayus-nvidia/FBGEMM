@@ -1721,7 +1721,7 @@ class HSTUAttentionBackwardSm100:
 
             # Compute P = silu(S)
             cute.copy(tiled_t2r, tTR_tST, tTR_rST)
-            mask_fn(tTR_rST, m_block=iter_count - 1)
+            mask_fn(tTR_rST, m_block=iter_index)
             tTR_rST_silu = cute.make_fragment_like(tTR_rST)
 
             # for i in cutlass.range(cute.size(tTR_rST), unroll_full=True):
