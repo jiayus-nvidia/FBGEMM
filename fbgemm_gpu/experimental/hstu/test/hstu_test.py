@@ -1285,7 +1285,7 @@ def _hstu_attention_maybe_from_cache_fp8(
     ori_n_k: int = n_k
     n_q = 16 * math.ceil(seqlen_q / 16)
     n_k = 16 * math.ceil(seqlen_k / 16)
-    dtype_out = torch.float16
+    dtype_out = q.dtype
     bm, bn = get_bm_and_bn_block_size_fwd(rab, attention_dim)
 
     if quant_mode == 0:
@@ -1441,7 +1441,7 @@ def _bwd_reference_fp8(
     n_q = 16 * math.ceil(seqlen_q / 16)
     n_k = 16 * math.ceil(seqlen_k / 16)
     L: int = q.size(0)
-    dtype_og = do.dtype
+    dtype_out = q.dtype
     bm, bn = get_bm_and_bn_block_size_bwd()
 
     if quant_mode == 0:
@@ -1660,9 +1660,9 @@ def _bwd_reference_fp8(
     dk = unpad_input(dk, k_offsets) / ori_n_q * alpha
 
     return (
-        dq.view(-1, num_heads, attention_dim),
-        dk.view(-1, num_heads, attention_dim),
-        dv.view(-1, num_heads, linear_dim),
+        dq.view(-1, num_heads, attention_dim).to(dtype_out),
+        dk.view(-1, num_heads, attention_dim).to(dtype_out),
+        dv.view(-1, num_heads, linear_dim).to(dtype_out),
         drab
     )
 

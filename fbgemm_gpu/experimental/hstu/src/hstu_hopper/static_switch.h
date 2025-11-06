@@ -124,3 +124,14 @@
       return __VA_ARGS__();                     \
     }                                           \
   }()
+
+#define DTYPE_SWITCH(COND, CONST_NAME, ...)      \
+  [&] {                                         \
+    if (COND == 0) {     \
+      using CONST_NAME = cutlass::bfloat16_t; \
+      return __VA_ARGS__();                     \
+    } else {                                    \
+      using CONST_NAME = cutlass::half_t; \
+      return __VA_ARGS__();                     \
+    }                                           \
+  }()

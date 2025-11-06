@@ -71,7 +71,8 @@ void set_params_fprop(
     int window_size_left,
     int window_size_right,
     const at::Tensor vt,
-    const at::Tensor vt_descale) {
+    const at::Tensor vt_descale,
+    const int output_dtype) {
   // Reset the parameters
   params = {};
 
@@ -79,6 +80,7 @@ void set_params_fprop(
       at::cuda::getCurrentDeviceProperties()->minor;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
   params.is_e4m3 = q.dtype() == torch::kFloat8_e4m3fn;
+  params.output_dtype = output_dtype;
 #ifdef HSTU_DISABLE_BF16
   TORCH_CHECK(
       !params.is_bf16, "This hstu attention build does not support bf16.");
@@ -313,6 +315,7 @@ void set_params_dgrad(
     bool has_drab,
     int window_size_left,
     int window_size_right,
+    const int output_dtype,
     bool deterministic) {
   set_params_fprop(
       params,
@@ -348,7 +351,8 @@ void set_params_dgrad(
       window_size_left,
       window_size_right,
       /*vt=*/torch::Tensor(),
-      /*vt_descale=*/torch::Tensor());
+      /*vt_descale=*/torch::Tensor(),
+      output_dtype);
 
   params.is_e5m2 = q.dtype() == torch::kFloat8_e5m2;
   params.has_drab = has_drab;
@@ -620,6 +624,7 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_90(
     std::optional<at::Tensor> rab,
     const std::optional<at::Tensor>& func,
     const int64_t quant_mode,
+    const int64_t output_dtype,
     const std::optional<at::Tensor>& vt,
     const std::optional<at::Tensor>& cu_seqlens_vt_descale,
     const std::optional<at::Tensor>& q_descale,
@@ -707,8 +712,7 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_90(
     CHECK_SHAPE(num_targets.value(), batch_size);
   }
 
-  auto out_type =
-      q_type == at::ScalarType::Float8_e4m3fn ? at::ScalarType::Half : q_type;
+  auto out_type = output_dtype == 0 ? at::ScalarType::BFloat16 : at::ScalarType::Half;
   at::Tensor out = torch::empty_like(q, out_type);
 
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -823,7 +827,8 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_90(
       window_size_left,
       window_size_right,
       vt.has_value() ? vt.value() : torch::Tensor(),
-      vt_descale.has_value() ? vt_descale.value() : torch::Tensor());
+      vt_descale.has_value() ? vt_descale.value() : torch::Tensor(),
+      output_dtype);
 
   auto tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
   params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
@@ -1074,6 +1079,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_90(
     const std::optional<at::Tensor>& cu_seqlens_kt_descale,
     const std::optional<at::Tensor>& cu_seqlens_q_block_descale,
     const std::optional<at::Tensor>& cu_seqlens_kv_block_descale,
+    const int64_t output_dtype,
     const bool deterministic) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
@@ -1185,9 +1191,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_90(
   at::Tensor dv = dv_.has_value() ? dv_.value() : torch::empty_like(v);
 
   if (q_dtype == at::ScalarType::Float8_e4m3fn) {
-    dq = dq.to(torch::kFloat16);
-    dk = dk.to(torch::kFloat16);
-    dv = dv.to(torch::kFloat16);
+    auto out_type = output_dtype == 0 ? at::ScalarType::BFloat16 : at::ScalarType::Half;
+    dq = dq.to(out_type);
+    dk = dk.to(out_type);
+    dv = dv.to(out_type);
   }
 
   // Otherwise the kernel will be launched from cuda:0 device
@@ -1314,6 +1321,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_90(
       has_drab,
       window_size_left,
       window_size_right,
+      output_dtype,
       deterministic);
   params.total_q = total_q;
   params.total_k = total_k;
@@ -1365,6 +1373,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "    Tensor? rab=None, "
       "    Tensor? func=None, "
       "    int quant_mode=-1, "
+      "    int output_dtype=-1, "
       "    Tensor? vt=None, "
       "    Tensor? cu_seqlens_vt_descale=None, "
       "    Tensor? q_descale=None, "
@@ -1411,6 +1420,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "    Tensor? cu_seqlens_kt_descale=None, "
       "    Tensor? cu_seqlens_q_block_descale=None, "
       "    Tensor? cu_seqlens_kv_block_descale=None, "
+      "    int output_dtype=-1, "
       "    bool deterministic=False"
       ") -> (Tensor, Tensor, Tensor, Tensor)");
 }

@@ -218,6 +218,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             ctx.q_fp16 = q
             ctx.k_fp16 = k
             ctx.v_fp16 = v
+            output_dtype = 0 if q.dtype == torch.bfloat16 else 1
             if quant_mode == 0:
                 q = q.to(torch.float8_e4m3fn)
                 k = k.to(torch.float8_e4m3fn)
@@ -258,6 +259,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 rab,
                 func,
                 quant_mode,
+                output_dtype,
                 vt,
                 cu_seqlens_vt_descale,
                 q_descale,
@@ -379,10 +381,11 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_kv_block_descale = None
             quant_mode = ctx.quant_mode
             bwd_fp8_type = torch.float8_e4m3fn
+            output_dtype = 0 if dout.dtype == torch.bfloat16 else 1
             if quant_mode == 0:
-                q = q.to(bwd_fp8_type)
-                k = k.to(bwd_fp8_type)
-                v = v.to(bwd_fp8_type)
+                q = ctx.q_fp16.to(bwd_fp8_type)
+                k = ctx.k_fp16.to(bwd_fp8_type)
+                v = ctx.v_fp16.to(bwd_fp8_type)
                 dout = dout.to(bwd_fp8_type)
                 q_descale = torch.tensor([1.0], dtype=torch.float32, device='cuda')
                 k_descale = torch.tensor([1.0], dtype=torch.float32, device='cuda')
@@ -445,6 +448,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 cu_seqlens_kt_descale,
                 cu_seqlens_q_block_descale,
                 cu_seqlens_kv_block_descale,
+                output_dtype,
                 False,  # deterministic
             )
 
@@ -627,6 +631,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 rab,
                 func,
                 -1, # quant_mode
+                0 if q.dtype == torch.bfloat16 else 1,
             )
 
         ctx.save_for_backward(
@@ -735,6 +740,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 None,
                 None,
                 None,
+                0 if q.dtype == torch.bfloat16 else 1,
                 False,  # deterministic
             )
         if has_drab:
@@ -888,6 +894,8 @@ def cuda_hstu_attn_varlen(
                 alpha,
                 None, # rab
                 None, # func
+                -1, # quant_mode
+                0 if q.dtype == torch.bfloat16 else 1,
             )
         return out
     return out

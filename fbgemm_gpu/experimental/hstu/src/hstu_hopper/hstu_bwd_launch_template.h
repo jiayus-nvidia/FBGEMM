@@ -286,13 +286,15 @@ void run_hstu_bwd_(Hstu_bwd_params& params, cudaStream_t stream) {
   static constexpr bool Deterministic = false;
   if constexpr (Is_fp8) {
     QUANT_SWITCH(params.quant_mode, Quant_mode, [&] {
-      if constexpr (Headdim <= 128) {
-          run_hstu_bwd<Arch, Hstu_bwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, Is_causal, Is_context, Is_target, Is_local, Is_arbitrary, kNFunc, Has_rab, Has_drab, Deterministic, 2, 2, kNWarpGroups, Quant_mode, T>
-                      >(params, stream);
-      } else {
-          run_hstu_bwd<Arch, Hstu_bwd_kernel_traits_fp8<Headdim, kBlockM, kBlockN, Is_causal, Is_context, Is_target, Is_local, Is_arbitrary, kNFunc, Has_rab, Has_drab, Deterministic, 1, 1, kNWarpGroups, Quant_mode, T>
-                      >(params, stream);
-      }
+      DTYPE_SWITCH(params.output_dtype, OutputType, [&] {
+        if constexpr (Headdim <= 128) {
+            run_hstu_bwd<Arch, Hstu_bwd_kernel_traits_fp8<OutputType, Headdim, kBlockM, kBlockN, Is_causal, Is_context, Is_target, Is_local, Is_arbitrary, kNFunc, Has_rab, Has_drab, Deterministic, 2, 2, kNWarpGroups, Quant_mode, T>
+                        >(params, stream);
+        } else {
+            run_hstu_bwd<Arch, Hstu_bwd_kernel_traits_fp8<OutputType, Headdim, kBlockM, kBlockN, Is_causal, Is_context, Is_target, Is_local, Is_arbitrary, kNFunc, Has_rab, Has_drab, Deterministic, 1, 1, kNWarpGroups, Quant_mode, T>
+                        >(params, stream);
+        }
+      });
     });
   } else {
     if constexpr (Headdim == 32) {

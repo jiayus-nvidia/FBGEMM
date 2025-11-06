@@ -268,6 +268,7 @@ struct Hstu_fwd_kernel_traits {
 
 // Traits struct for fp8 kernel with in-kernel transpose
 template <
+    typename OutputType_,
     int kHeadDim_,
     int kBlockM_,
     int kBlockN_,
@@ -285,7 +286,7 @@ template <
 struct Hstu_fwd_kernel_traits_fp8 {
   using Element = cutlass::float_e4m3_t;
   using ElementAccum = float;
-  using OutputType = cutlass::half_t;
+  using OutputType = OutputType_;
   using index_t = int64_t;
 
   // Quantization mode: 0: cast to fp8, 1: 1xDIM&128x1 quantization,
@@ -957,7 +958,7 @@ struct Hstu_bwd_kernel_traits {
 
 };
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_,
+template<typename OutputType_, int kHeadDim_, int kBlockM_, int kBlockN_,
          bool Is_causal_, bool Is_context_, bool Is_target_, bool Is_local_, bool Is_arbitrary_,
          int kNFunc_, bool Has_rab_, bool Has_drab_, bool Is_deterministic_,
          int kStages_dO_, int kStages_dS_, int NumWarpGroups_=3,
@@ -965,8 +966,8 @@ template<int kHeadDim_, int kBlockM_, int kBlockN_,
 struct Hstu_bwd_kernel_traits_fp8 {
   using Element = Element_;
   using ElementAccum = float;
-  using ElementRab = cutlass::half_t;
-  using ElementOut = cutlass::half_t;
+  using ElementRab = OutputType_;
+  using ElementOut = OutputType_;
   using index_t = int64_t;
 
   static constexpr bool Is_fp8 = true;

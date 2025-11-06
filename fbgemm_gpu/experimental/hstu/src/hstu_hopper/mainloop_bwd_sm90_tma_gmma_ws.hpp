@@ -1942,16 +1942,9 @@ struct CollectiveMainloopBwd {
     auto smem_tiled_copy_rab = make_tiled_copy_C(SmemCopyAtomRab{}, tiled_mma_SdP);
     auto smem_thr_copy_rab = smem_tiled_copy_rab.get_thread_slice(thread_idx);
     Tensor tSsRab = smem_thr_copy_rab.partition_S(cute::conditional_return<!SdP_swapAB>(sRab, sRabt)); // (CPY, CPY_M, CPY_N, PIPE)
-    Tensor tSrRab = make_tensor<Element>(partition_shape_C(tiled_mma_SdP, cute::conditional_return<!SdP_swapAB>(select<0, 1>(TileShape_MNK{}), select<1, 0>(TileShape_MNK{}))));
+    Tensor tSrRab = make_tensor<ElementRab>(partition_shape_C(tiled_mma_SdP, cute::conditional_return<!SdP_swapAB>(select<0, 1>(TileShape_MNK{}), select<1, 0>(TileShape_MNK{}))));
     Tensor tSrRab_copy_view = smem_thr_copy_rab.retile_D(tSrRab); // (CPY, CPY_M, CPY_N)
     Tensor tSrRab_accum = make_tensor_like<ElementAccum>(tSrRab);
-
-    auto smem_tiled_copy_rab_ldsm = make_tiled_copy_C(SmemCopyAtomRab_LDSM{}, tiled_mma_SdP);
-    auto smem_thr_copy_rab_ldsm = smem_tiled_copy_rab_ldsm.get_thread_slice(thread_idx);
-    Tensor tSsRab_ldsm = smem_thr_copy_rab_ldsm.partition_S(cute::conditional_return<!SdP_swapAB>(sRab, sRabt)); // (CPY, CPY_M, CPY_N, PIPE)
-    Tensor tSrRab_ldsm = make_tensor<Element>(partition_shape_C(tiled_mma_SdP, cute::conditional_return<!SdP_swapAB>(select<0, 1>(TileShape_MNK{}), select<1, 0>(TileShape_MNK{}))));
-    Tensor tSrRab_copy_view_ldsm = smem_thr_copy_rab_ldsm.retile_D(tSrRab_ldsm); // (CPY, CPY_M, CPY_N)
-    Tensor tSrRab_accum_ldsm = make_tensor_like<ElementAccum>(tSrRab_ldsm);
 
     auto consumer_wait = [](auto& pipeline, auto& smem_pipe_read) {
       auto barrier_token = pipeline.consumer_try_wait(smem_pipe_read);

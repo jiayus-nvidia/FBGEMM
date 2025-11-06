@@ -171,23 +171,26 @@ void run_hstu_fwd_(Hstu_fwd_params& params, cudaStream_t stream) {
   static constexpr int kNWarps = std::get<2>(tile_size);
   if constexpr (Is_fp8) {
     QUANT_SWITCH(params.quant_mode, Quant_mode, [&] {
-      run_hstu_fwd<
-          90,
-          Hstu_fwd_kernel_traits_fp8<
-              Headdim,
-              kBlockM,
-              kBlockN,
-              kNWarps,
-              2,
-              Is_causal,
-              Is_context,
-              Is_target,
-              Is_local,
-              Is_arbitrary,
-              kNFunc,
-              Has_rab,
-              1,
-              Quant_mode>>(params, stream);
+      DTYPE_SWITCH(params.output_dtype, OutputType, [&] {
+        run_hstu_fwd<
+            90,
+            Hstu_fwd_kernel_traits_fp8<
+                OutputType,
+                Headdim,
+                kBlockM,
+                kBlockN,
+                kNWarps,
+                2,
+                Is_causal,
+                Is_context,
+                Is_target,
+                Is_local,
+                Is_arbitrary,
+                kNFunc,
+                Has_rab,
+                1,
+                Quant_mode>>(params, stream);
+        });
       });
   } else {
     run_hstu_fwd<
