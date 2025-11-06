@@ -1939,9 +1939,9 @@ class HSTU8Test(unittest.TestCase):
 
 
 if __name__ == "__main__":
-
+    # benchmark case
     HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
-    1, 1, 160, (64, 64), 1.0, (False, False, None), (32, 32), (25, (-1, 0), 1, False), torch.bfloat16, True)
+    8, 8, 0, (128, 128), 1.0, (False, False, None), (8192, 8192), (0, (-1, -1), 1, False), torch.bfloat16, True)
 
     # HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
     # 1, 1, 0, (64, 64), 1.0, (False, False, None), (128, 128), (0, (-1, -1), 1, False), torch.bfloat16, True)
