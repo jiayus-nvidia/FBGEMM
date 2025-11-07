@@ -113,7 +113,6 @@ class HSTUAttentionBackwardSm100:
         func_num: int = 0,
         has_rab: bool = False,
     ):
-        print("kBlockM is {}, kBlockN is {}".format(kBlockM, kBlockN))
         self.element_dtype = element_dtype
         self.acc_dtype = Float32
         self.kBlockM = kBlockM
@@ -260,7 +259,6 @@ class HSTUAttentionBackwardSm100:
         h, b = hb
         h_r, h_k = h
         # (s, d, h_r, h_k, b) -> (s, d, ((h_r, h_k), b))
-        #(2048,64,1,3,1)
         Q = cute.make_tensor(
             Q.iterator,
             cute.make_layout(
@@ -277,7 +275,6 @@ class HSTUAttentionBackwardSm100:
                 ),
             ),
         )
-        #(2048,64,((1,3),2), 其中2是bs
         # (s, d, 1, h_k, b) -> (s, d, ((1, h_k), b))
         K = cute.make_tensor(
             K.iterator,
@@ -350,7 +347,7 @@ class HSTUAttentionBackwardSm100:
 
         cta_group = tcgen05.CtaGroup.ONE
 
-        # compute S swapAB
+        # compute S
         KQ_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
             tcgen05.OperandMajorMode.K,
@@ -731,8 +728,6 @@ class HSTUAttentionBackwardSm100:
         bidx, bidy, bidz = cute.arch.block_idx()
         grid_dim_x, grid_dim_y, grid_dim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        #(256,256,4,2):(1,256,0,131072)
-        # cute.printf("=== begin mRab here is === {}", (mRab))
 
         if warp_idx == self.load_warp_id:
             cpasync.prefetch_descriptor(tma_atom_K)
@@ -808,8 +803,6 @@ class HSTUAttentionBackwardSm100:
         # (MMA, MMA_N, MMA_K, STAGE)
         tSTrQ = KQ_tiled_mma.make_fragment_B(sQ)
 
-        print("sQ shape is {}, tSTrQ shape is {}".format(sQ.shape, tSTrQ.shape)) #sQ shape is ((128, 16), 1, 4, 2), tSTrQ shape is (1, 1, 4, 2)
-
         # (MMA, MMA_M, MMA_K, STAGE)
         tdPTrV = VdO_tiled_mma.make_fragment_A(sV)
         # (MMA, MMA_N, MMA_K, STAGE)
@@ -831,7 +824,6 @@ class HSTUAttentionBackwardSm100:
         tSTtST = KQ_tiled_mma.make_fragment_C(tSTtST_shape)
         # (MMA, MMA_M, MMA_N)
         tSTtST = cute.make_tensor(tSTtST.iterator + self.tmem_S_offset, tSTtST.layout)
-        print("=== tSTtST is {}".format(tSTtST.shape))
 
         # (MMA, MMA_M, MMA_K, STAGE)
         tdVrP = PdO_tiled_mma.make_fragment_A(tP)
@@ -1008,7 +1000,6 @@ class HSTUAttentionBackwardSm100:
                             compute_mma_dS_pipeline,
                             mma_compute_dKdV_pipeline,
                     )
-                    # 1abcdsaassasas
                     self.compute(
                         tSTtST,
                         tdPTtdPT,
@@ -1402,9 +1393,6 @@ class HSTUAttentionBackwardSm100:
 
         # S = K * Q
         KQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        # print("tSTrK[None, None, k_block, 0] is {}, tSTrQ[None, None, k_block, load_mma_Q_consumer_state.index] is {}".format(tSTrK[None, None, 0, 0].shape, tSTrQ[None, None, 0, load_mma_Q_consumer_state.index].shape))
-        print("tSTrK is {}, tSTrQ is {}".format(tSTrK.shape, tSTrQ.shape))
-        print("tSTrQ is {}".format(tSTrQ.shape))
         for k_block in cutlass.range(0, cute.size(tSTrQ, mode=[2]), unroll_full=True):
             cute.gemm(
                 KQ_tiled_mma,
@@ -1695,9 +1683,7 @@ class HSTUAttentionBackwardSm100:
             self.element_dtype,
         )
 
-        # cute.printf("old tSTtST shape is {}", tSTtST.shape) #old tSTtST shape is ((128,128),1,1)
         tSTtST = tSTtST[(None, None), 0, 0]
-        # cute.printf("new tSTtST shape is {}", tSTtST.shape) #new tSTtST shape is (128,128)
 
         tdPTtdPT = tdPTtdPT[(None, None), 0, 0]
 
@@ -2279,24 +2265,17 @@ class HSTUAttentionBackwardSm100:
 
         #define identity tensor
         cS = cute.make_identity_tensor((self.KQ_mma_tiler[0], self.KQ_mma_tiler[1]))
-        # tScS = thr_mma_qk.partition_C(cute.make_identity_tensor((self.KQ_mma_tiler[0], self.KQ_mma_tiler[1]))) 
-        # tScS_t2r_shape_1 = thr_tmem_load.partition_D(tScS).shape
         tSgRab_g2r = thr_tmem_load.partition_D(gRab)
         tSgRab_g2r_test = thr_tmem_load.partition_S(gRab)
-        # cute.printf("bwd tSgRab_g2r_test shape is {}", tSgRab_g2r_test.shape) #bwd tSgRab_g2r_test shape is ((16,1),1,4)
         tSgRab_g2r = split_wg(tSgRab_g2r, num_warp_groups, wg_idx, is_print=True)
 
         # # split_warp
         tSrRab_g2r = cute.make_fragment(tSgRab_g2r.layout.shape, self.rab_dtype)
         cRab = cute.domain_offset((((n_block) * self.KQ_mma_tiler[0]),(m_block * self.KQ_mma_tiler[1])), cute.make_identity_tensor((self.KQ_mma_tiler[0], self.KQ_mma_tiler[1])))
-        # cRab = thr_mma_qk.partition_C(cRab) # 此处也会多加两个mode
         tScRab_g2r = thr_tmem_load.partition_D(cRab) #
         tScRab_g2r = split_wg(tScRab_g2r, num_warp_groups, wg_idx)
-        #bwd tSgRab_g2r shape is ((16,1),1,4), tSrRab_g2r shape is ((16,1),1,4), tScRab_g2r shape is ((16,1),1,4)
-        # cute.printf("bwd tSgRab_g2r shape is {}, tSrRab_g2r shape is {}, tScRab_g2r shape is {}", tSgRab_g2r.shape, tSrRab_g2r.shape, tScRab_g2r.shape)
         tidx, _, _ = cute.arch.thread_idx()
         self.load_Rab_g2r(tSgRab_g2r, tSrRab_g2r, tScRab_g2r, (K_len_cur_batch, Q_len_cur_batch), batch_idx, head_idx, m_block, n_block)
-        # print("tSrRab_g2r shape is {}".format(tSrRab_g2r.shape)) #((16, 1), 1, 4)
         return tSrRab_g2r
 
 

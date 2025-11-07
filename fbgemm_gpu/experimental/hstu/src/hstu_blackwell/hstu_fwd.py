@@ -268,7 +268,6 @@ class HSTUAttentionForwardSm100:
             self.mma_tiler_qk[:2],
         )
 
-        # cute.print_latex("tiled_mma_qk =", tiled_mma_qk)
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
             self.v_dtype,
             p_major_mode,
@@ -1347,8 +1346,6 @@ class HSTUAttentionForwardSm100:
         tPc_fake = cute.group_modes(tPc, 1, 5)
         preds_shape_fake = (tPc_fake.shape[0][1], cute.size(tPc_fake, mode=[1]))
         preds_fake = cute.make_tensor(preds.iterator, preds_shape_fake)
-        # cute.printf("fwd preds_fake is {}", preds_fake.shape)
-        print("fwd preds_fake is {}".format(preds_fake.layout))
 
         for i in cutlass.range_constexpr(0, cute.size(preds_fake, mode=[0])):
             for j in cutlass.range_constexpr(0, cute.size(preds_fake, mode=[1])):

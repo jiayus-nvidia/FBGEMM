@@ -154,9 +154,6 @@ def hstu_varlen_bwd_100(
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
 
-    # if rab is not None:
-    #     num_heads_rab = rab.shape[1]
-    #     assert num_heads == num_heads_rab or num_heads_rab == 1, "Number of heads in rab must be 1 or equal to number of heads in query"
     rab_tensor = None
     if rab is not None:
         last_dim = rab.size(-1)
