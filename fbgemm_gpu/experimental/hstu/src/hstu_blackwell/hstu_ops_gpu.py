@@ -18,6 +18,8 @@ from cutlass.cute.typing import Float32, Int32, Float16, BFloat16
 
 from .hstu_fwd import HSTUAttentionForwardSm100
 from .hstu_bwd import HSTUAttentionBackwardSm100
+import numpy as np
+import torch.nn.functional as F
 
 def hstu_varlen_fwd_100(
     q: torch.Tensor,
@@ -51,12 +53,18 @@ def hstu_varlen_fwd_100(
     assert not (is_target and not is_causal), "Target mask is True, but causal mask is False, this is undefined behavior."
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
-
     out = torch.empty_like(q)
     q_tensor, k_tensor, v_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (q, k, v, out)
     ]
+    rab_tensor = None
+    if rab is not None:
+        last_dim = rab.size(-1)
+        pad_size = (8 - (last_dim % 8)) % 8
+        rab = F.pad(rab, (0, pad_size), mode='constant', value=0)
+        rab_tensor = from_dlpack(rab.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=rab.ndim - 1)
+        # rab_tensor = from_dlpack(rab, assumed_align=16)
     cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (cu_seqlens_q, cu_seqlens_k)
@@ -66,7 +74,7 @@ def hstu_varlen_fwd_100(
         for t in (num_contexts, num_targets, func)
     ]
     current_stream = cutlass_torch.default_stream()
-    compile_key = (head_dim, kBlockM, kBlockN, is_causal, is_local, is_context, is_target, target_group_size, is_arbitrary, func_num)
+    compile_key = (head_dim, kBlockM, kBlockN, is_causal, is_local, is_context, is_target, target_group_size, is_arbitrary, func_num, rab)
 
     if compile_key not in hstu_varlen_fwd_100.compile_cache:
         hstu_fwd_sm100 = HSTUAttentionForwardSm100(
@@ -80,11 +88,12 @@ def hstu_varlen_fwd_100(
             func_num=func_num,
             kBlockM=kBlockM,
             kBlockN=kBlockN,
+            has_rab=(rab is not None),
         )
-        hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(hstu_fwd_sm100, q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, num_contexts_tensor, num_targets_tensor, alpha, current_stream, window_size_left, window_size_right, func_tensor)
+        hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(hstu_fwd_sm100, q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, num_contexts_tensor, num_targets_tensor, alpha, current_stream, window_size_left, window_size_right, func_tensor, mRab=rab_tensor)
 
-    hstu_varlen_fwd_100.compile_cache[compile_key](q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, num_contexts_tensor, num_targets_tensor, alpha, current_stream, window_size_left, window_size_right, func_tensor)
-
+    hstu_varlen_fwd_100.compile_cache[compile_key](q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, num_contexts_tensor, num_targets_tensor, alpha, current_stream, window_size_left, window_size_right, func_tensor, mRab=rab_tensor)
+    
     return out, None
 
 hstu_varlen_fwd_100.compile_cache = {}
@@ -145,9 +154,15 @@ def hstu_varlen_bwd_100(
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
 
+    # if rab is not None:
+    #     num_heads_rab = rab.shape[1]
+    #     assert num_heads == num_heads_rab or num_heads_rab == 1, "Number of heads in rab must be 1 or equal to number of heads in query"
+    rab_tensor = None
     if rab is not None:
-        num_heads_rab = rab.shape[1]
-        assert num_heads == num_heads_rab or num_heads_rab == 1, "Number of heads in rab must be 1 or equal to number of heads in query"
+        last_dim = rab.size(-1)
+        pad_size = (8 - (last_dim % 8)) % 8
+        rab = F.pad(rab, (0, pad_size), mode='constant', value=0)
+        rab_tensor = from_dlpack(rab.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=rab.ndim - 1)
 
     assert not (has_drab and rab is None), "rab must be provided when has_drab is True"
     drab = torch.zeros_like(rab) if has_drab else None
@@ -193,9 +208,10 @@ def hstu_varlen_bwd_100(
             is_target=is_target,
             target_group_size=target_group_size,
             is_arbitrary=is_arbitrary,
+            has_rab=(rab is not None),
             func_num=func_num,
         )
-        hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(hstu_bwd_sm100, problem_shape, q_tensor, k_tensor, v_tensor, dq_tensor, dk_tensor, dv_tensor, do_tensor, cu_seqlens_q_tensor, cu_seqlens_k_tensor, Int32(window_size_left), Int32(window_size_right), num_contexts_tensor, num_targets_tensor, func_tensor, workspace, current_stream)
+        hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(hstu_bwd_sm100, problem_shape, q_tensor, k_tensor, v_tensor, dq_tensor, dk_tensor, dv_tensor, do_tensor, cu_seqlens_q_tensor, cu_seqlens_k_tensor, Int32(window_size_left), Int32(window_size_right), num_contexts_tensor, num_targets_tensor, func_tensor, workspace, current_stream, mRab=rab_tensor)
 
     hstu_varlen_bwd_100.compile_cache[compile_key](
         problem_shape,
@@ -214,7 +230,8 @@ def hstu_varlen_bwd_100(
         num_targets_tensor,
         func_tensor,
         workspace,
-        current_stream
+        current_stream,
+        mRab=rab_tensor
     )
 
     dq = dq.squeeze(4).squeeze(2).permute(0, 2, 1)

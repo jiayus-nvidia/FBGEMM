@@ -270,6 +270,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         else:
             # from fbgemm_gpu.experimental.hstu.hstu_blackwell import hstu_ops_gpu as _sm100
             from fbgemm_gpu.experimental.hstu.src.hstu_blackwell import hstu_ops_gpu as _sm100
+            print("==== enter 2 here ====")
             out, rab_padded = _sm100.hstu_varlen_fwd_100(
                 q,
                 k,
@@ -297,6 +298,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             num_contexts,
             num_targets,
             rab_padded,
+            rab
         )
         ctx.major_version = major_version
         ctx.max_seqlen_q = max_seqlen_q
@@ -346,6 +348,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             num_contexts,
             num_targets,
             rab_padded,
+            rab
         ) = ctx.saved_tensors
 
         max_seqlen_q = ctx.max_seqlen_q
@@ -488,7 +491,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 window_size_left,
                 window_size_right,
                 alpha,
-                rab_padded,
+                rab,
                 has_drab,
                 func,
                 False,  # deterministic

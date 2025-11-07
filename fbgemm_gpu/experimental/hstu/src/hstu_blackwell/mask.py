@@ -1,5 +1,3 @@
-# Copyright (c) 2025, Tri Dao.
-
 from typing import Optional
 from dataclasses import dataclass
 
@@ -118,7 +116,6 @@ class AttentionMask:
             target_col_limit_left = self.seqlen_h + target_index * self.target_group_size if cutlass.const_expr(self.is_target) else 0
             block_col = cute.get(tScS_t2r[i], mode=[col_id])
             col = block_col + base_col
-
             if col >= self.seqlen_k or row >= self.seqlen_q + seqlen_offset:
                 acc_S[i] = -cutlass.Float32.inf
             if cutlass.const_expr(self.is_arbitrary):

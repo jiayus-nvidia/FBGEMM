@@ -33,6 +33,7 @@ import random
 import time
 from typing import Type, Tuple, Union, Optional
 from functools import partial
+from cutlass import const_expr
 
 import torch
 import torch.nn.functional as F
@@ -110,7 +111,9 @@ class HSTUAttentionBackwardSm100:
         target_group_size: int = 1,
         is_arbitrary: bool = False,
         func_num: int = 0,
+        has_rab: bool = False,
     ):
+        print("kBlockM is {}, kBlockN is {}".format(kBlockM, kBlockN))
         self.element_dtype = element_dtype
         self.acc_dtype = Float32
         self.kBlockM = kBlockM
@@ -162,6 +165,7 @@ class HSTUAttentionBackwardSm100:
         self.target_group_size = target_group_size
         self.is_arbitrary = is_arbitrary
         self.func_num = func_num
+        self.has_rab = has_rab
 
         self.reduce_warp_id = (0, 1, 2, 3)
         self.compute_warp_id = (4, 5, 6, 7, 8, 9, 10, 11)
@@ -246,11 +250,17 @@ class HSTUAttentionBackwardSm100:
         func: Optional[cute.Tensor],
         workspace: cute.Tensor,
         stream: cuda.CUstream,
+        mRab: Optional[cute.Tensor] = None,  # (bs, h, seq_len_k, seq_len_k) or (head, total_qk) if has_var_rab
     ):
+        assert not (mRab is not None and not self.has_rab), "mRab should be None when has_rab is False"
+        assert not (mRab is None and self.has_rab), "mRab can not be None when has_rab is True"
+        self.rab_dtype = mRab.element_type if cutlass.const_expr(mRab is not None) else self.element_dtype 
+
         q_seq_max, k_seq_max, d, hb = problem_shape
         h, b = hb
         h_r, h_k = h
         # (s, d, h_r, h_k, b) -> (s, d, ((h_r, h_k), b))
+        #(2048,64,1,3,1)
         Q = cute.make_tensor(
             Q.iterator,
             cute.make_layout(
@@ -267,6 +277,7 @@ class HSTUAttentionBackwardSm100:
                 ),
             ),
         )
+        #(2048,64,((1,3),2), 其中2是bs
         # (s, d, 1, h_k, b) -> (s, d, ((1, h_k), b))
         K = cute.make_tensor(
             K.iterator,
@@ -302,6 +313,11 @@ class HSTUAttentionBackwardSm100:
             ),
         )
 
+        #As we have swapAB, so the S is BN * BM, if we use the '32x32' tmem_load, then every T covers BM items.
+        #If you wanna use the [K, Q, BS, H]
+        Rab_layout_transpose = [3, 2, 0, 1] if cutlass.const_expr(mRab is not None) else [0, 1] if cutlass.const_expr(mRab is not None) else None
+        mRab = cute.make_tensor(mRab.iterator, cute.select(mRab.layout, mode=Rab_layout_transpose)) if  cutlass.const_expr(mRab is not None) else None
+
         dQ = cute.make_tensor(dQ.iterator, Q.layout)
         dK = cute.make_tensor(dK.iterator, K.layout)
         dV = cute.make_tensor(dV.iterator, V.layout)
@@ -315,6 +331,7 @@ class HSTUAttentionBackwardSm100:
         self.dV_major_mode = utils.LayoutEnum.from_tensor(dV).mma_major_mode()
         self.dO_major_mode = utils.LayoutEnum.from_tensor(dO).mma_major_mode()
         self.dQ_layout = utils.LayoutEnum.from_tensor(dQ)
+        self.rab_major_mode = utils.LayoutEnum.from_tensor(mRab) if cutlass.const_expr(mRab is not None) else None
 
         if cutlass.const_expr(self.Q_major_mode != tcgen05.OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
@@ -333,7 +350,7 @@ class HSTUAttentionBackwardSm100:
 
         cta_group = tcgen05.CtaGroup.ONE
 
-        # compute S
+        # compute S swapAB
         KQ_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
             tcgen05.OperandMajorMode.K,
@@ -629,6 +646,7 @@ class HSTUAttentionBackwardSm100:
             dOT_smem_layout_staged,
             dQ_smem_layout_staged,
             P_tmem_layout_staged,
+            mRab,
         ).launch(
             grid=bwd_grid,
             block=[self.threads_per_cta, 1, 1],
@@ -707,11 +725,14 @@ class HSTUAttentionBackwardSm100:
         dOT_smem_layout_staged: cute.ComposedLayout,
         dQ_smem_layout_staged: cute.ComposedLayout,
         P_tmem_layout_staged: cute.ComposedLayout,
+        mRab: Optional[cute.Tensor] = None,
     ):
         tidx, tidy, tidz = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
         grid_dim_x, grid_dim_y, grid_dim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        #(256,256,4,2):(1,256,0,131072)
+        # cute.printf("=== begin mRab here is === {}", (mRab))
 
         if warp_idx == self.load_warp_id:
             cpasync.prefetch_descriptor(tma_atom_K)
@@ -787,6 +808,8 @@ class HSTUAttentionBackwardSm100:
         # (MMA, MMA_N, MMA_K, STAGE)
         tSTrQ = KQ_tiled_mma.make_fragment_B(sQ)
 
+        print("sQ shape is {}, tSTrQ shape is {}".format(sQ.shape, tSTrQ.shape)) #sQ shape is ((128, 16), 1, 4, 2), tSTrQ shape is (1, 1, 4, 2)
+
         # (MMA, MMA_M, MMA_K, STAGE)
         tdPTrV = VdO_tiled_mma.make_fragment_A(sV)
         # (MMA, MMA_N, MMA_K, STAGE)
@@ -808,6 +831,7 @@ class HSTUAttentionBackwardSm100:
         tSTtST = KQ_tiled_mma.make_fragment_C(tSTtST_shape)
         # (MMA, MMA_M, MMA_N)
         tSTtST = cute.make_tensor(tSTtST.iterator + self.tmem_S_offset, tSTtST.layout)
+        print("=== tSTtST is {}".format(tSTtST.shape))
 
         # (MMA, MMA_M, MMA_K, STAGE)
         tdVrP = PdO_tiled_mma.make_fragment_A(tP)
@@ -977,6 +1001,14 @@ class HSTUAttentionBackwardSm100:
                 ):
                     cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
 
+                    pipeline_args = (
+                            mma_compute_S_pipeline,
+                            compute_mma_P_pipeline,
+                            mma_compute_dP_pipeline,
+                            compute_mma_dS_pipeline,
+                            mma_compute_dKdV_pipeline,
+                    )
+                    # 1abcdsaassasas
                     self.compute(
                         tSTtST,
                         tdPTtdPT,
@@ -998,14 +1030,10 @@ class HSTUAttentionBackwardSm100:
                         window_size_left,
                         window_size_right,
                         mask,
-                        (
-                            mma_compute_S_pipeline,
-                            compute_mma_P_pipeline,
-                            mma_compute_dP_pipeline,
-                            compute_mma_dS_pipeline,
-                            mma_compute_dKdV_pipeline,
-                        ),
+                        pipeline_args,
+                        mRab,
                     )
+                    
 
                     self.epilogue_sync_barrier.arrive_and_wait()
 
@@ -1374,6 +1402,9 @@ class HSTUAttentionBackwardSm100:
 
         # S = K * Q
         KQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        # print("tSTrK[None, None, k_block, 0] is {}, tSTrQ[None, None, k_block, load_mma_Q_consumer_state.index] is {}".format(tSTrK[None, None, 0, 0].shape, tSTrQ[None, None, 0, load_mma_Q_consumer_state.index].shape))
+        print("tSTrK is {}, tSTrQ is {}".format(tSTrK.shape, tSTrQ.shape))
+        print("tSTrQ is {}".format(tSTrQ.shape))
         for k_block in cutlass.range(0, cute.size(tSTrQ, mode=[2]), unroll_full=True):
             cute.gemm(
                 KQ_tiled_mma,
@@ -1616,8 +1647,8 @@ class HSTUAttentionBackwardSm100:
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         mask: AttentionMask,
-        # (mma_compute_S_pipeline, compute_mma_P_pipeline, mma_compute_dP_pipeline, compute_mma_dS_pipeline, mma_compute_dKdV_pipeline)
-        pipeline_args: tuple,
+        pipeline_args: Tuple, ## (mma_compute_S_pipeline, compute_mma_P_pipeline, mma_compute_dP_pipeline, compute_mma_dS_pipeline, mma_compute_dKdV_pipeline)
+        mRab: Optional[cute.Tensor],
     ):
         tidx, tidy, tidz = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -1652,13 +1683,25 @@ class HSTUAttentionBackwardSm100:
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)),
             self.acc_dtype,
         )
+
+        tmem_load_atom_rab = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32,
+        )
+
+        
+
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(8)),
             self.element_dtype,
         )
 
+        # cute.printf("old tSTtST shape is {}", tSTtST.shape) #old tSTtST shape is ((128,128),1,1)
         tSTtST = tSTtST[(None, None), 0, 0]
+        # cute.printf("new tSTtST shape is {}", tSTtST.shape) #new tSTtST shape is (128,128)
+
         tdPTtdPT = tdPTtdPT[(None, None), 0, 0]
+
+        tiled_t2r_rab = tcgen05.make_tmem_copy(tmem_load_atom_rab, tSTtST)
 
         cST = cute.make_identity_tensor(cute.select(self.KQ_mma_tiler, mode=[0, 1]))
         cdPT = cute.make_identity_tensor(cute.select(self.VdO_mma_tiler, mode=[0, 1]))
@@ -1668,6 +1711,7 @@ class HSTUAttentionBackwardSm100:
         wg_idx = (tidx % (self.num_compute_warps * self.threads_per_warp)) // 128
         tiled_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tSTtST)
         thr_t2r = tiled_t2r.get_slice(dp_idx)
+        thr_t2r_rab = tiled_t2r_rab.get_slice(dp_idx)
 
         tTR_cST = thr_t2r.partition_D(cST)
         tTR_cST = split_wg(tTR_cST, num_warp_groups, wg_idx)
@@ -1723,6 +1767,15 @@ class HSTUAttentionBackwardSm100:
             cute.copy(tiled_t2r, tTR_tST, tTR_rST)
             mask_fn(tTR_rST, m_block=iter_index)
             tTR_rST_silu = cute.make_fragment_like(tTR_rST)
+            
+            if const_expr(self.has_rab):
+                tSrRab_g2r = self.rab_step(Q, K, iter_index, blk_coord_k, KQ_thr_mma, thr_t2r, num_warp_groups, wg_idx, mRab)
+                tSrRab_g2r_fp32 = cute.make_fragment_like(tSrRab_g2r, self.acc_dtype)
+                for i in range(cute.size(tSrRab_g2r)):
+                    tSrRab_g2r_fp32[i] = tSrRab_g2r[i].to(self.acc_dtype)
+
+                for i in range(cute.size(tTR_rST)):
+                    tTR_rST[i] += (tSrRab_g2r_fp32[i])
 
             # for i in cutlass.range(cute.size(tTR_rST), unroll_full=True):
             #     c_transpose = tTR_cST[i]
@@ -1989,6 +2042,8 @@ class HSTUAttentionBackwardSm100:
             output_frg[None, i].store(frg_vec.to(self.element_dtype))
         return output
 
+    
+
     @cute.jit
     def store(
         self,
@@ -2199,6 +2254,101 @@ class HSTUAttentionBackwardSm100:
         cute.arch.fence_view_async_tmem_load()
         mma_compute_dKdV_pipeline.consumer_release(mma_compute_dKdV_consumer_state)
         mma_compute_dKdV_consumer_state.advance()
+    
+    @cute.jit
+    def rab_step(
+        self,
+        Q_len_cur_batch: Int32,
+        K_len_cur_batch: Int32,
+        m_block: Int32,
+        n_block: Int32,
+        thr_mma_qk: cute.core.ThrMma,
+        thr_tmem_load: cute.CopyAtom,
+        num_warp_groups: Int32,
+        wg_idx: Int32,
+        mRab: cute.Tensor,
+    ):
+        """
+        Perform a rab bias add operation.
+        """
+        # get current tile
+        qk_offset = K_len_cur_batch - Q_len_cur_batch
+        bidx, head_idx, batch_idx = cute.arch.block_idx()
+        mRab_cur = cute.domain_offset((0, qk_offset), mRab[None, None, batch_idx, head_idx]) #K * Q
+        gRab = cute.local_tile(mRab_cur, cute.select(self.KQ_mma_tiler, mode=[0, 1]), (n_block, m_block))
+
+        #define identity tensor
+        cS = cute.make_identity_tensor((self.KQ_mma_tiler[0], self.KQ_mma_tiler[1]))
+        # tScS = thr_mma_qk.partition_C(cute.make_identity_tensor((self.KQ_mma_tiler[0], self.KQ_mma_tiler[1]))) 
+        # tScS_t2r_shape_1 = thr_tmem_load.partition_D(tScS).shape
+        tSgRab_g2r = thr_tmem_load.partition_D(gRab)
+        tSgRab_g2r_test = thr_tmem_load.partition_S(gRab)
+        # cute.printf("bwd tSgRab_g2r_test shape is {}", tSgRab_g2r_test.shape) #bwd tSgRab_g2r_test shape is ((16,1),1,4)
+        tSgRab_g2r = split_wg(tSgRab_g2r, num_warp_groups, wg_idx, is_print=True)
+
+        # # split_warp
+        tSrRab_g2r = cute.make_fragment(tSgRab_g2r.layout.shape, self.rab_dtype)
+        cRab = cute.domain_offset((((n_block) * self.KQ_mma_tiler[0]),(m_block * self.KQ_mma_tiler[1])), cute.make_identity_tensor((self.KQ_mma_tiler[0], self.KQ_mma_tiler[1])))
+        # cRab = thr_mma_qk.partition_C(cRab) # 此处也会多加两个mode
+        tScRab_g2r = thr_tmem_load.partition_D(cRab) #
+        tScRab_g2r = split_wg(tScRab_g2r, num_warp_groups, wg_idx)
+        #bwd tSgRab_g2r shape is ((16,1),1,4), tSrRab_g2r shape is ((16,1),1,4), tScRab_g2r shape is ((16,1),1,4)
+        # cute.printf("bwd tSgRab_g2r shape is {}, tSrRab_g2r shape is {}, tScRab_g2r shape is {}", tSgRab_g2r.shape, tSrRab_g2r.shape, tScRab_g2r.shape)
+        tidx, _, _ = cute.arch.thread_idx()
+        self.load_Rab_g2r(tSgRab_g2r, tSrRab_g2r, tScRab_g2r, (K_len_cur_batch, Q_len_cur_batch), batch_idx, head_idx, m_block, n_block)
+        # print("tSrRab_g2r shape is {}".format(tSrRab_g2r.shape)) #((16, 1), 1, 4)
+        return tSrRab_g2r
+
+
+    def load_Rab_g2r(
+        self,
+        gmem: cute.Tensor, #gmem destinition tOgO_r2g
+        regs: cute.Tensor, #reg destinition tOrO_t2r
+        coord: cute.Tensor,
+        tensor_shape: cute.Shape,
+        batch_idx: Int32,
+        head_idx: Int32,
+        m_block: Int32,
+        n_block: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        copy_bits = 16
+
+        copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.rab_dtype,
+            num_bits_per_copy=copy_bits,
+        )
+        copy_op = cute.make_cotiled_copy(
+            copy_atom,
+            cute.make_layout((1, copy_bits // self.rab_dtype.width)),
+            regs.layout,
+        )
+
+        thr_copy = copy_op.get_slice(0)
+        
+        tCg = thr_copy.partition_S(gmem)
+        tCr = thr_copy.partition_D(regs)
+        tPc = thr_copy.partition_S(coord)
+
+        preds_shape = (tPc.shape[0][1], tPc.shape[1], tPc.shape[2], tPc.shape[3])
+
+        preds = cute.make_fragment(preds_shape, Boolean)
+        tPc_fake = cute.group_modes(tPc, 1, 4)
+        preds_shape_fake = (tPc_fake.shape[0][1], cute.size(tPc_fake, mode=[1]))
+        preds_fake = cute.make_tensor(preds.iterator, preds_shape_fake)
+        for i in range(0, cute.size(preds_fake, mode=[0])):
+            for j in range(0, cute.size(preds_fake, mode=[1])):
+                lhs = tPc_fake[(0, i), j]
+                val = cute.elem_less(lhs, tensor_shape)
+                preds_fake[i,j] = val
+        cute.copy(copy_atom, tCg, tCr, pred=preds)
+
+        
+
+
+        
+
 
     def get_workspace_tensor(
         self,

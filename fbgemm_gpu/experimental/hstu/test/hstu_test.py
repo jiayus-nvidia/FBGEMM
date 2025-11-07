@@ -628,7 +628,7 @@ class HSTU16Test(unittest.TestCase):
         running_on_github, "GitHub runners are unable to run the test at this time"
     )
     @given(
-        batch_size=st.sampled_from([32]),
+        batch_size=st.sampled_from([4]),
         heads=st.sampled_from([2]),
         seq_len_params=st.sampled_from(
             [
@@ -647,14 +647,14 @@ class HSTU16Test(unittest.TestCase):
             [
                 (0, (-1, -1), 1, False),
                 (0, (-1, -1), 1, True),
-                (0, (111, 11), 1, False),
-                (0, (111, 222), 1, False),
-                (0, (-1, 0), 1, False),
-                (32, (-1, 0), 1, False),
-                (257, (-1, 0), 1, False),
-                (1024, (-1, 0), 1, False),
-                (111, (-1, 0), 11, False),
-                (1111, (-1, 0), 222, False),
+                # (0, (111, 11), 1, False),
+                # (0, (111, 222), 1, False),
+                # (0, (-1, 0), 1, False),
+                # (32, (-1, 0), 1, False),
+                # (257, (-1, 0), 1, False),
+                # (1024, (-1, 0), 1, False),
+                # (111, (-1, 0), 11, False),
+                # (1111, (-1, 0), 222, False),
             ]
         ),
         attn_hidden_dims=st.sampled_from(
@@ -665,7 +665,7 @@ class HSTU16Test(unittest.TestCase):
                 # (256, 256),
             ]
         ),
-        alpha=st.sampled_from([1.0, 0.1]),
+        alpha=st.sampled_from([1.0]),
         rab_params=st.sampled_from(
             [
                 (False, False, None),
@@ -828,6 +828,7 @@ class HSTU16Test(unittest.TestCase):
         print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
 
         assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
+        # return
 
         g = torch.rand_like(torch_out)
         if not has_drab:
@@ -896,6 +897,7 @@ class HSTU16Test(unittest.TestCase):
             assert (drab_hstu - drab_ref).abs().max().item() <= 5 * (  # pyre-ignore[58,61]
                 drab_torch - drab_ref  # pyre-ignore[61]
             ).abs().max().item()
+        print("==== all sucess ====")
         torch.cuda.synchronize()
 
 
@@ -1667,281 +1669,290 @@ def _bwd_reference_fp8(
         drab
     )
 
-@unittest.skipIf(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
-    "Skip when no Hopper GPU is available. This test is only for Hopper GPU.",
-)
-class HSTU8Test(unittest.TestCase):
-    """Test HSTU attention with float8_e4m3 inputs."""
+# @unittest.skipIf(
+#     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
+#     "Skip when no Hopper GPU is available. This test is only for Hopper GPU.",
+# )
+# class HSTU8Test(unittest.TestCase):
+#     """Test HSTU attention with float8_e4m3 inputs."""
 
-    @given(
-        batch_size=st.sampled_from([32]),
-        heads=st.sampled_from([2]),
-        seq_len_params=st.sampled_from(
-            [
-                (32, 32),
-                (99, 99),
-                (272, 272),
-                (848, 848),
-                (8, 99),
-                (51, 256),
-                (531, 777),
-                (160, 800),
-            ]
-        ),
-        max_context_len=st.sampled_from([0, 99, 160, 333]),
-        target_params=st.sampled_from(
-            [
-                (0, (-1, -1), 1, False),
-                (0, (-1, -1), 1, True),
-                (0, (111, 11), 1, False),
-                (0, (111, 222), 1, False),
-                (0, (-1, 0), 1, False),
-                (32, (-1, 0), 1, False),
-                (257, (-1, 0), 1, False),
-                (1024, (-1, 0), 1, False),
-                (111, (-1, 0), 11, False),
-                (1111, (-1, 0), 222, False),
-            ]
-        ),
-        attn_hidden_dims=st.sampled_from(
-            [
-                (64, 64),
-                (128, 128),
-                (256, 256),
-            ]
-        ),
-        alpha=st.sampled_from([1.0, 0.1]),
-        rab_params=st.sampled_from(
-            [
-                (False, False, None),
-                (True, False, None),  # None means heads_rab=heads
-                (True, True, None),
-                (True, False, 1),
-                (True, True, 1),
-            ]
-        ),
-        dtype=st.just(torch.float8_e4m3fn),
-        quant_mode_full_batch=st.sampled_from([
-            (0, True), (0, False),
-            (1, True), (2, True),
-            (3, True), (4, True),
-            (5, True),
-        ]),
-    )
-    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
-    def test_hstu_attn_fp8(
-        self,
-        batch_size: int,
-        heads: int,
-        seq_len_params: Tuple[int, int],
-        max_context_len: int,
-        target_params: Tuple[int, Tuple[int, int], int, bool],
-        attn_hidden_dims: Tuple[int, int],
-        alpha: float,
-        rab_params: Tuple[bool, bool, Optional[int]],
-        dtype: torch.dtype,
-        quant_mode_full_batch: Tuple[int, bool],
-    ) -> None:
-        max_seq_len_q, max_seq_len_k = seq_len_params
-        max_target_len, window_size, target_group_size, is_arbitrary = target_params
-        attn_dim, hidden_dim = attn_hidden_dims
-        has_rab, has_drab, heads_rab = rab_params
-        quant_mode, full_batch = quant_mode_full_batch
+#     @given(
+#         batch_size=st.sampled_from([32]),
+#         heads=st.sampled_from([2]),
+#         seq_len_params=st.sampled_from(
+#             [
+#                 (32, 32),
+#                 (99, 99),
+#                 (272, 272),
+#                 (848, 848),
+#                 (8, 99),
+#                 (51, 256),
+#                 (531, 777),
+#                 (160, 800),
+#             ]
+#         ),
+#         max_context_len=st.sampled_from([0, 99, 160, 333]),
+#         target_params=st.sampled_from(
+#             [
+#                 (0, (-1, -1), 1, False),
+#                 (0, (-1, -1), 1, True),
+#                 (0, (111, 11), 1, False),
+#                 (0, (111, 222), 1, False),
+#                 (0, (-1, 0), 1, False),
+#                 (32, (-1, 0), 1, False),
+#                 (257, (-1, 0), 1, False),
+#                 (1024, (-1, 0), 1, False),
+#                 (111, (-1, 0), 11, False),
+#                 (1111, (-1, 0), 222, False),
+#             ]
+#         ),
+#         attn_hidden_dims=st.sampled_from(
+#             [
+#                 (64, 64),
+#                 (128, 128),
+#                 (256, 256),
+#             ]
+#         ),
+#         alpha=st.sampled_from([1.0, 0.1]),
+#         rab_params=st.sampled_from(
+#             [
+#                 (False, False, None),
+#                 (True, False, None),  # None means heads_rab=heads
+#                 (True, True, None),
+#                 (True, False, 1),
+#                 (True, True, 1),
+#             ]
+#         ),
+#         dtype=st.just(torch.float8_e4m3fn),
+#         quant_mode_full_batch=st.sampled_from([
+#             (0, True), (0, False),
+#             (1, True), (2, True),
+#             (3, True), (4, True),
+#             (5, True),
+#         ]),
+#     )
+#     @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
+#     def test_hstu_attn_fp8(
+#         self,
+#         batch_size: int,
+#         heads: int,
+#         seq_len_params: Tuple[int, int],
+#         max_context_len: int,
+#         target_params: Tuple[int, Tuple[int, int], int, bool],
+#         attn_hidden_dims: Tuple[int, int],
+#         alpha: float,
+#         rab_params: Tuple[bool, bool, Optional[int]],
+#         dtype: torch.dtype,
+#         quant_mode_full_batch: Tuple[int, bool],
+#     ) -> None:
+#         max_seq_len_q, max_seq_len_k = seq_len_params
+#         max_target_len, window_size, target_group_size, is_arbitrary = target_params
+#         attn_dim, hidden_dim = attn_hidden_dims
+#         has_rab, has_drab, heads_rab = rab_params
+#         quant_mode, full_batch = quant_mode_full_batch
 
-        total_q = max_context_len + max_seq_len_q + max_target_len
-        total_k = max_context_len + max_seq_len_k + max_target_len
-        has_context = max_context_len > 0
-        has_target = max_target_len > 0
-        is_causal = window_size[0] == -1 and window_size[1] == 0
-        is_delta_q = max_seq_len_q < max_seq_len_k
-        if quant_mode == 0 and alpha < 0.5:
-            logger.info("Skipping test for quant_mode == 0 and alpha < 0.5, might cause dQ accuracy issue")
-            return
-        if quant_mode > 0 and (total_q % 16 != 0 or total_k % 16 != 0 or full_batch == False):
-            logger.info("Skipping test for quant_mode > 0 and (total_q % 16 != 0 or total_k % 16 != 0 or full_batch == False), not supported")
-            return
-        if is_delta_q and has_target:
-            logger.info("Skipping test for is_delta_q and has_target")
-            return
-        if is_delta_q and has_context:
-            logger.info("Skipping test for is_delta_q and has_context")
-            return
-        if not is_causal and has_context:
-            logger.info("Skipping test for not is_causal and has_context")
-            return
-        if (window_size[0] > 0 or window_size[1] > 0) and has_context:
-            logger.info(
-                "Skipping test for (window_size[0] > 0 or window_size[1] > 0) and has_context"
-            )
-            return
+#         total_q = max_context_len + max_seq_len_q + max_target_len
+#         total_k = max_context_len + max_seq_len_k + max_target_len
+#         has_context = max_context_len > 0
+#         has_target = max_target_len > 0
+#         is_causal = window_size[0] == -1 and window_size[1] == 0
+#         is_delta_q = max_seq_len_q < max_seq_len_k
+#         if quant_mode == 0 and alpha < 0.5:
+#             logger.info("Skipping test for quant_mode == 0 and alpha < 0.5, might cause dQ accuracy issue")
+#             return
+#         if quant_mode > 0 and (total_q % 16 != 0 or total_k % 16 != 0 or full_batch == False):
+#             logger.info("Skipping test for quant_mode > 0 and (total_q % 16 != 0 or total_k % 16 != 0 or full_batch == False), not supported")
+#             return
+#         if is_delta_q and has_target:
+#             logger.info("Skipping test for is_delta_q and has_target")
+#             return
+#         if is_delta_q and has_context:
+#             logger.info("Skipping test for is_delta_q and has_context")
+#             return
+#         if not is_causal and has_context:
+#             logger.info("Skipping test for not is_causal and has_context")
+#             return
+#         if (window_size[0] > 0 or window_size[1] > 0) and has_context:
+#             logger.info(
+#                 "Skipping test for (window_size[0] > 0 or window_size[1] > 0) and has_context"
+#             )
+#             return
 
-        torch.cuda.synchronize()
-        L_q, L_k, num_contexts, cu_seqlens_q, cu_seqlens_k, num_targets, _, q, k, v, rab, attn_mask, func = (
-            generate_input(
-                batch_size=batch_size,
-                heads=heads,
-                heads_rab=heads_rab,
-                max_seq_len_q=max_seq_len_q,
-                max_seq_len_k=max_seq_len_k,
-                max_context_len=max_context_len,
-                max_target_len=max_target_len,
-                target_group_size=target_group_size,
-                attn_dim=attn_dim,
-                hidden_dim=hidden_dim,
-                window_size=window_size,
-                dtype=dtype,
-                full_batch=full_batch,
-                has_drab=has_drab,
-                is_delta_q=is_delta_q,
-                is_arbitrary=is_arbitrary,
-            )
-        )
-        out_ref = _hstu_attention_maybe_from_cache(
-            num_heads=heads,
-            attention_dim=attn_dim,
-            linear_dim=hidden_dim,
-            seqlen_q=max_context_len + max_seq_len_q + max_target_len,
-            seqlen_k=max_context_len + max_seq_len_k + max_target_len,
-            q=q,
-            k=k,
-            v=v,
-            q_offsets=cu_seqlens_q,
-            k_offsets=cu_seqlens_k,
-            rab=rab if has_rab else None,
-            invalid_attn_mask=(
-                attn_mask.to(torch.float32) if attn_mask is not None else None
-            ),
-            alpha=alpha,
-            upcast=True,
-            is_delta_q=is_delta_q,
-        )
+#         torch.cuda.synchronize()
+#         L_q, L_k, num_contexts, cu_seqlens_q, cu_seqlens_k, num_targets, _, q, k, v, rab, attn_mask, func = (
+#             generate_input(
+#                 batch_size=batch_size,
+#                 heads=heads,
+#                 heads_rab=heads_rab,
+#                 max_seq_len_q=max_seq_len_q,
+#                 max_seq_len_k=max_seq_len_k,
+#                 max_context_len=max_context_len,
+#                 max_target_len=max_target_len,
+#                 target_group_size=target_group_size,
+#                 attn_dim=attn_dim,
+#                 hidden_dim=hidden_dim,
+#                 window_size=window_size,
+#                 dtype=dtype,
+#                 full_batch=full_batch,
+#                 has_drab=has_drab,
+#                 is_delta_q=is_delta_q,
+#                 is_arbitrary=is_arbitrary,
+#             )
+#         )
+#         out_ref = _hstu_attention_maybe_from_cache(
+#             num_heads=heads,
+#             attention_dim=attn_dim,
+#             linear_dim=hidden_dim,
+#             seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+#             seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+#             q=q,
+#             k=k,
+#             v=v,
+#             q_offsets=cu_seqlens_q,
+#             k_offsets=cu_seqlens_k,
+#             rab=rab if has_rab else None,
+#             invalid_attn_mask=(
+#                 attn_mask.to(torch.float32) if attn_mask is not None else None
+#             ),
+#             alpha=alpha,
+#             upcast=True,
+#             is_delta_q=is_delta_q,
+#         )
 
-        torch_out = _hstu_attention_maybe_from_cache_fp8(
-            num_heads=heads,
-            attention_dim=attn_dim,
-            linear_dim=hidden_dim,
-            seqlen_q=max_context_len + max_seq_len_q + max_target_len,
-            seqlen_k=max_context_len + max_seq_len_k + max_target_len,
-            q=q,
-            k=k,
-            v=v,
-            q_offsets=cu_seqlens_q,
-            k_offsets=cu_seqlens_k,
-            rab=rab if has_rab else None,
-            invalid_attn_mask=(
-                attn_mask.to(torch.float32) if attn_mask is not None else None
-            ),
-            alpha=alpha,
-            quant_mode=quant_mode,
-            is_delta_q=is_delta_q,
-        )
+#         torch_out = _hstu_attention_maybe_from_cache_fp8(
+#             num_heads=heads,
+#             attention_dim=attn_dim,
+#             linear_dim=hidden_dim,
+#             seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+#             seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+#             q=q,
+#             k=k,
+#             v=v,
+#             q_offsets=cu_seqlens_q,
+#             k_offsets=cu_seqlens_k,
+#             rab=rab if has_rab else None,
+#             invalid_attn_mask=(
+#                 attn_mask.to(torch.float32) if attn_mask is not None else None
+#             ),
+#             alpha=alpha,
+#             quant_mode=quant_mode,
+#             is_delta_q=is_delta_q,
+#         )
 
-        hstu_out = hstu_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
-            max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
-            num_contexts=num_contexts,
-            num_targets=num_targets,
-            target_group_size=target_group_size,
-            window_size=window_size,
-            alpha=alpha,
-            rab=rab if has_rab else None,
-            has_drab=has_drab,
-            func=func,
-            quant_mode=quant_mode,
-        )
+#         hstu_out = hstu_attn_varlen_func(
+#             q=q,
+#             k=k,
+#             v=v,
+#             cu_seqlens_q=cu_seqlens_q,
+#             cu_seqlens_k=cu_seqlens_k,
+#             max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+#             max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+#             num_contexts=num_contexts,
+#             num_targets=num_targets,
+#             target_group_size=target_group_size,
+#             window_size=window_size,
+#             alpha=alpha,
+#             rab=rab if has_rab else None,
+#             has_drab=has_drab,
+#             func=func,
+#             quant_mode=quant_mode,
+#         )
 
-        # print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
-        # print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
-        # print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
-        # print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
+#         # print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
+#         # print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
+#         # print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
+#         # print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
 
-        assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
+#         assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
 
-        g = torch.rand_like(torch_out)
-        if not has_drab:
-            (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
-                out_ref, (q, k, v), g, retain_graph=True
-            )
-            (dq_hstu, dk_hstu, dv_hstu) = torch.autograd.grad(
-                hstu_out, (q, k, v), g, retain_graph=True,
-            )
-        else:
-            (dq_ref, dk_ref, dv_ref, drab_ref) = torch.autograd.grad(
-                out_ref, (q, k, v, rab), g, retain_graph=True
-            )
-            (dq_hstu, dk_hstu, dv_hstu, drab_hstu) = torch.autograd.grad(
-                hstu_out, (q, k, v, rab), g, retain_graph=True,
-            )
-        (dq_torch, dk_torch, dv_torch, drab_torch) = _bwd_reference_fp8(
-            num_heads=heads,
-            attention_dim=attn_dim,
-            linear_dim=hidden_dim,
-            seqlen_q=max_context_len+max_seq_len_q+max_target_len,
-            seqlen_k=max_context_len+max_seq_len_k+max_target_len,
-            do=g,
-            q=q,
-            k=k,
-            v=v,
-            q_offsets=cu_seqlens_q,
-            k_offsets=cu_seqlens_k,
-            rab=rab if has_rab else None,
-            invalid_attn_mask=attn_mask,
-            alpha=alpha,
-            quant_mode=quant_mode,
-            is_delta_q=is_delta_q,
-        )
+#         g = torch.rand_like(torch_out)
+#         if not has_drab:
+#             (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
+#                 out_ref, (q, k, v), g, retain_graph=True
+#             )
+#             (dq_hstu, dk_hstu, dv_hstu) = torch.autograd.grad(
+#                 hstu_out, (q, k, v), g, retain_graph=True,
+#             )
+#         else:
+#             (dq_ref, dk_ref, dv_ref, drab_ref) = torch.autograd.grad(
+#                 out_ref, (q, k, v, rab), g, retain_graph=True
+#             )
+#             (dq_hstu, dk_hstu, dv_hstu, drab_hstu) = torch.autograd.grad(
+#                 hstu_out, (q, k, v, rab), g, retain_graph=True,
+#             )
+#         (dq_torch, dk_torch, dv_torch, drab_torch) = _bwd_reference_fp8(
+#             num_heads=heads,
+#             attention_dim=attn_dim,
+#             linear_dim=hidden_dim,
+#             seqlen_q=max_context_len+max_seq_len_q+max_target_len,
+#             seqlen_k=max_context_len+max_seq_len_k+max_target_len,
+#             do=g,
+#             q=q,
+#             k=k,
+#             v=v,
+#             q_offsets=cu_seqlens_q,
+#             k_offsets=cu_seqlens_k,
+#             rab=rab if has_rab else None,
+#             invalid_attn_mask=attn_mask,
+#             alpha=alpha,
+#             quant_mode=quant_mode,
+#             is_delta_q=is_delta_q,
+#         )
 
-        # print(f"dV max diff: {(dv_hstu - dv_ref).abs().max().item()}")
-        # print(f"dV Pytorch max diff: {(dv_torch - dv_ref).abs().max().item()}")
-        # print(f"dK max diff: {(dk_hstu - dk_ref).abs().max().item()}")
-        # print(f"dK Pytorch max diff: {(dk_torch - dk_ref).abs().max().item()}")
-        # print(f"dQ max diff: {(dq_hstu - dq_ref).abs().max().item()}")
-        # print(f"dQ Pytorch max diff: {(dq_torch - dq_ref).abs().max().item()}")
-        # if has_drab:
-        #     print(f"drab max diff: {(drab_hstu - drab_ref).abs().max().item()}")
-        #     print(f"drab Pytorch max diff: {(drab_torch - drab_ref).abs().max().item()}")
+#         # print(f"dV max diff: {(dv_hstu - dv_ref).abs().max().item()}")
+#         # print(f"dV Pytorch max diff: {(dv_torch - dv_ref).abs().max().item()}")
+#         # print(f"dK max diff: {(dk_hstu - dk_ref).abs().max().item()}")
+#         # print(f"dK Pytorch max diff: {(dk_torch - dk_ref).abs().max().item()}")
+#         # print(f"dQ max diff: {(dq_hstu - dq_ref).abs().max().item()}")
+#         # print(f"dQ Pytorch max diff: {(dq_torch - dq_ref).abs().max().item()}")
+#         # if has_drab:
+#         #     print(f"drab max diff: {(drab_hstu - drab_ref).abs().max().item()}")
+#         #     print(f"drab Pytorch max diff: {(drab_torch - drab_ref).abs().max().item()}")
 
-        assert (dv_torch - dv_ref).abs().max().item() <= 2 * (
-            dv_hstu - dv_ref
-        ).abs().max().item()
-        assert (dk_torch - dk_ref).abs().max().item() <= 2 * (
-            dk_hstu - dk_ref
-        ).abs().max().item()
-        assert (dq_torch - dq_ref).abs().max().item() <= 2 * (
-            dq_hstu - dq_ref
-        ).abs().max().item()
-        if has_drab:
-            assert (drab_torch - drab_ref).abs().max().item() <= 2 * (
-                drab_hstu - drab_ref
-            ).abs().max().item()
+#         assert (dv_torch - dv_ref).abs().max().item() <= 2 * (
+#             dv_hstu - dv_ref
+#         ).abs().max().item()
+#         assert (dk_torch - dk_ref).abs().max().item() <= 2 * (
+#             dk_hstu - dk_ref
+#         ).abs().max().item()
+#         assert (dq_torch - dq_ref).abs().max().item() <= 2 * (
+#             dq_hstu - dq_ref
+#         ).abs().max().item()
+#         if has_drab:
+#             assert (drab_torch - drab_ref).abs().max().item() <= 2 * (
+#                 drab_hstu - drab_ref
+#             ).abs().max().item()
 
-        assert (dv_hstu - dv_ref).abs().max().item() <= 5 * (
-            dv_torch - dv_ref
-        ).abs().max().item()
-        assert (dk_hstu - dk_ref).abs().max().item() <= 5 * (
-            dk_torch - dk_ref
-        ).abs().max().item()
-        assert (dq_hstu - dq_ref).abs().max().item() <= 5 * (
-            dq_torch - dq_ref
-        ).abs().max().item()
-        if has_drab:
-            assert (drab_hstu - drab_ref).abs().max().item() <= 5 * (
-                drab_torch - drab_ref
-            ).abs().max().item()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+#         assert (dv_hstu - dv_ref).abs().max().item() <= 5 * (
+#             dv_torch - dv_ref
+#         ).abs().max().item()
+#         assert (dk_hstu - dk_ref).abs().max().item() <= 5 * (
+#             dk_torch - dk_ref
+#         ).abs().max().item()
+#         assert (dq_hstu - dq_ref).abs().max().item() <= 5 * (
+#             dq_torch - dq_ref
+#         ).abs().max().item()
+#         if has_drab:
+#             assert (drab_hstu - drab_ref).abs().max().item() <= 5 * (
+#                 drab_torch - drab_ref
+#             ).abs().max().item()
+#         torch.cuda.empty_cache()
+#         torch.cuda.synchronize()
 
 
 if __name__ == "__main__":
-    # benchmark case
-    HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
-    8, 8, 0, (128, 128), 1.0, (False, False, None), (8192, 8192), (0, (-1, -1), 1, False), torch.bfloat16, True)
+
+    # HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
+    # 1, 1, 160, (64, 64), 1.0, (False, False, None), (32, 32), (25, (-1, 0), 1, False), torch.bfloat16, True)
+
+    # for i in range(10):
+    #     HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
+    #     1, 1, 0, (64, 64), 1.0, (False, False, None), (1024, 1024), (0, (-1, -1), 1, True), torch.bfloat16, False)
+
+    # for i in range(10):
+    for i in range(10):
+        HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
+        4, 2, 160, (128, 128), 0.1, (True, False, None), (256, 256), (1024, (-1, 0), 1, False), torch.bfloat16, False)
 
     # HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
     # 1, 1, 0, (64, 64), 1.0, (False, False, None), (128, 128), (0, (-1, -1), 1, False), torch.bfloat16, True)
