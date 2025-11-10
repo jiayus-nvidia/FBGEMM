@@ -1603,10 +1603,12 @@ struct CollectiveMainloopBwd {
           Tensor tdQrdQ_atomic = recast<float4>(tdQrdQ);
           Tensor tdQgdQaccum_atomic =
               recast<float4>(tdQgdQaccum(_, _, _, m_block));
+          #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < size(tdQrdQ_atomic) / 2; ++i) {
             atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i));
           }
+          #endif
         }
 
         if constexpr (!Mma_dKV_is_RS) {
@@ -1678,10 +1680,12 @@ struct CollectiveMainloopBwd {
         Tensor tdQrdQ_atomic = recast<float4>(tdQrdQ);
         Tensor tdQgdQaccum_atomic =
             recast<float4>(tdQgdQaccum(_, _, _, m_block));
+        #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tdQrdQ_atomic) / 2; ++i) {
           atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i));
         }
+        #endif
 
         Tensor tdKrdS =
             mma_partition_fragment_AB</*A=*/!dKV_swapAB>(wg_mma_dKV, sdSt);
@@ -1707,10 +1711,12 @@ struct CollectiveMainloopBwd {
             /*wg_wait=*/0,
             /*SwapAB=*/dQ_swapAB,
             /*M_slice=*/1>(tiled_mma_dQ, tdQrdS_cur, tdQrK, tdQrdQ);
+        #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
         CUTLASS_PRAGMA_UNROLL
         for (int i = size(tdQrdQ_atomic) / 2; i < size(tdQrdQ_atomic); ++i) {
           atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i));
         }
+        #endif
 
         flash::gemm<
             /*zero_init=*/false,
@@ -2605,8 +2611,10 @@ struct CollectiveMainloopBwd {
       } else {
         Tensor tdQrdQ_atomic = recast<float4>(tdQrdQ);
         Tensor tdQgdQaccum_atomic = recast<float4>(tdQgdQaccum(_, _, _, m_block));
+        #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tdQrdQ_atomic); ++i) { atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i)); }
+        #endif
       }
 
       ++smem_pipe_read;

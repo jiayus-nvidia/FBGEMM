@@ -22,6 +22,8 @@ class VarSeqLenTraits {
   const int sum_s = 0;
   // seq len offsets.
   const int* cu_seq_len = nullptr;
+  // seq len used
+  const int* seqused = nullptr;
   // targets nums
   const int* num_targets = nullptr;
   // context nums
@@ -29,6 +31,7 @@ class VarSeqLenTraits {
   // seq len of the current batch.
   int max_seq_len = -1;
   int actual_seq_len = -1;
+  int actual_seq_len_padded = -1;
   int actual_seq_len_h = -1;
   int actual_seq_len_c = 0;
   // seq len q offsets
@@ -52,11 +55,13 @@ class VarSeqLenTraits {
       const int sum_s,
       const int max_seq_len,
       const int* cu_seq_len,
+      const int* seqused,
       const int* num_targets = nullptr,
       const int* num_contexts = nullptr)
       : sum_s(sum_s),
         max_seq_len(max_seq_len),
         cu_seq_len(cu_seq_len),
+        seqused(seqused),
         num_targets(num_targets),
         num_contexts(num_contexts) {}
 
@@ -78,7 +83,8 @@ class VarSeqLenTraits {
 
   CUTLASS_DEVICE void init(int bidb) {
     offset = cu_seq_len[bidb];
-    actual_seq_len = cu_seq_len[bidb + 1] - offset;
+    actual_seq_len = seqused ? seqused[bidb] : cu_seq_len[bidb + 1] - offset;
+    actual_seq_len_padded = cu_seq_len[bidb + 1] - offset;
   }
 
   CUTLASS_DEVICE void init_h(int bidb) {

@@ -22,8 +22,14 @@ struct HstuBlockInfo {
         sum_s_page(Kernel_traits::Paged_KV ? params.page_offsets[bidb] : 0),
         actual_seqlen_c(
             Kernel_traits::Is_context ? params.num_contexts[bidb] : 0),
-        actual_seqlen_q(params.cu_seqlens_q[bidb + 1] - sum_s_q),
-        actual_seqlen_k(params.cu_seqlens_k[bidb + 1] - sum_s_k),
+        actual_seqlen_q(
+          params.seqused_q ? params.seqused_q[bidb] : params.cu_seqlens_q[bidb + 1] - sum_s_q),
+        actual_seqlen_k(
+          params.seqused_k ? params.seqused_k[bidb] : params.cu_seqlens_k[bidb + 1] - sum_s_k),
+        actual_seqlen_q_padded(
+          params.cu_seqlens_q[bidb + 1] - sum_s_q),
+        actual_seqlen_k_padded(
+          params.cu_seqlens_k[bidb + 1] - sum_s_k),
         actual_seqlen_t(Kernel_traits::Is_target ? params.num_targets[bidb] : 0),
         actual_page_num(
             Kernel_traits::Paged_KV ? params.page_offsets[bidb + 1] - sum_s_page : 0),
@@ -51,6 +57,8 @@ struct HstuBlockInfo {
   const int actual_seqlen_c;
   const int actual_seqlen_q;
   const int actual_seqlen_k;
+  const int actual_seqlen_q_padded;
+  const int actual_seqlen_k_padded;
   const int actual_seqlen_t;
   const int actual_page_num;
   const int last_page_seqlen;

@@ -54,12 +54,14 @@ void run_hstu_bwd(Hstu_bwd_params& params, cudaStream_t stream) {
       params.total_q,
       params.seqlen_q,
       params.cu_seqlens_q,
+      params.seqused_q,
       params.num_targets,
       params.num_contexts);
   Seqlen_traits seqlen_traits_k(
       params.total_k,
       params.seqlen_k,
       params.cu_seqlens_k,
+      params.seqused_k,
       params.num_targets,
       params.num_contexts);
   typename CollectiveMainloop::Params mainloop_params =
@@ -241,8 +243,7 @@ void run_hstu_bwd(Hstu_bwd_params& params, cudaStream_t stream) {
            params.seqlen_q,
            params.alpha,
            params.cu_seqlens_q,
-           params.num_targets,
-           params.num_contexts});
+           params.seqused_q});
   int num_m_block_postprocess =
       cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
   dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);

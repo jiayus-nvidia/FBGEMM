@@ -109,8 +109,7 @@ class FlashAttnBwdPostprocessConvertdQ {
     const int seqlen_q;
     const float alpha;
     const int* cu_seqlens_q;
-    const int* num_targets;
-    const int* num_contexts;
+    const int* seqused_q;
   };
 
   // Kernel entry point API
@@ -123,8 +122,7 @@ class FlashAttnBwdPostprocessConvertdQ {
     const int seqlen_q;
     const float alpha;
     const int* cu_seqlens_q;
-    const int* num_targets;
-    const int* num_contexts;
+    const int* seqused_q;
   };
 
   // Convert to underlying arguments. In this case, a simple copy for the
@@ -147,8 +145,7 @@ class FlashAttnBwdPostprocessConvertdQ {
         args.seqlen_q,
         args.alpha,
         args.cu_seqlens_q,
-        args.num_targets,
-        args.num_contexts};
+        args.seqused_q};
   }
 
   CUTLASS_DEVICE
@@ -175,12 +172,12 @@ class FlashAttnBwdPostprocessConvertdQ {
         params.total_q,
         params.seqlen_q,
         params.cu_seqlens_q,
-        params.num_targets,
-        params.num_contexts);
+        params.seqused_q);
     seqlen_traits_q.init(bidb);
     int const max_seq_len_q = seqlen_traits_q.max_seq_len;
     int const seqlen = seqlen_traits_q.actual_seq_len;
-    if (m_block * kBlockM >= seqlen) {
+    int const seqlen_padded = seqlen_traits_q.actual_seq_len_padded;
+    if (m_block * kBlockM >= seqlen_padded) {
       return;
     }
 
@@ -296,6 +293,12 @@ class FlashAttnBwdPostprocessConvertdQ {
       tdQpdQ(k) =
           get<1>(tdQcdQ(_0{}, _0{}, k)) < get<1>(params.layout_dQ.shape());
     }
+    CUTLASS_PRAGMA_UNROLL
+    for (int m = 0; m < size<1>(tdQrdQ); m++) {
+      if (get<0>(tdQcdQ(0, m, 0)) >= seqlen - m_block * kBlockM) {
+        cute::clear(tdQrdQ(_, m, _));
+      }
+    }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     flash::copy<
         /*Is_even_MN=*/false,
@@ -307,7 +310,7 @@ class FlashAttnBwdPostprocessConvertdQ {
         tdQgdQ,
         tdQcdQ,
         tdQpdQ,
-        seqlen - m_block * kBlockM);
+        seqlen_padded - m_block * kBlockM);
   }
 };
 

@@ -127,13 +127,6 @@ struct CollectiveEpilogueFwd {
     cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible
                                               // to TMA
 
-    Tensor caccO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));
-    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-    Tensor taccOcO = thread_mma.partition_C(caccO);
-    static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
-    static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
-    Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
-
     cutlass::arch::NamedBarrier::sync(
         NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     TiledCopyO gmem_tiled_copy_O;
@@ -176,12 +169,6 @@ struct CollectiveEpilogueFwd {
     cute::copy(rmem_tiled_copy_O, taccOrO, taccOsO);
     cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible
                                               // to TMA
-    Tensor caccO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));
-    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-    Tensor taccOcO = thread_mma.partition_C(caccO);
-    static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
-    static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
-    Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
 
     cutlass::arch::NamedBarrier::sync(
         NumMmaThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
@@ -244,7 +231,7 @@ struct CollectiveEpilogueFwd {
         tOgO,
         tOcO,
         tOpO,
-        seqlen_traits_q.actual_seq_len - m_block * kBlockM);
+        seqlen_traits_q.actual_seq_len_padded - m_block * kBlockM);
     static_assert(kBlockM <= NumMmaThreads);
   }
 };

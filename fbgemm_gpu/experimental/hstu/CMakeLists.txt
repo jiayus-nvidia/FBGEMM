@@ -22,13 +22,14 @@ execute_process(
           --arch-list="${TORCH_CUDA_ARCH_LIST_STR}" # Pass requested architectures
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src"
   RESULT_VARIABLE _resvar
+  OUTPUT_VARIABLE _outvar
   ERROR_VARIABLE _errvar
   OUTPUT_STRIP_TRAILING_WHITESPACE
-  COMMAND_ERROR_IS_FATAL ANY # Ensure build fails if script fails
+  ERROR_STRIP_TRAILING_WHITESPACE
 )
 # Check result (recommended)
 if(NOT _resvar EQUAL 0)
-  message(FATAL_ERROR "generate_kernels.py failed:\n${_errvar}")
+  message(FATAL_ERROR "generate_kernels.py failed with return code ${_resvar}:\nSTDOUT:\n${_outvar}\nSTDERR:\n${_errvar}")
 endif()
 
 set(HSTU_CUDA_FLAGS "")

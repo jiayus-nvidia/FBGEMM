@@ -359,8 +359,12 @@ __global__ void __launch_bounds__(
              m_masking_steps,
              is_in_context,
              m_block_context] = get_block_info(n_block, bidb);
+        if (n_block * kBlockN >= seqlen_traits_k.actual_seq_len_padded) {
+          scheduler.prefetch_next_work(scheduler_params, work_tile_info);
+          continue;
+        }
         get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<false>{});
-        if (m_block_min >= m_block_max) {
+        if (m_block_min >= m_block_max || n_block * kBlockN >= seqlen_traits_k.actual_seq_len) {
           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
           continue;
         }
@@ -407,8 +411,11 @@ __global__ void __launch_bounds__(
              m_masking_steps,
              is_in_context,
              m_block_context] = get_block_info(n_block, bidb);
+        if (n_block * kBlockN >= seqlen_traits_k.actual_seq_len_padded) {
+          continue;
+        }
         get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<false>{});
-        if (m_block_min >= m_block_max) {
+        if (m_block_min >= m_block_max || n_block * kBlockN >= seqlen_traits_k.actual_seq_len) {
           continue;
         }
         collective_mainloop.store_dq(
@@ -438,8 +445,11 @@ __global__ void __launch_bounds__(
              m_masking_steps,
              is_in_context,
              m_block_context] = get_block_info(n_block, bidb);
+        if (n_block * kBlockN >= seqlen_traits_k.actual_seq_len_padded) {
+          continue;
+        }
         get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<true>{});
-        if (m_block_min >= m_block_max) {
+        if (m_block_min >= m_block_max || n_block * kBlockN >= seqlen_traits_k.actual_seq_len) {
           continue;
         }
         collective_mainloop.store_drab(
@@ -487,9 +497,11 @@ __global__ void __launch_bounds__(
            m_masking_steps,
            is_in_context,
            m_block_context] = get_block_info(n_block, bidb);
+      if (n_block * kBlockN >= seqlen_traits_k.actual_seq_len_padded) {
+        continue;
+      }
       get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<true>{});
-      if (m_block_min >=
-          m_block_max) { // We exit early and write 0 to dK and dV
+      if (m_block_min >= m_block_max || n_block * kBlockN >= seqlen_traits_k.actual_seq_len) { // We exit early and write 0 to dK and dV and covers the case where the input sequence involve padding.
         collective_epilogue.store_zero(
             epilogue_params,
             threadIdx.x - NumCopyThreads,
@@ -808,8 +820,12 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
         auto block_coord = work_tile_info.get_block_coord(scheduler_params);
         auto [n_block, bidh, bidb] = block_coord;
         auto [m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context] = get_block_info(n_block, bidb);
+        if (n_block * kBlockN >= seqlen_traits_k.actual_seq_len_padded) {
+          scheduler.prefetch_next_work(scheduler_params, work_tile_info);
+          continue;
+        }
         get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<false>{});
-        if (m_block_min >= m_block_max) {
+        if (m_block_min >= m_block_max || n_block * kBlockN >= seqlen_traits_k.actual_seq_len) {
           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
           continue;
         }
@@ -830,8 +846,11 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
         auto block_coord = work_tile_info.get_block_coord(scheduler_params);
         auto [n_block, bidh, bidb] = block_coord;
         auto [m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context] = get_block_info(n_block, bidb);
+        if (n_block * kBlockN >= seqlen_traits_k.actual_seq_len_padded) {
+          continue;
+        }
         get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<false>{});
-        if (m_block_min >= m_block_max) { continue; }
+        if (m_block_min >= m_block_max || n_block * kBlockN >= seqlen_traits_k.actual_seq_len) { continue; }
         collective_mainloop.store_dq(mainloop_params, shared_storage, block_coord,
                                      m_block_min, m_block_max, is_in_context, m_block_context, seqlen_traits_q);
       }
@@ -844,8 +863,11 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
         auto block_coord = work_tile_info.get_block_coord(scheduler_params);
         auto [n_block, bidh, bidb] = block_coord;
         auto [m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context] = get_block_info(n_block, bidb);
+        if (n_block * kBlockN >= seqlen_traits_k.actual_seq_len_padded) {
+          continue;
+        }
         get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<false>{});
-        if (m_block_min >= m_block_max) { continue; }
+        if (m_block_min >= m_block_max || n_block * kBlockN >= seqlen_traits_k.actual_seq_len) { continue; }
         collective_mainloop.store_drab(mainloop_params, pipeline_drab, smem_pipe_read_dRab, shared_storage, block_coord,
                                        m_block_min, m_block_max, is_in_context, m_block_context, seqlen_traits_q, seqlen_traits_k);
       }
@@ -872,8 +894,12 @@ __global__ void __launch_bounds__(Ktraits::kNWarps *cutlass::NumThreadsPerWarp, 
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
       auto [n_block, bidh, bidb] = block_coord;
       auto [m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context] = get_block_info(n_block, bidb);
+      if (n_block * kBlockN >= seqlen_traits_k.actual_seq_len_padded) {
+        continue;
+      }
       get_valid_block_ids(n_block, m_block_min, m_block_max, cute::bool_constant<true>{});
-      if (m_block_min >= m_block_max) {
+      // We exit early and write 0 to dK and dV and covers the case where the input sequence involve padding.
+      if (m_block_min >= m_block_max || n_block * kBlockN >= seqlen_traits_k.actual_seq_len) {
         collective_epilogue.store_zero(epilogue_params, threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_k);
         continue;
       }

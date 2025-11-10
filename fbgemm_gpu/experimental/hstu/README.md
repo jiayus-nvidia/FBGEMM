@@ -17,6 +17,8 @@ def hstu_attn_varlen_func(
     v,                     # (total_k, nheads_k, headdim)
     cu_seqlens_q,          # (batch_size + 1,), cumulative sequence lengths for q
     cu_seqlens_k,          # (batch_size + 1,), cumulative sequence lengths for k/v
+    seqused_q,             # (batch_size,). The number of valid tokens in each query sequence. If None, all tokens are valid.
+    seqused_k,             # (batch_size,). The number of valid tokens in each key sequence. If None, all tokens are valid.
     max_seqlen_q,          # Maximum query sequence length
     max_seqlen_k,          # Maximum k/v sequence length
     num_contexts=None,     # (batch_size,), context tokens per batch
@@ -43,6 +45,8 @@ def hstu_attn_varlen_func(
 
 ```bash
 cd fbgemm_gpu/
+git submodule update --init --recursive
+pip install -r requirements.txt
 
 # Install HSTU-Ampere
 export HSTU_DISABLE_BACKWARD=FLASE; \
@@ -107,6 +111,7 @@ export HSTU_DISABLE_86OR89=TRUE; \
 python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="8.0 9.0"
 
 # If you don't add -DTORCH_CUDA_ARCH_LIST, the default is "8.0 9.0".
+# If you change any environment variables above, please run `python setup.py clean` and delete all *.cu files in src/hstu_hopper/instantiations/ and/or src/hstu_ampere/instantiations/ before compiling again.
 ```
 
 # **3. Features**
@@ -152,6 +157,6 @@ python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="8.0 9.0"
   * quant_mode == 1: 1xDIM && 128x1.
   * quant_mode == 2: Per block quantization. Block size is in [get_bm_and_bn_block_size_fwd](hstu/cuda_hstu_attention.py#L93) and [get_bm_and_bn_block_size_bwd](hstu/cuda_hstu_attention.py#L112).
   * quant_mode == 3: Per head quantization. Shape of q_descale is (batch_size, nheads).
-  * quant_mode == 4: Per tensor quantization. Shape of q_descale is (batch_size).
-  * quant_mode == 5: Per batch quantization. Shape of q_descale is (1).
+  * quant_mode == 4: Per batch quantization. Shape of q_descale is (batch_size).
+  * quant_mode == 5: Per tensor quantization. Shape of q_descale is (1).
 - **Note**: Only undeterministic backward implementation

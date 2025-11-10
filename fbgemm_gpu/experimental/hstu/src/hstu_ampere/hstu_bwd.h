@@ -68,11 +68,13 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
   constexpr bool Is_V_in_regs = Kernel_traits::Is_V_in_regs;
 
   const HstuBlockInfo<Kernel_traits, Hstu_bwd_params> binfo(params, bidb);
-  if (n_block * kBlockN >= binfo.actual_seqlen_k)
+  if (n_block * kBlockN >= binfo.actual_seqlen_k_padded)
     return;
 
   const int actual_seqlen_q = binfo.actual_seqlen_q;
   const int actual_seqlen_k = binfo.actual_seqlen_k;
+  const int actual_seqlen_q_padded = binfo.actual_seqlen_q_padded;
+  const int actual_seqlen_k_padded = binfo.actual_seqlen_k_padded;
   // Actual context length of this sequence
   const int actual_seqlen_c = Is_context ? binfo.actual_seqlen_c : 0;
   // Actual history length of this sequence
@@ -524,7 +526,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
   // blocks. Otherwise we get wrong result for the blocks that don't enter
   // the for loop. And we might read OOB elements from gQ and gdO. This also
   // covers the case where actual_seqlen_q == 0.
-  if ((Is_causal || Is_local || Is_arbitrary) && m_block_max <= m_block_min) {
+  if (((Is_causal || Is_local || Is_arbitrary) && m_block_max <= m_block_min) || n_block * kBlockN >= actual_seqlen_k) {
     const index_t row_offset_dk = binfo.k_offset(params.dk_row_stride) +
         n_block * kBlockN * params.dk_row_stride + bidh * params.dk_head_stride;
     const index_t row_offset_dv = binfo.k_offset(params.dv_row_stride) +
@@ -558,7 +560,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
         tdKrdK,
         tdKgdK,
         tdKVcdKV,
-        actual_seqlen_k - n_block * kBlockN);
+        actual_seqlen_k_padded - n_block * kBlockN);
     flash::copy<
         /*Is_even_MN=*/false,
         /*Clear_OOB_MN=*/false,
@@ -567,7 +569,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
         tdVrdV,
         tdVgdV,
         tdKVcdKV,
-        actual_seqlen_k - n_block * kBlockN);
+        actual_seqlen_k_padded - n_block * kBlockN);
     return;
   }
 
@@ -1046,6 +1048,14 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
   Tensor cdKV = make_identity_tensor(
       make_shape(size<0>(sdK), size<1>(sdK))); // (BLK_N,BLK_K) -> (blk_n,blk_k)
   Tensor tdKVcdKV = gmem_thr_copy_dKV.partition_D(cdKV);
+  
+  for (int m = 0; m < size<1>(tdKrdK); m++) {
+    if (get<0>(tdKVcdKV(0, m, 0)) >= actual_seqlen_k - n_block * kBlockN) {
+      cute::clear(tdKrdK(_, m, _));
+      cute::clear(tdVrdV(_, m, _));
+    }
+  }
+  
   // Clear_OOB_K must be false since we don't want to write zeros to gmem
   flash::
       copy</*Is_even_MN=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
@@ -1053,14 +1063,14 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
           tdKrdK,
           tdKgdK,
           tdKVcdKV,
-          actual_seqlen_k - n_block * kBlockN);
+          actual_seqlen_k_padded - n_block * kBlockN);
   flash::
       copy</*Is_even_MN=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
           gmem_tiled_copy_dKV,
           tdVrdV,
           tdVgdV,
           tdKVcdKV,
-          actual_seqlen_k - n_block * kBlockN);
+          actual_seqlen_k_padded - n_block * kBlockN);
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1103,14 +1113,15 @@ __global__ void hstu_bwd_convert_dq_kernel(
   constexpr int kHeadDim = Kernel_traits::kHeadDim;
 
   const HstuBlockInfo<Kernel_traits, Hstu_bwd_params> binfo(params, bidb);
-  if (m_block * kBlockM >= binfo.actual_seqlen_q)
+  const int actual_seqlen_q = binfo.actual_seqlen_q;
+  const int actual_seqlen_q_padded = binfo.actual_seqlen_q_padded;
+  if (m_block * kBlockM >= actual_seqlen_q_padded)
     return;
 
   const index_t row_offset_dq = binfo.q_offset(params.dq_row_stride) +
       m_block * kBlockM * params.dq_row_stride + bidh * params.dq_head_stride;
   const index_t row_offset_dq_accum = binfo.q_offset(params.dq_accum_row_stride) +
-      (m_block * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128 * bidb)) *
-          params.dq_accum_row_stride +
+      (m_block * kBlockM + 128 * bidb) * params.dq_accum_row_stride +
       bidh * params.dq_accum_head_stride;
 
   Tensor gdQ = make_tensor(
@@ -1169,7 +1180,12 @@ __global__ void hstu_bwd_convert_dq_kernel(
 
   Tensor cdQ = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
   Tensor tdQcdQ = gmem_thr_copy_dQ.partition_D(cdQ);
-  Tensor tdQpdQ = make_tensor<bool>(make_shape(size<2>(tdQgdQ)));
+
+  for (int m = 0; m < size<1>(tdQrdQ); m++) {
+    if (get<0>(tdQcdQ(0, m, 0)) >= actual_seqlen_q - m_block * kBlockM) {
+      cute::clear(tdQrdQ(_, m, _));
+    }
+  }
 
   // Clear_OOB_K must be false since we don't want to write zeros to gmem
   flash::
@@ -1178,7 +1194,7 @@ __global__ void hstu_bwd_convert_dq_kernel(
           tdQrdQ,
           tdQgdQ,
           tdQcdQ,
-          binfo.actual_seqlen_q - m_block * kBlockM);
+          actual_seqlen_q_padded - m_block * kBlockM);
 }
 
 } // namespace flash

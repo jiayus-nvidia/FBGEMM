@@ -162,6 +162,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         v: torch.Tensor,  # need grad
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
+        seqused_q: Optional[torch.Tensor],
+        seqused_k: Optional[torch.Tensor],
         max_seqlen_q: int,
         max_seqlen_k: int,
         num_contexts: torch.Tensor,
@@ -191,6 +193,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                seqused_q,
+                seqused_k,
                 max_seqlen_q,
                 max_seqlen_k,
                 num_contexts,
@@ -248,6 +252,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                seqused_q,
+                seqused_k,
                 max_seqlen_q,
                 max_seqlen_k,
                 num_contexts,
@@ -276,6 +282,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             v,
             cu_seqlens_q,
             cu_seqlens_k,
+            seqused_q,
+            seqused_k,
             num_contexts,
             num_targets,
             rab_padded,
@@ -325,6 +333,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             v,
             cu_seqlens_q,
             cu_seqlens_k,
+            seqused_q,
+            seqused_k,
             num_contexts,
             num_targets,
             rab_padded,
@@ -348,6 +358,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                seqused_q,
+                seqused_k,
                 max_seqlen_q,
                 max_seqlen_k,
                 None,
@@ -422,6 +434,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                seqused_q,
+                seqused_k,
                 max_seqlen_q,
                 max_seqlen_k,
                 None,
@@ -466,6 +480,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
             dRab if ctx.has_drab else None,
             None,
             None,
@@ -484,6 +500,8 @@ def hstu_attn_varlen_func(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
     max_seqlen_q: int,
     max_seqlen_k: int,
     num_contexts: torch.Tensor,
@@ -505,10 +523,10 @@ def hstu_attn_varlen_func(
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
         k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
         v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into q.
-        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into kv.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths of the sequences in the batch, used to index into q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths of the sequences in the batch, used to index into kv.
+        seqused_q: (batch_size,). The number of valid tokens in each query sequence. If None, all tokens are valid.
+        seqused_k: (batch_size,). The number of valid tokens in each key sequence. If None, all tokens are valid.
         max_seqlen_q: int. Maximum query sequence length in the batch.
         max_seqlen_k: int. Maximum key sequence length in the batch.
         num_contexts: (batch_size,). Number of context tokens in each batch.
@@ -554,6 +572,8 @@ def hstu_attn_varlen_func(
         v,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         num_contexts,
@@ -579,6 +599,8 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         qkv: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
+        seqused_q: Optional[torch.Tensor],
+        seqused_k: Optional[torch.Tensor],
         max_seqlen_q: int,
         max_seqlen_k: int,
         num_contexts: Optional[torch.Tensor] = None,
@@ -602,6 +624,8 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                seqused_q,
+                seqused_k,
                 max_seqlen_q,
                 max_seqlen_k,
                 num_contexts,
@@ -620,6 +644,8 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                seqused_q,
+                seqused_k,
                 max_seqlen_q,
                 max_seqlen_k,
                 num_contexts,
@@ -640,6 +666,8 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
             v,
             cu_seqlens_q,
             cu_seqlens_k,
+            seqused_q,
+            seqused_k,
             num_contexts,
             num_targets,
             rab_padded,
@@ -662,6 +690,8 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
             v,
             cu_seqlens_q,
             cu_seqlens_k,
+            seqused_q,
+            seqused_k,
             num_contexts,
             num_targets,
             rab_padded,
@@ -687,6 +717,8 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                seqused_q,
+                seqused_k,
                 max_seqlen_q,
                 max_seqlen_k,
                 dqkv[:,0,:,:], # dq
@@ -714,6 +746,8 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                seqused_q,
+                seqused_k,
                 max_seqlen_q,
                 max_seqlen_k,
                 dqkv[:,0,:,:], # dq
@@ -759,6 +793,8 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
             dRab if ctx.has_drab else None,
             None,
             None
@@ -768,6 +804,8 @@ def hstu_attn_qkvpacked_func(
     qkv: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
     max_seqlen_q: int,
     max_seqlen_k: int,
     num_contexts: Optional[torch.Tensor] = None,
@@ -782,10 +820,10 @@ def hstu_attn_qkvpacked_func(
     """
     Arguments:
         qkv: (batch_size, seqlen, 3, nheads, headdim)
-        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into q.
-        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into kv.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths of the sequences in the batch, used to index into q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths of the sequences in the batch, used to index into kv.
+        seqused_q: (batch_size,). The number of valid tokens in each query sequence. If None, all tokens are valid.
+        seqused_k: (batch_size,). The number of valid tokens in each key sequence. If None, all tokens are valid.
         max_seqlen_q: int. Maximum query sequence length in the batch.
         max_seqlen_k: int. Maximum key sequence length in the batch.
         num_contexts: (batch_size,). Number of context tokens in each batch.
@@ -814,6 +852,8 @@ def hstu_attn_qkvpacked_func(
         qkv,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         num_contexts,
@@ -835,6 +875,8 @@ def cuda_hstu_attn_varlen(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
     max_seqlen_q: int,
     max_seqlen_k: int,
     num_targets: torch.Tensor,
@@ -849,6 +891,8 @@ def cuda_hstu_attn_varlen(
             v,
             cu_seqlens_q,
             cu_seqlens_k,
+            seqused_q,
+            seqused_k,
             max_seqlen_q,
             max_seqlen_k,
             None,  # num_contexts, # pyre-ignore[6]
@@ -868,6 +912,8 @@ def cuda_hstu_attn_varlen(
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                seqused_q,
+                seqused_k,
                 max_seqlen_q,
                 max_seqlen_k,
                 None,  # num_contexts,
@@ -884,6 +930,8 @@ def cuda_hstu_attn_varlen(
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                seqused_q,
+                seqused_k,
                 max_seqlen_q,
                 max_seqlen_k,
                 None,

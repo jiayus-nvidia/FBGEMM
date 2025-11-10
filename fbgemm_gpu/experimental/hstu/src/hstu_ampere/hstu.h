@@ -65,6 +65,9 @@ struct Hstu_fwd_params : public Hstu_params {
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q;
   int* __restrict__ cu_seqlens_k;
+  int* __restrict__ seqused_q;
+  int* __restrict__ seqused_k;
+
   int* __restrict__ num_targets;
   int* __restrict__ num_contexts;
 

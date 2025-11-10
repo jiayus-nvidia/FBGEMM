@@ -26,7 +26,6 @@ logger: logging.Logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 _MAX_SAMPLES: int = 200
-debug = False
 example = False
 e4m3_max = 448.0
 
@@ -46,24 +45,20 @@ def pad_input(unpadded_input, cu_seqlen, batch, seqlen):
     output[indices] = unpadded_input
     return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
-def pad_input_delta_q(unpadded_input, cu_seqlen_q, cu_seqlen_k, batch, seqlen):
-    indices = []
-    for i in range(batch):
-        act_seqlen_q = (cu_seqlen_q[i + 1] - cu_seqlen_q[i]).item()
-        act_seqlen_k = (cu_seqlen_k[i + 1] - cu_seqlen_k[i]).item()
-        indices.append(
-            torch.arange(
-                seqlen * i + act_seqlen_k - act_seqlen_q, seqlen * i + act_seqlen_k
-            )
-        )
-    indices = torch.cat(indices)
+def pad_input_delta_q(unpadded_input, cu_seqlen_q, cu_seqlen_k, batch, seqlen, seqused_q, seqused_k):
     output = torch.zeros(
         (batch * seqlen),
         *unpadded_input.shape[1:],
         device=unpadded_input.device,
         dtype=unpadded_input.dtype
     )
-    output[indices] = unpadded_input
+    for i in range(batch):
+        act_seqlen_q = (cu_seqlen_q[i + 1] - cu_seqlen_q[i]).item()
+        act_seqlen_k = (cu_seqlen_k[i + 1] - cu_seqlen_k[i]).item()
+        act_seqlen_offset = act_seqlen_k - act_seqlen_q if seqused_q is None else seqused_k[i].item() - seqused_q[i].item()
+        actual_seqlen_q = seqused_q[i].item() if seqused_q is not None else act_seqlen_q
+        for j in range(actual_seqlen_q):
+            output[seqlen * i + act_seqlen_offset + j, :] = unpadded_input[cu_seqlen_q[i].item() + j, :]
     return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
 def unpad_input(padded_input, cu_seqlen):
@@ -73,17 +68,19 @@ def unpad_input(padded_input, cu_seqlen):
         output.append(padded_input[i, : (cu_seqlen[i + 1] - cu_seqlen[i]), :])
     return torch.cat(output, dim=0)
 
-def unpad_input_delta_q(padded_input, cu_seqlen_q, cu_seqlen_k, batch, seqlen):
+def unpad_input_delta_q(padded_input, cu_seqlen_q, cu_seqlen_k, batch, seqlen, seqused_q, seqused_k):
     padded_input.reshape(padded_input.size(0), padded_input.size(1), -1)
     output = []
     for i in range(batch):
         act_seqlen_q = (cu_seqlen_q[i + 1] - cu_seqlen_q[i]).item()
         act_seqlen_k = (cu_seqlen_k[i + 1] - cu_seqlen_k[i]).item()
-        output.append(padded_input[i, act_seqlen_k - act_seqlen_q : act_seqlen_k, :])
+        act_seqlen_offset = act_seqlen_k - act_seqlen_q if seqused_q is None else seqused_k[i].item() - seqused_q[i].item()
+        output.append(padded_input[i, act_seqlen_offset : act_seqlen_offset + act_seqlen_q, :])
+        if padded_input.shape[1] < act_seqlen_offset + act_seqlen_q:
+            output.append(torch.zeros((act_seqlen_offset + act_seqlen_q - padded_input.shape[1], *padded_input.shape[2:]), device=padded_input.device, dtype=padded_input.dtype))
     return torch.cat(output, dim=0)
 
 def construct_mask(
-    batch_func,
     seqlen_c,
     seqlen,
     seqlen_t=0,
@@ -92,54 +89,48 @@ def construct_mask(
     func=None,
     cu_seqlens_q=None,
     cu_seqlens_k=None,
+    seqused_q=None,
+    seqused_k=None,
     num_contexts=None,
+    num_targets=None,
     device=torch.device("cuda"),
 ):
     seqlen = seqlen_c + seqlen + seqlen_t
     bs = cu_seqlens_k.size(0) - 1
-    if debug:
-        print(func)
+    mask = torch.zeros((bs, 1, seqlen, seqlen), device=device, dtype=torch.bool)
     if func is not None:
-        mask = torch.zeros((batch_func, seqlen, seqlen), device=device, dtype=torch.bool)
-    else:
-        mask = torch.zeros((seqlen, seqlen), device=device, dtype=torch.bool)
-    mask[:] = False
-    if func is not None:
-        for b in range(batch_func):
+        for b in range(bs):
             actual_seqlen_q = (cu_seqlens_q[b+1] - cu_seqlens_q[b]).item()
             actual_seqlen_k = (cu_seqlens_k[b+1] - cu_seqlens_k[b]).item()
-            actual_offset = actual_seqlen_k - actual_seqlen_q
+            actual_offset = actual_seqlen_k - actual_seqlen_q if seqused_q is None else seqused_k[b].item() - seqused_q[b].item()
+            actual_seqlen_q = seqused_q[b].item() if seqused_q is not None else actual_seqlen_q
             for i in range(actual_seqlen_q):
-                mask[b, actual_offset + i, 0 :func[b, 0, 0, i]] = True
+                mask[b, 0, actual_offset + i, :func[b, 0, 0, i].item()] = True
             n_pair_fun = func.size(2) // 2
             for fun_idx in range(1, n_pair_fun+1):
                 for i in range(actual_seqlen_q):
-                    mask[b, actual_offset + i, func[b, 0, 2*fun_idx-1, i] : func[b, 0, 2*fun_idx, i]] = True
+                    mask[b, 0, actual_offset + i, func[b, 0, 2*fun_idx-1, i].item() : func[b, 0, 2*fun_idx, i].item()] = True
+            for i in range(actual_seqlen_q):
+                mask[b, 0, actual_offset + i, actual_seqlen_k : ] = False
+
     elif window_size[0] < 0 and window_size[1] == 0:
         # causal mask
         for i in range(seqlen):
-            mask[i, : i + 1] = True
+            mask[:, 0, i, : i + 1] = True
 
-        # context mask
-        if seqlen_c != 0:
-            mask = mask.unsqueeze(0).unsqueeze(0).repeat(bs, 1, 1, 1)
-            for i in range(bs):
-                target_start = (
-                    num_contexts[i] + cu_seqlens_k[i + 1] - cu_seqlens_k[i]
-                ).item()
+        for i in range(bs):
+            if seqused_k is not None:
+                history_len = seqused_k[i].item() - num_targets[i].item() - num_contexts[i].item()
+            else:
+                history_len = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item()
+            target_start = (num_contexts[i]).item() + history_len
+
+            # context mask
+            if seqlen_c != 0:
                 mask[i, 0, : num_contexts[i], :target_start] = True
 
-        # target mask
-        if seqlen_t != 0:
-            mask = (
-                mask.unsqueeze(0).unsqueeze(0).repeat(bs, 1, 1, 1)
-                if mask.ndim == 2
-                else mask
-            )
-            for i in range(bs):
-                target_start = (
-                    num_contexts[i] + cu_seqlens_k[i + 1] - cu_seqlens_k[i]
-                ).item()
+            # target mask
+            if seqlen_t != 0:
                 # target group mask
                 if target_group_size > 1:
                     group_num = math.ceil((seqlen - target_start) / target_group_size)
@@ -165,9 +156,15 @@ def construct_mask(
         window_size_0 = window_size[0] if window_size[0] > 0 else seqlen
         window_size_1 = window_size[1] if window_size[1] > 0 else seqlen
         for i in range(seqlen):
-            mask[i, max(0, i - window_size_0) : min(seqlen, i + window_size_1 + 1)] = (
-                True
-            )
+            mask[:, 0, i, max(0, i - window_size_0) : min(seqlen, i + window_size_1 + 1)] = True
+
+    if seqused_q is not None:
+        for b in range(bs):
+            actual_seqlen_q = seqused_q[b].item()
+            actual_seqlen_k = seqused_k[b].item()
+            mask[b, 0, actual_seqlen_k:, :] = False
+            mask[b, 0, :, actual_seqlen_k:] = False
+
     return mask
 
 def make_heart_func(batch_func: int, L_q: int, L_k: int, device="cuda"):
@@ -242,7 +239,7 @@ def generate_input(
     cu_seqlens_c = torch.zeros(
         (batch_size + 1,),
         dtype=torch.int32,
-        device=torch.accelerator.current_accelerator(),
+        device=torch.device("cuda"),
     )
     cu_seqlens_c[1:] = torch.cumsum(num_contexts, dim=0)
 
@@ -251,19 +248,19 @@ def generate_input(
         lengths_k = (
             torch.ones(
                 (batch_size,),
-                device=torch.accelerator.current_accelerator(),
+                device=torch.device("cuda"),
                 dtype=torch.int32,
             )
             * max_seq_len_k
         )
     else:
         lengths_k = torch.randint(
-            1, max_seq_len_k + 1, size=(batch_size,), device=torch.device("cuda")
+            1, max_seq_len_k + 1, size=(batch_size,), device=torch.device("cuda"), dtype=torch.int32,
         )
     cu_seqlens_k = torch.zeros(
         (batch_size + 1,),
         dtype=torch.int32,
-        device=torch.accelerator.current_accelerator(),
+        device=torch.device("cuda"),
     )
     cu_seqlens_k[1:] = torch.cumsum(lengths_k, dim=0)
 
@@ -291,7 +288,7 @@ def generate_input(
     cu_seqlens_t = torch.zeros(
         (batch_size + 1,),
         dtype=torch.int32,
-        device=torch.accelerator.current_accelerator(),
+        device=torch.device("cuda"),
     )
     cu_seqlens_t[1:] = torch.cumsum(num_targets, dim=0)
 
@@ -319,7 +316,7 @@ def generate_input(
         cu_seqlens_q = torch.zeros(
             (batch_size + 1,),
             dtype=torch.int32,
-            device=torch.accelerator.current_accelerator(),
+            device=torch.device("cuda"),
         )
         cu_seqlens_q[1:] = torch.cumsum(lengths_q, dim=0)
     else:
@@ -334,6 +331,20 @@ def generate_input(
         (batch_size + 1,), dtype=torch.int32, device=torch.device("cuda")
     )
     cu_seqlens_k_wt = cu_seqlens_c + cu_seqlens_k + cu_seqlens_t
+
+    seqused_is_not_none = torch.rand(1) < 0.5
+    seqused_q = torch.ones(batch_size, dtype=torch.int32, device=torch.device("cuda")) if seqused_is_not_none else None
+    seqused_k = torch.ones(batch_size, dtype=torch.int32, device=torch.device("cuda")) if seqused_is_not_none else None
+    if seqused_is_not_none:
+        for i in range(batch_size):
+            seqlen_min = max(1, (num_contexts[i] + num_targets[i]).item())
+            seqlen_q_padded = (cu_seqlens_q_wt[i+1] - cu_seqlens_q_wt[i]).item()
+            seqlen_k_padded = (cu_seqlens_k_wt[i+1] - cu_seqlens_k_wt[i]).item()
+            seqused_k[i] = seqlen_k_padded if full_batch else torch.randint(seqlen_min, seqlen_k_padded + 1, size=(1,), device=torch.device("cuda"))
+            seqlen_max = min(seqlen_q_padded, seqused_k[i].item()) + 1
+            seqused_q[i] = seqlen_q_padded if full_batch else torch.randint(seqlen_min, seqlen_max, size=(1,), device=torch.device("cuda"))
+    if not is_delta_q:
+        seqused_q = seqused_k
 
     L_q = int(cu_seqlens_q_wt[-1].item())
     L_k = int(cu_seqlens_k_wt[-1].item())
@@ -381,13 +392,13 @@ def generate_input(
             max_context_len + max_seq_len_k + max_target_len,
         ),
         dtype=dtype_init,
-        device=torch.accelerator.current_accelerator(),
+        device=torch.device("cuda"),
     ).uniform_(-1, 1)
 
     head_func = 1
     batch_func = batch_size
     if is_arbitrary:
-        n_func = 1
+        n_func = 3
         max_seq_split = max_seq_len_k // n_func
         coef = 0.3
         func = torch.empty((batch_func, head_func, n_func, max_seq_len_q), dtype=torch.int32, device=torch.device("cuda"))
@@ -494,12 +505,11 @@ def generate_input(
     #             var_fun[j, :, cu_seqlens_q_wt[i]:cu_seqlens_q_wt[i+1]] = func[i, j, :, 0:cu_seqlens_q_wt[i+1]-cu_seqlens_q_wt[i]]
     if has_drab:
         rab = rab.requires_grad_()
-    if window_size[0] == -1 and window_size[1] == -1 and func is None:
+    if window_size[0] == -1 and window_size[1] == -1 and func is None and not seqused_is_not_none:
         attn_mask = None
     else:
         attn_mask = (
             construct_mask(
-                batch_func=batch_func,
                 seqlen_c=max_context_len,
                 seqlen=max_seq_len_k,
                 seqlen_t=max_target_len,
@@ -508,7 +518,10 @@ def generate_input(
                 func=func,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
                 num_contexts=num_contexts,
+                num_targets=num_targets,
             )
             .cuda()
             .to(torch.float32)
@@ -521,6 +534,8 @@ def generate_input(
         num_contexts if has_context else None,
         cu_seqlens_q_wt,
         cu_seqlens_k_wt,
+        seqused_q,
+        seqused_k,
         num_targets if has_target else None,
         qkv,
         q,
@@ -543,6 +558,8 @@ def _hstu_attention_maybe_from_cache(
     v: torch.Tensor,
     q_offsets: torch.Tensor,
     k_offsets: torch.Tensor,
+    seqused_q: torch.Tensor,
+    seqused_k: torch.Tensor,
     rab: Optional[torch.Tensor],
     invalid_attn_mask: torch.Tensor,
     alpha: float,
@@ -553,7 +570,7 @@ def _hstu_attention_maybe_from_cache(
     B: int = q_offsets.size(0) - 1
     dtype_out = q.dtype
     if is_delta_q:
-        padded_q = pad_input_delta_q(q, q_offsets, k_offsets, B, seqlen_k)
+        padded_q = pad_input_delta_q(q, q_offsets, k_offsets, B, seqlen_k, seqused_q, seqused_k)
     else:
         padded_q = pad_input(q, q_offsets, B, seqlen_q)
     padded_k = pad_input(k, k_offsets, B, seqlen_k)
@@ -591,10 +608,6 @@ def _hstu_attention_maybe_from_cache(
     masked_qk_attn = F.silu(masked_qk_attn)
     masked_qk_attn = masked_qk_attn / seqlen_q
     if invalid_attn_mask is not None:
-        if invalid_attn_mask.ndim == 2:
-            invalid_attn_mask = invalid_attn_mask.unsqueeze(0).unsqueeze(0)
-        elif invalid_attn_mask.ndim == 3:
-            invalid_attn_mask = invalid_attn_mask.unsqueeze(1)
         masked_qk_attn = masked_qk_attn * invalid_attn_mask.type(masked_qk_attn.dtype)
 
     attn_output = torch.einsum(
@@ -606,7 +619,7 @@ def _hstu_attention_maybe_from_cache(
     attn_output = attn_output.reshape(B, seqlen_k, num_heads * linear_dim)
     if is_delta_q:
         attn_output = unpad_input_delta_q(
-            attn_output, q_offsets, k_offsets, B, seqlen_k
+            attn_output, q_offsets, k_offsets, B, seqlen_k, seqused_q, seqused_k
         )
     else:
         attn_output = unpad_input(attn_output, q_offsets)
@@ -686,7 +699,7 @@ class HSTU16Test(unittest.TestCase):
         attn_hidden_dims: Tuple[int, int],
         alpha: float,
         rab_params: Tuple[bool, bool, Optional[int]],
-        seq_len_params: Tuple[int, int, bool],
+        seq_len_params: Tuple[int, int],
         target_params: Tuple[int, Tuple[int, int], int, bool],
         dtype: torch.dtype,
         full_batch: bool,
@@ -722,6 +735,8 @@ class HSTU16Test(unittest.TestCase):
             num_contexts,
             cu_seqlens_q,
             cu_seqlens_k,
+            seqused_q,
+            seqused_k,
             num_targets,
             qkv,
             q,
@@ -759,6 +774,8 @@ class HSTU16Test(unittest.TestCase):
             v=v.view(L_k, -1),
             q_offsets=cu_seqlens_q,
             k_offsets=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
             rab=rab if has_rab else None,
             invalid_attn_mask=(
                 attn_mask.to(torch.float32) if attn_mask is not None else None
@@ -778,6 +795,8 @@ class HSTU16Test(unittest.TestCase):
             v=v.view(L_k, -1),
             q_offsets=cu_seqlens_q,
             k_offsets=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
             rab=rab if has_rab else None,
             invalid_attn_mask=(
                 attn_mask.to(torch.float32) if attn_mask is not None else None
@@ -793,6 +812,8 @@ class HSTU16Test(unittest.TestCase):
                 v=v.to(dtype),
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
                 max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
                 max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
                 num_contexts=num_contexts,
@@ -809,6 +830,8 @@ class HSTU16Test(unittest.TestCase):
                 qkv=qkv.to(dtype),
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
                 max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
                 max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
                 num_contexts=num_contexts,
@@ -820,6 +843,14 @@ class HSTU16Test(unittest.TestCase):
                 has_drab=has_drab,
                 func=func,
             )
+
+        if seqused_q is not None:
+            for i in range(batch_size):
+                seqlen_offset = cu_seqlens_q[i].item()
+                seqlen_padded = cu_seqlens_q[i+1].item() - seqlen_offset
+                seqlen_actual = seqused_q[i].item()
+                out_ref[seqlen_offset + seqlen_actual:seqlen_offset + seqlen_padded, :, :] = 0
+                torch_out[seqlen_offset + seqlen_actual:seqlen_offset + seqlen_padded, :, :] = 0
 
         # print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
         # print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
@@ -871,6 +902,21 @@ class HSTU16Test(unittest.TestCase):
                 dq_hstu = dqkv_hstu[:, 0, :, :]
                 dk_hstu = dqkv_hstu[:, 1, :, :]
                 dv_hstu = dqkv_hstu[:, 2, :, :]
+
+        if seqused_q is not None:
+            for i in range(batch_size):
+                seqlen_offset_q = (cu_seqlens_q[i]).item()
+                seqlen_offset_k = (cu_seqlens_k[i]).item()
+                seqlen_padded_q = (cu_seqlens_q[i+1]).item() - seqlen_offset_q
+                seqlen_padded_k = (cu_seqlens_k[i+1]).item() - seqlen_offset_k
+                seqlen_actual_q = (seqused_q[i]).item()
+                seqlen_actual_k = (seqused_k[i]).item()
+                dq_ref[seqlen_offset_q + seqlen_actual_q:seqlen_offset_q + seqlen_padded_q, :, :] = 0
+                dk_ref[seqlen_offset_k + seqlen_actual_k:seqlen_offset_k + seqlen_padded_k, :, :] = 0
+                dv_ref[seqlen_offset_k + seqlen_actual_k:seqlen_offset_k + seqlen_padded_k, :, :] = 0
+                dq_torch[seqlen_offset_q + seqlen_actual_q:seqlen_offset_q + seqlen_padded_q, :, :] = 0
+                dk_torch[seqlen_offset_k + seqlen_actual_k:seqlen_offset_k + seqlen_padded_k, :, :] = 0
+                dv_torch[seqlen_offset_k + seqlen_actual_k:seqlen_offset_k + seqlen_padded_k, :, :] = 0
 
         # print(f"dV max diff: {(dv_hstu - dv_ref).abs().max().item()}")
         # print(f"dV Pytorch max diff: {(dv_torch - dv_ref).abs().max().item()}")
@@ -1029,6 +1075,8 @@ def _hstu_paged_kv_attention(
               v=v_con,
               q_offsets=q_offsets,
               k_offsets=k_offsets,
+              seqused_q=None,
+              seqused_k=None,
               rab=None,
               invalid_attn_mask=invalid_attn_mask,
               alpha=alpha,
@@ -1131,6 +1179,8 @@ class HSTUPagedKVTest(unittest.TestCase):
             v=v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
+            seqused_q=None,
+            seqused_k=None,
             max_seqlen_q=max_seq_len_q + max_target_len,
             max_seqlen_k=max_seq_len_q + max_seq_len_k + max_target_len,
             num_contexts=None,
@@ -1271,6 +1321,8 @@ def _hstu_attention_maybe_from_cache_fp8(
     v: torch.Tensor,
     q_offsets: torch.Tensor,
     k_offsets: torch.Tensor,
+    seqused_q: torch.Tensor,
+    seqused_k: torch.Tensor,
     rab: Optional[torch.Tensor],
     invalid_attn_mask: torch.Tensor,
     alpha: float,
@@ -1309,7 +1361,7 @@ def _hstu_attention_maybe_from_cache_fp8(
         v_fp8, v_descale = quantize_for_head_batch_tensor(v, k_offsets, quant_mode=quant_mode)
 
     if is_delta_q:
-        padded_q = pad_input_delta_q(q_fp8, q_offsets, k_offsets, B, n_k) #padding at beginning
+        padded_q = pad_input_delta_q(q_fp8, q_offsets, k_offsets, B, n_k, seqused_q, seqused_k)
     else:
         padded_q = pad_input(q_fp8, q_offsets, B, n_q)
     padded_k = pad_input(k_fp8, k_offsets, B, n_k)
@@ -1407,7 +1459,7 @@ def _hstu_attention_maybe_from_cache_fp8(
     attn_output = attn_output.reshape(B, n_k, num_heads * linear_dim)[:, :ori_n_k, :]
 
     if is_delta_q:
-        attn_output = unpad_input_delta_q(attn_output, q_offsets, k_offsets, B, n_k)
+        attn_output = unpad_input_delta_q(attn_output, q_offsets, k_offsets, B, n_k, seqused_q, seqused_k)
     else:
         attn_output = unpad_input(attn_output, q_offsets)
     attn_output = attn_output.reshape(-1, num_heads, linear_dim) / ori_n_q
@@ -1426,6 +1478,8 @@ def _bwd_reference_fp8(
     v: torch.Tensor,
     q_offsets: torch.Tensor,
     k_offsets: torch.Tensor,
+    seqused_q: torch.Tensor,
+    seqused_k: torch.Tensor,
     rab: Optional[torch.Tensor],
     invalid_attn_mask: Optional[torch.Tensor],
     alpha: float,
@@ -1476,8 +1530,8 @@ def _bwd_reference_fp8(
         do_fp8, do_descale = quantize_for_head_batch_tensor(do, q_offsets, quant_mode=quant_mode)
 
     if is_delta_q:
-        padded_q = pad_input_delta_q(q_fp8, q_offsets, k_offsets, B, n_k)
-        padded_do = pad_input_delta_q(do_fp8, q_offsets, k_offsets, B, n_k)
+        padded_q = pad_input_delta_q(q_fp8, q_offsets, k_offsets, B, n_k, seqused_q, seqused_k)
+        padded_do = pad_input_delta_q(do_fp8, q_offsets, k_offsets, B, n_k, seqused_q, seqused_k)
     else:
         padded_q = pad_input(q_fp8, q_offsets, B, n_q)
         padded_do = pad_input(do_fp8, q_offsets, B, n_q)
@@ -1538,15 +1592,7 @@ def _bwd_reference_fp8(
     qk_attn = qk_attn * alpha
     qk_attn_silu = F.silu(qk_attn)
     if invalid_attn_mask is not None:
-        if invalid_attn_mask.ndim == 2:
-            if invalid_attn_mask.shape[0] != n_k or invalid_attn_mask.shape[1] != n_k:
-                invalid_attn_mask = F.pad(invalid_attn_mask, (0, n_k - ori_n_k, 0, n_k - ori_n_k), value=0)
-            invalid_attn_mask = invalid_attn_mask.unsqueeze(0).unsqueeze(0)
-        elif invalid_attn_mask.ndim == 3:
-            if invalid_attn_mask.shape[1] != n_k or invalid_attn_mask.shape[2] != n_k:
-                invalid_attn_mask = F.pad(invalid_attn_mask, (0, n_k - ori_n_k, 0, n_k - ori_n_k, 0, 0), value=0)
-            invalid_attn_mask = invalid_attn_mask.unsqueeze(1)
-        elif invalid_attn_mask.shape[2] != n_k or invalid_attn_mask.shape[3] != n_k:
+        if invalid_attn_mask.shape[2] != n_k or invalid_attn_mask.shape[3] != n_k:
             # pad 3rd and 4th dim
             invalid_attn_mask = F.pad(invalid_attn_mask, (0, n_k - ori_n_k, 0, n_k - ori_n_k, 0, 0, 0, 0), value=0)
         masked_qk_attn = qk_attn_silu * invalid_attn_mask.type(qk_attn_silu.dtype)
@@ -1637,7 +1683,7 @@ def _bwd_reference_fp8(
         dq = P_blockwise_Vt_gemm_fp8(dp, padded_k_for_dQ, k_descale, None, bm, bn, False, start_ids, mode=quant_mode).permute(0, 2, 1, 3)
 
     if is_delta_q:
-        dq = unpad_input_delta_q(dq, q_offsets, k_offsets, B, n_k) / ori_n_q * alpha
+        dq = unpad_input_delta_q(dq, q_offsets, k_offsets, B, n_k, seqused_q, seqused_k) / ori_n_q * alpha
     else:
         dq = unpad_input(dq, q_offsets) / ori_n_q * alpha
 
@@ -1776,7 +1822,7 @@ class HSTU8Test(unittest.TestCase):
             return
 
         torch.cuda.synchronize()
-        L_q, L_k, num_contexts, cu_seqlens_q, cu_seqlens_k, num_targets, _, q, k, v, rab, attn_mask, func = (
+        L_q, L_k, num_contexts, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, num_targets, _, q, k, v, rab, attn_mask, func = (
             generate_input(
                 batch_size=batch_size,
                 heads=heads,
@@ -1807,6 +1853,8 @@ class HSTU8Test(unittest.TestCase):
             v=v,
             q_offsets=cu_seqlens_q,
             k_offsets=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
             rab=rab if has_rab else None,
             invalid_attn_mask=(
                 attn_mask.to(torch.float32) if attn_mask is not None else None
@@ -1827,6 +1875,8 @@ class HSTU8Test(unittest.TestCase):
             v=v,
             q_offsets=cu_seqlens_q,
             k_offsets=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
             rab=rab if has_rab else None,
             invalid_attn_mask=(
                 attn_mask.to(torch.float32) if attn_mask is not None else None
@@ -1842,6 +1892,8 @@ class HSTU8Test(unittest.TestCase):
             v=v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
             max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
             max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
             num_contexts=num_contexts,
@@ -1854,6 +1906,14 @@ class HSTU8Test(unittest.TestCase):
             func=func,
             quant_mode=quant_mode,
         )
+
+        if seqused_q is not None:
+            for i in range(batch_size):
+                seqlen_offset = cu_seqlens_q[i]
+                seqlen_padded = cu_seqlens_q[i+1] - seqlen_offset
+                seqlen_actual = seqused_q[i]
+                out_ref[seqlen_offset + seqlen_actual:seqlen_offset + seqlen_padded, :, :] = 0
+                torch_out[seqlen_offset + seqlen_actual:seqlen_offset + seqlen_padded, :, :] = 0
 
         # print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
         # print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
@@ -1889,12 +1949,29 @@ class HSTU8Test(unittest.TestCase):
             v=v,
             q_offsets=cu_seqlens_q,
             k_offsets=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
             rab=rab if has_rab else None,
             invalid_attn_mask=attn_mask,
             alpha=alpha,
             quant_mode=quant_mode,
             is_delta_q=is_delta_q,
         )
+
+        if seqused_q is not None:
+            for i in range(batch_size):
+                seqlen_offset_q = (cu_seqlens_q[i]).item()
+                seqlen_offset_k = (cu_seqlens_k[i]).item()
+                seqlen_padded_q = (cu_seqlens_q[i+1]).item() - seqlen_offset_q
+                seqlen_padded_k = (cu_seqlens_k[i+1]).item() - seqlen_offset_k
+                seqlen_actual_q = (seqused_q[i]).item()
+                seqlen_actual_k = (seqused_k[i]).item()
+                dq_ref[seqlen_offset_q + seqlen_actual_q:seqlen_offset_q + seqlen_padded_q, :, :] = 0
+                dk_ref[seqlen_offset_k + seqlen_actual_k:seqlen_offset_k + seqlen_padded_k, :, :] = 0
+                dv_ref[seqlen_offset_k + seqlen_actual_k:seqlen_offset_k + seqlen_padded_k, :, :] = 0
+                dq_torch[seqlen_offset_q + seqlen_actual_q:seqlen_offset_q + seqlen_padded_q, :, :] = 0
+                dk_torch[seqlen_offset_k + seqlen_actual_k:seqlen_offset_k + seqlen_padded_k, :, :] = 0
+                dv_torch[seqlen_offset_k + seqlen_actual_k:seqlen_offset_k + seqlen_padded_k, :, :] = 0
 
         # print(f"dV max diff: {(dv_hstu - dv_ref).abs().max().item()}")
         # print(f"dV Pytorch max diff: {(dv_torch - dv_ref).abs().max().item()}")
@@ -1939,7 +2016,10 @@ class HSTU8Test(unittest.TestCase):
 
 if __name__ == "__main__":
 
-    HSTU8Test().test_hstu_attn_fp8.hypothesis.inner_test(HSTU8Test(),
-    1, 1, (32, 32), 0, (0, (-1, -1), 1, False), (64, 64), 1.0, (True, False, None), torch.float8_e4m3fn, (0, True))
+    # HSTU8Test().test_hstu_attn_fp8.hypothesis.inner_test(HSTU8Test(),
+    # 2, 1, (8, 99), 0, (0, (-1, -1), 1, True), (64, 64), 1.0, (False, False, None), torch.float8_e4m3fn, (0, True))
+
+    HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
+    32, 2, 0, (64, 64), 1.0, (True, False, None), (51, 256), (0, (-1, -1), 1, True), torch.bfloat16, False)
 
     # unittest.main()

@@ -143,7 +143,7 @@ struct CollectiveEpilogueBwd {
         NumEpilogueThreads,
         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     int const offset = seqlen_traits_k.cu_seq_len[bidb];
-    int const seqlen = seqlen_traits_k.actual_seq_len;
+    int const seqlen_padded = seqlen_traits_k.actual_seq_len_padded;
 
     Tensor mdK = make_tensor(
         make_gmem_ptr(epilogue_params.ptr_dK), epilogue_params.layout_dK)(
@@ -182,6 +182,13 @@ struct CollectiveEpilogueBwd {
           get<1>(epilogue_params.layout_dK.shape());
     }
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
+    CUTLASS_PRAGMA_UNROLL
+    for (int m = 0; m < size<1>(tdKVrdK); m++) {
+      if (get<0>(tdKVcdKV(0, m, 0)) >= seqlen_traits_k.actual_seq_len - n_block * kBlockN) {
+        cute::clear(tdKVrdK(_, m, _));
+        cute::clear(tdKVrdV(_, m, _));
+      }
+    }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     flash::copy<
         /*Is_even_MN=*/false,
@@ -193,7 +200,7 @@ struct CollectiveEpilogueBwd {
         tdKVgdV,
         tdKVcdKV,
         tdKVpdKV,
-        seqlen - n_block * kBlockN);
+        seqlen_padded - n_block * kBlockN);
     flash::copy<
         /*Is_even_MN=*/false,
         /*Is_even_K=*/false,
@@ -204,7 +211,7 @@ struct CollectiveEpilogueBwd {
         tdKVgdK,
         tdKVcdKV,
         tdKVpdKV,
-        seqlen - n_block * kBlockN);
+        seqlen_padded - n_block * kBlockN);
   }
 
   // Write 0 to dK and dV
@@ -216,7 +223,7 @@ struct CollectiveEpilogueBwd {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     auto [n_block, bidh, bidb] = block_coord;
     int const offset = seqlen_traits_k.cu_seq_len[bidb];
-    int const seqlen = seqlen_traits_k.actual_seq_len;
+    int const seqlen_padded = seqlen_traits_k.actual_seq_len_padded;
 
     Tensor mdK = make_tensor(
         make_gmem_ptr(epilogue_params.ptr_dK), epilogue_params.layout_dK)(
@@ -261,7 +268,7 @@ struct CollectiveEpilogueBwd {
         tdKVgdK,
         tdKVcdKV,
         tdKVpdKV,
-        seqlen - n_block * kBlockN);
+        seqlen_padded - n_block * kBlockN);
     flash::copy<
         /*Is_even_MN=*/false,
         /*Is_even_K=*/false,
@@ -272,7 +279,7 @@ struct CollectiveEpilogueBwd {
         tdKVgdV,
         tdKVcdKV,
         tdKVpdKV,
-        seqlen - n_block * kBlockN);
+        seqlen_padded - n_block * kBlockN);
   }
 };
 
@@ -367,7 +374,7 @@ struct CollectiveEpilogueBwd_fp8 {
     cute::copy(smem_tiled_copy_dKV, taccdKrdK, taccdKsdK);
     cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     int const offset = seqlen_traits_k.cu_seq_len[bidb];
-    int const seqlen = seqlen_traits_k.actual_seq_len;
+    int const seqlen_padded = seqlen_traits_k.actual_seq_len_padded;
 
     Tensor mdK = make_tensor(make_gmem_ptr(params.ptr_dK), params.layout_dK)(_, _, bidh);
     Tensor gdK = local_tile(cute::domain_offset(make_coord(offset, _0{}), mdK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
@@ -392,12 +399,19 @@ struct CollectiveEpilogueBwd_fp8 {
     CUTLASS_PRAGMA_UNROLL
     for (int k = 0; k < size(tdKVpdKV); ++k) { tdKVpdKV(k) = get<1>(tdKVcdKV(_0{}, _0{}, k)) < get<1>(params.layout_dK.shape()); }
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
+    CUTLASS_PRAGMA_UNROLL
+    for (int m = 0; m < size<1>(tdKVrdK); m++) {
+      if (get<0>(tdKVcdKV(0, m, 0)) >= seqlen_traits_k.actual_seq_len - n_block * kBlockN) {
+        cute::clear(tdKVrdK(_, m, _));
+        cute::clear(tdKVrdV(_, m, _));
+      }
+    }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_dKV, tdKVrdV, tdKVgdV, tdKVcdKV, tdKVpdKV, seqlen - n_block * kBlockN
+        gmem_tiled_copy_dKV, tdKVrdV, tdKVgdV, tdKVcdKV, tdKVpdKV, seqlen_padded - n_block * kBlockN
     );
     flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_dKV, tdKVrdK, tdKVgdK, tdKVcdKV, tdKVpdKV, seqlen - n_block * kBlockN
+        gmem_tiled_copy_dKV, tdKVrdK, tdKVgdK, tdKVcdKV, tdKVpdKV, seqlen_padded - n_block * kBlockN
     );
   }
 
@@ -411,7 +425,7 @@ struct CollectiveEpilogueBwd_fp8 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     auto [n_block, bidh, bidb] = block_coord;
     int const offset = seqlen_traits_k.cu_seq_len[bidb];
-    int const seqlen = seqlen_traits_k.actual_seq_len;
+    int const seqlen_padded = seqlen_traits_k.actual_seq_len_padded;
 
     Tensor mdK = make_tensor(make_gmem_ptr(params.ptr_dK), params.layout_dK)(_, _, bidh);
     Tensor gdK = local_tile(cute::domain_offset(make_coord(offset, _0{}), mdK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
@@ -433,10 +447,10 @@ struct CollectiveEpilogueBwd_fp8 {
     for (int k = 0; k < size(tdKVpdKV); ++k) { tdKVpdKV(k) = get<1>(tdKVcdKV(_0{}, _0{}, k)) < get<1>(params.layout_dK.shape()); }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_dKV, tdKVrdKV, tdKVgdK, tdKVcdKV, tdKVpdKV, seqlen - n_block * kBlockN
+        gmem_tiled_copy_dKV, tdKVrdKV, tdKVgdK, tdKVcdKV, tdKVpdKV, seqlen_padded - n_block * kBlockN
     );
     flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_dKV, tdKVrdKV, tdKVgdV, tdKVcdKV, tdKVpdKV, seqlen - n_block * kBlockN
+        gmem_tiled_copy_dKV, tdKVrdKV, tdKVgdV, tdKVcdKV, tdKVpdKV, seqlen_padded - n_block * kBlockN
     );
   }
 

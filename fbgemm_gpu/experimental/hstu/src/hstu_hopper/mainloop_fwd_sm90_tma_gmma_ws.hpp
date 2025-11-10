@@ -500,13 +500,13 @@ struct CollectiveMainloopFwd {
             copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), mcast_mask_kv),
                   tKgK(_, n_block_next), tKsK(_, smem_pipe_write_k.index()));
             ++smem_pipe_write_k;
-          }
 
-          if (Has_rab && n_block_next >= n_block_min) {
-            pipeline_rab.producer_acquire(smem_pipe_write_rab);
-            copy(mainloop_params.tma_load_Rab.with(*pipeline_rab.producer_get_barrier(smem_pipe_write_rab), 0),
-                  tRabgRab(_, n_block_next), tRabsRab(_, smem_pipe_write_rab.index()));
-            ++smem_pipe_write_rab;
+            if (Has_rab) {
+              pipeline_rab.producer_acquire(smem_pipe_write_rab);
+              copy(mainloop_params.tma_load_Rab.with(*pipeline_rab.producer_get_barrier(smem_pipe_write_rab), 0),
+                    tRabgRab(_, n_block_next), tRabsRab(_, smem_pipe_write_rab.index()));
+              ++smem_pipe_write_rab;
+            }
           }
 
           pipeline_v.producer_acquire(smem_pipe_write_v);
@@ -560,14 +560,16 @@ struct CollectiveMainloopFwd {
     if constexpr (IntraWGOverlap) {
       if (lane_predicate) {
         n_block = !Is_arbitrary ? n_block : sValidBlockIds[n_block];
-        pipeline_v.producer_acquire(smem_pipe_write_v);
-        copy(
-            mainloop_params.tma_load_V.with(
-                *pipeline_v.producer_get_barrier(smem_pipe_write_v),
-                mcast_mask_kv),
-            tVgV(_, n_block),
-            tVsV(_, smem_pipe_write_v.index()));
-        ++smem_pipe_write_v;
+          if (n_block >= n_block_min) {
+          pipeline_v.producer_acquire(smem_pipe_write_v);
+          copy(
+              mainloop_params.tma_load_V.with(
+                  *pipeline_v.producer_get_barrier(smem_pipe_write_v),
+                  mcast_mask_kv),
+              tVgV(_, n_block),
+              tVsV(_, smem_pipe_write_v.index()));
+          ++smem_pipe_write_v;
+        }
       }
     }
   }
@@ -1123,6 +1125,7 @@ struct CollectiveMainloopFwd {
       auto fwd_step = [&](int n_block_valid, int masking_step) {
         int n_block_next = !Is_arbitrary ? n_block_valid - 1 : sValidBlockIds[n_block_valid - 1];
         const bool is_masking = masking_step < n_masking_steps - 1 || (n_block_next + 1) * kBlockN > actual_seqlen_h;
+        if (Is_target && n_block_next < 0) return;
         if (Has_rab) {
           consumer_wait(pipeline_rab, smem_pipe_read_rab);
           cute::copy(
@@ -1489,7 +1492,7 @@ struct CollectiveMainloopFwd {
           const int block_col = int(get<Col>(tScS_view(mma_row, mma_col)));
           const int col = block_col + base_col;
           if constexpr (!Is_causal && !Is_local && !Is_arbitrary) {
-            if (col >= actual_seqlen_k) {
+            if (col >= actual_seqlen_k || row >= actual_seqlen_q + actual_seqlen_offset) {
               tSrS_view(mma_row, mma_col) = -INFINITY;
               continue;
             }
@@ -1500,7 +1503,7 @@ struct CollectiveMainloopFwd {
               }
             }
             // causal mask
-            if (col >= col_limit_right(row)) {
+            if (col >= col_limit_right(row) || row >= actual_seqlen_q + actual_seqlen_offset) {
                 tSrS_view(mma_row, mma_col) = -INFINITY;
                 continue;
             }

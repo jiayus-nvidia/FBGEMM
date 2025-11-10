@@ -62,7 +62,7 @@ inline __device__ void hstu_compute_attn_1rowblock(
   constexpr int kHeadDim = Kernel_traits::kHeadDim;
 
   const HstuBlockInfo<Kernel_traits, Params> binfo(params, bidb);
-  if (m_block * kBlockM >= binfo.actual_seqlen_q) {
+  if (m_block * kBlockM >= binfo.actual_seqlen_q_padded) {
     return;
   }
 
@@ -75,6 +75,7 @@ inline __device__ void hstu_compute_attn_1rowblock(
 
   const int actual_seqlen_q = binfo.actual_seqlen_q;
   const int actual_seqlen_k = binfo.actual_seqlen_k;
+  const int actual_seqlen_q_padded = binfo.actual_seqlen_q_padded;
   // Actual target length of this sequence
   const int actual_seqlen_t = Is_target ? binfo.actual_seqlen_t : 0;
   // Actual context length of this sequence
@@ -165,43 +166,6 @@ inline __device__ void hstu_compute_attn_1rowblock(
   Tensor gMinFunc = local_tile(mMinFunc(Int<0>{}, _, _),
                               make_shape(Int<kNFunc/2>{}, Int<kBlockM>{}),
                               make_coord(Int<0>{}, m_block));
-
-
-  // We exit early and write 0 to gO. This also covers the case where
-  // actual_seqlen_k == 0. Otherwise we might read OOB elements from gK and gV.
-  if ((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) {
-    Tensor mO = make_tensor(
-        make_gmem_ptr(
-            reinterpret_cast<Element*>(params.o_ptr) +
-            binfo.q_offset(params.o_row_stride)),
-        make_shape(actual_seqlen_q, params.h, params.d),
-        make_stride(params.o_row_stride, params.o_head_stride, _1{}));
-    Tensor gO = local_tile(
-        mO(_, bidh, _),
-        Shape<Int<kBlockM>, Int<kHeadDim>>{},
-        make_coord(m_block, 0));
-
-    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
-    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
-    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-    Tensor tOrO = make_tensor<Element>(shape(tOgO));
-    clear(tOrO);
-    // Construct identity layout for sO
-    Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));
-    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
-    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
-    // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy<
-        /*Is_even_MN=*/false,
-        /*Clear_OOB_MN=*/false,
-        /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_O,
-        tOrO,
-        tOgO,
-        tOcO,
-        actual_seqlen_q - m_block * kBlockM);
-    return;
-  }
 
   // We iterate over the blocks in reverse order.
   Tensor mQ = make_tensor(
@@ -353,6 +317,43 @@ inline __device__ void hstu_compute_attn_1rowblock(
     __syncthreads();
     n_block_max = *sn_valid_block_max;
     n_block_min = 0;
+  }
+
+  // We exit early and write 0 to gO. This also covers the case where
+  // actual_seqlen_k == 0. Otherwise we might read OOB elements from gK and gV.
+  // Also covers the case where the input sequence involve padding.
+  if (((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) || m_block * kBlockM >= actual_seqlen_q) {
+    Tensor mO = make_tensor(
+        make_gmem_ptr(
+            reinterpret_cast<Element*>(params.o_ptr) +
+            binfo.q_offset(params.o_row_stride)),
+        make_shape(actual_seqlen_q, params.h, params.d),
+        make_stride(params.o_row_stride, params.o_head_stride, _1{}));
+    Tensor gO = local_tile(
+        mO(_, bidh, _),
+        Shape<Int<kBlockM>, Int<kHeadDim>>{},
+        make_coord(m_block, 0));
+
+    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+    Tensor tOrO = make_tensor<Element>(shape(tOgO));
+    clear(tOrO);
+    // Construct identity layout for sO
+    Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));
+    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+    // Clear_OOB_K must be false since we don't want to write zeros to gmem
+    flash::copy<
+        /*Is_even_MN=*/false,
+        /*Clear_OOB_MN=*/false,
+        /*Clear_OOB_K=*/false>(
+        gmem_tiled_copy_O,
+        tOrO,
+        tOgO,
+        tOcO,
+        actual_seqlen_q_padded - m_block * kBlockM);
+    return;
   }
 
   typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
@@ -535,7 +536,6 @@ inline __device__ void hstu_compute_attn_1rowblock(
         // The reason for adding the 'if' statement was to guard against gMin and gMax going out of bounds.
         // However, our design ensures that the lengths of the gMin and gMax sequences are both max_seq_q, so there's no need to worry about this issue.
         /*if (row >= actual_seqlen_q) {
-          #pragma unroll
           for (int mma_col = 0; mma_col < size<1>(tSrS_view); mma_col++) {
             tSrS_view(mma_row, mma_col) = -INFINITY;
           }
@@ -761,12 +761,19 @@ inline __device__ void hstu_compute_attn_1rowblock(
   Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
   // Repeat the partitioning with identity layouts
   Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+
+  for (int m = 0; m < size<1>(tOgO); m++) {
+    if (get<0>(tOcO(0, m, 0)) >= actual_seqlen_q - m_block * kBlockM) {
+      cute::clear(tOrO(_, m, _));
+    }
+  }
+
   Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
   // Clear_OOB_K must be false since we don't want to write zeros to gmem
   flash::copy</*Is_even_MN=*/false,
               /*Clear_OOB_MN=*/false,
               /*Clear_OOB_K=*/false>(
-      gmem_tiled_copy_O, tOrO, tOgO, tOcO, actual_seqlen_q - m_block * kBlockM);
+      gmem_tiled_copy_O, tOrO, tOgO, tOcO, actual_seqlen_q_padded - m_block * kBlockM);
 }
 
 template <typename Kernel_traits, typename Params>

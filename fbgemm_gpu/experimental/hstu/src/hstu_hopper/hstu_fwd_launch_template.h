@@ -50,12 +50,14 @@ void run_hstu_fwd(Hstu_fwd_params& params, cudaStream_t stream) {
       params.total_q,
       params.seqlen_q,
       params.cu_seqlens_q,
+      params.seqused_q,
       params.num_targets,
       params.num_contexts);
   Seqlen_traits seqlen_traits_k(
       params.total_k,
       params.seqlen_k,
       params.cu_seqlens_k,
+      params.seqused_k,
       params.num_targets,
       params.num_contexts);
 

@@ -416,6 +416,16 @@ CUTLASS_DEVICE void write_tiled(
   Tensor tOgO = thr_copy_O.partition_D(gO); // (CPY,CPY_M,CPY_K,k)
   Tensor tOsO = thr_copy_O.partition_S(sO); // (CPY,CPY_M,CPY_K)
 
+  const int kNumMsPerTile = get<0>(tile_shape_O);
+  Tensor cO = cute::make_identity_tensor(tile_shape_O);
+  Tensor tOcO = thr_copy_O.partition_S(cO);
+  CUTLASS_PRAGMA_UNROLL
+  for (int m = 0; m < size<1>(tOsO); m++) {
+    if (get<0>(tOcO(0, m, 0)) >= seqlen_traits_o.actual_seq_len - m_block * kNumMsPerTile) {
+      cute::clear(tOsO(_, m, _));
+    }
+  }
+
   // Prepare for TiledCopy.
   // Grouping is needed because cute::copy_if() does group_modes<1, R> for src
   // and dst. After grouping, the first dim is number of elements to read
@@ -433,9 +443,8 @@ CUTLASS_DEVICE void write_tiled(
       cute::group_modes<1, rank(tSgOCountingFlatten)>(tSgOCountingFlatten);
 
   // Write out to GMEM.
-  const int kNumMsPerTile = get<0>(tile_shape_O);
   int cta_m = std::min(
-      seqlen_traits_o.actual_seq_len - m_block * kNumMsPerTile, kNumMsPerTile);
+      seqlen_traits_o.actual_seq_len_padded - m_block * kNumMsPerTile, kNumMsPerTile);
   if (cta_m == kNumMsPerTile) {
     copy(tiled_copy_O, tOsOGroup, tOgOGroup);
   } else {

@@ -60,6 +60,8 @@ void set_params_fprop(
     void* num_contexts_d,
     void* cu_seqlens_q_d,
     void* cu_seqlens_k_d,
+    void* seqused_q_d,
+    void* seqused_k_d,
     void* page_offsets,
     void* page_ids,
     void* last_page_lens,
@@ -114,6 +116,9 @@ void set_params_fprop(
   params->cu_seqlens_q = static_cast<int*>(cu_seqlens_q_d);
   params->cu_seqlens_k = static_cast<int*>(cu_seqlens_k_d);
   params->num_targets = static_cast<int*>(num_targets_d);
+
+  params->seqused_q = static_cast<int*>(seqused_q_d);
+  params->seqused_k = static_cast<int*>(seqused_k_d);
 
   params->is_bf16 = q.dtype() == at::kBFloat16;
 #ifdef HSTU_DISABLE_BF16
@@ -251,6 +256,8 @@ void set_params_dgrad(
     void* num_contexts_d,
     void* cu_seqlens_q_d,
     void* cu_seqlens_k_d,
+    void* seqused_q_d,
+    void* seqused_k_d,
     void* num_targets_d,
     int window_size_left,
     int window_size_right,
@@ -280,6 +287,8 @@ void set_params_dgrad(
       num_contexts_d,
       cu_seqlens_q_d,
       cu_seqlens_k_d,
+      seqused_q_d,
+      seqused_k_d,
       /*page_offsets=*/nullptr,
       /*page_ids=*/nullptr,
       /*last_page_lens=*/nullptr,
@@ -459,6 +468,8 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_80(
         v, // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
     const at::Tensor& cu_seqlens_q, // b+1
     const at::Tensor& cu_seqlens_k, // b+1
+    const std::optional<at::Tensor>& seqused_q, // b
+    const std::optional<at::Tensor>& seqused_k, // b
     const int64_t max_seqlen_q,
     const int64_t max_seqlen_k,
     const std::optional<at::Tensor>& num_contexts, // b
@@ -490,22 +501,35 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_80(
   CHECK_DEVICE(q);
   CHECK_DEVICE(k);
   CHECK_DEVICE(v);
-  CHECK_DEVICE(cu_seqlens_q);
-  CHECK_DEVICE(cu_seqlens_k);
-  TORCH_CHECK(
-      q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-  TORCH_CHECK(
-      k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-  TORCH_CHECK(
-      v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-  CHECK_CONTIGUOUS(cu_seqlens_q);
-  CHECK_CONTIGUOUS(cu_seqlens_k);
 
   const int batch_size = cu_seqlens_q.numel() - 1;
   const int num_heads = q.size(1);
   const int head_size = q.size(2);
   const int total_k = k.size(0);
   const int num_heads_k = k.size(1);
+
+  CHECK_DEVICE(cu_seqlens_q);
+  CHECK_DEVICE(cu_seqlens_k);
+  CHECK_CONTIGUOUS(cu_seqlens_q);
+  CHECK_CONTIGUOUS(cu_seqlens_k);
+  CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+  CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+  if (seqused_q.has_value()) {
+    CHECK_DEVICE(seqused_q.value());
+    CHECK_CONTIGUOUS(seqused_q.value());
+    CHECK_SHAPE(seqused_q.value(), batch_size);
+  }
+  if (seqused_k.has_value()) {
+    CHECK_DEVICE(seqused_k.value());
+    CHECK_CONTIGUOUS(seqused_k.value());
+    CHECK_SHAPE(seqused_k.value(), batch_size);
+  }
+  TORCH_CHECK(
+      q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+  TORCH_CHECK(
+      k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+  TORCH_CHECK(
+      v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
   CHECK_SHAPE(k, total_k, num_heads_k, head_size);
   CHECK_SHAPE(v, total_k, num_heads_k, head_size);
@@ -518,8 +542,6 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_80(
           head_size == 256,
       "head_size should be 32, 64, 128, or 256");
 
-  CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-  CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
   if (num_contexts.has_value()) {
     TORCH_CHECK(
         num_contexts.value().dtype() == at::kInt,
@@ -590,6 +612,8 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_80(
       num_contexts.has_value() ? num_contexts.value().data_ptr() : nullptr,
       cu_seqlens_q.data_ptr(),
       cu_seqlens_k.data_ptr(),
+      seqused_q.has_value() ? seqused_q.value().data_ptr() : nullptr,
+      seqused_k.has_value() ? seqused_k.value().data_ptr() : nullptr,
       page_offsets.has_value() ? page_offsets.value().data_ptr() : nullptr,
       page_ids.has_value() ? page_ids.value().data_ptr() : nullptr,
       last_page_lens.has_value() ? last_page_lens.value().data_ptr() : nullptr,
@@ -768,6 +792,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
         v, // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
     const at::Tensor& cu_seqlens_q, // b+1
     const at::Tensor& cu_seqlens_k, // b+1
+    const std::optional<at::Tensor>& seqused_q, // b
+    const std::optional<at::Tensor>& seqused_k, // b
     const int64_t max_seqlen_q,
     const int64_t max_seqlen_k,
     const std::optional<at::Tensor> &dq_,
@@ -807,8 +833,30 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
   CHECK_DEVICE(k);
   CHECK_DEVICE(v);
   CHECK_DEVICE(dout);
+
+  const int batch_size = cu_seqlens_q.numel() - 1;
+  const int total_q = q.size(0);
+  const int num_heads = q.size(1);
+  const int head_size = q.size(2);
+  const int total_k = k.size(0);
+  const int num_heads_k = k.size(1);
+
   CHECK_DEVICE(cu_seqlens_q);
   CHECK_DEVICE(cu_seqlens_k);
+  CHECK_CONTIGUOUS(cu_seqlens_q);
+  CHECK_CONTIGUOUS(cu_seqlens_k);
+  CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+  CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+  if (seqused_q.has_value()) {
+    CHECK_DEVICE(seqused_q.value());
+    CHECK_CONTIGUOUS(seqused_q.value());
+    CHECK_SHAPE(seqused_q.value(), batch_size);
+  }
+  if (seqused_k.has_value()) {
+    CHECK_DEVICE(seqused_k.value());
+    CHECK_CONTIGUOUS(seqused_k.value());
+    CHECK_SHAPE(seqused_k.value(), batch_size);
+  }
   TORCH_CHECK(
       q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(
@@ -817,15 +865,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
       v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(
       dout.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-  CHECK_CONTIGUOUS(cu_seqlens_q);
-  CHECK_CONTIGUOUS(cu_seqlens_k);
 
-  const int batch_size = cu_seqlens_q.numel() - 1;
-  const int total_q = q.size(0);
-  const int num_heads = q.size(1);
-  const int head_size = q.size(2);
-  const int total_k = k.size(0);
-  const int num_heads_k = k.size(1);
 
   CHECK_SHAPE(k, total_k, num_heads_k, head_size);
   CHECK_SHAPE(v, total_k, num_heads_k, head_size);
@@ -845,8 +885,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
   const int seqlen_k_rounded = round_multiple(
       max_seqlen_k, sizeof(cutlass::uint128_t) / sizeof(q_dtype));
 
-  CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-  CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
   if (num_contexts.has_value()) {
     TORCH_CHECK(
         num_contexts.value().dtype() == at::kInt,
@@ -855,8 +893,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
     CHECK_CONTIGUOUS(num_contexts.value());
     CHECK_SHAPE(num_contexts.value(), batch_size);
   }
-  CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-  CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
   if (num_targets.has_value()) {
     TORCH_CHECK(
         num_targets.value().dtype() == at::kInt,
@@ -956,6 +992,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
       num_contexts.has_value() ? num_contexts.value().data_ptr() : nullptr,
       cu_seqlens_q.data_ptr(),
       cu_seqlens_k.data_ptr(),
+      seqused_q.has_value() ? seqused_q.value().data_ptr() : nullptr,
+      seqused_k.has_value() ? seqused_k.value().data_ptr() : nullptr,
       num_targets.has_value() ? num_targets.value().data_ptr() : nullptr,
       window_size_left,
       window_size_right,
@@ -991,6 +1029,8 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "    Tensor v, "
       "    Tensor cu_seqlens_q, "
       "    Tensor cu_seqlens_k, "
+      "    Tensor? seqused_q, "
+      "    Tensor? seqused_k, "
       "    int max_seqlen_q, "
       "    int max_seqlen_k, "
       "    Tensor? num_contexts=None, "
@@ -1014,6 +1054,8 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "    Tensor v, "
       "    Tensor cu_seqlens_q, "
       "    Tensor cu_seqlens_k, "
+      "    Tensor? seqused_q, "
+      "    Tensor? seqused_k, "
       "    int max_seqlen_q, "
       "    int max_seqlen_k, "
       "    Tensor? dq=None, "

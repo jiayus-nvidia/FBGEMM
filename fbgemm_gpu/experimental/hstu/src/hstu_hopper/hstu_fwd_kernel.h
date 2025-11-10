@@ -136,6 +136,7 @@ __global__ void __launch_bounds__(
       seqlen_traits_k.init_c(bidb);
     }
     const int actual_seqlen_q = seqlen_traits_q.actual_seq_len;
+    const int actual_seqlen_q_padded = seqlen_traits_q.actual_seq_len_padded;
     const int actual_seqlen_k = seqlen_traits_k.actual_seq_len;
     const int actual_seqlen_h =
         Is_target ? seqlen_traits_k.actual_seq_len_h : actual_seqlen_k;
@@ -206,7 +207,8 @@ __global__ void __launch_bounds__(
         n_masking_steps,
         is_jump,
         n_block_history,
-        actual_seqlen_q);
+        actual_seqlen_q,
+        actual_seqlen_q_padded);
   };
 
   auto get_valid_block_ids = [&](int m_block, int &n_block_max, int &n_block_min, auto is_calwarp) {
@@ -339,13 +341,14 @@ __global__ void __launch_bounds__(
              n_masking_steps,
              is_jump,
              n_block_history,
-             actual_seqlen_q] = get_block_info(m_block, bidb);
-        if (m_block * kBlockM >= actual_seqlen_q) {
+             actual_seqlen_q,
+             actual_seqlen_q_padded] = get_block_info(m_block, bidb);
+        if (m_block * kBlockM >= actual_seqlen_q_padded) {
           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
           continue;
         }
         get_valid_block_ids(m_block, n_block_max, n_block_min, cute::bool_constant<false>{});
-        if ((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) {
+        if (((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) || m_block * kBlockM >= actual_seqlen_q) {
           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
           continue;
         }
@@ -417,12 +420,13 @@ __global__ void __launch_bounds__(
            n_masking_steps,
            is_jump,
            n_block_history,
-           actual_seqlen_q] = get_block_info(m_block, bidb);
-      if (m_block * kBlockM >= actual_seqlen_q) {
+           actual_seqlen_q,
+           actual_seqlen_q_padded] = get_block_info(m_block, bidb);
+      if (m_block * kBlockM >= actual_seqlen_q_padded) {
         continue;
       }
       get_valid_block_ids(m_block, n_block_max, n_block_min, cute::bool_constant<true>{});
-      if ((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) {
+      if (((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) || m_block * kBlockM >= actual_seqlen_q) {
         collective_epilogue.store_zero(
             epilogue_params,
             shared_storage,
@@ -590,6 +594,7 @@ __global__ void __launch_bounds__(
       seqlen_traits_k.init_c(bidb);
     }
     const int actual_seqlen_q = seqlen_traits_q.actual_seq_len;
+    const int actual_seqlen_q_padded = seqlen_traits_q.actual_seq_len_padded;
     const int actual_seqlen_k = seqlen_traits_k.actual_seq_len;
     const int actual_seqlen_h = Is_target ? seqlen_traits_k.actual_seq_len_h : actual_seqlen_k;
     const int actual_seqlen_c = Is_context ? seqlen_traits_k.actual_seq_len_c : 0;
@@ -628,7 +633,7 @@ __global__ void __launch_bounds__(
     }
 
     const int n_masking_steps = (!Is_causal || is_in_context) ? 0 : n_masking_block_max - n_masking_block_min;
-    return std::make_tuple(n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, actual_seqlen_q);
+    return std::make_tuple(n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, actual_seqlen_q, actual_seqlen_q_padded);
   };
 
   auto get_valid_block_ids = [&](int m_block, int &n_block_max, int &n_block_min, auto is_calwarp) {
@@ -750,13 +755,13 @@ __global__ void __launch_bounds__(
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
       auto [m_block, bidh, bidb] = block_coord;
 
-      auto [n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, actual_seqlen_q] = get_block_info(m_block, bidb);
-      if (m_block * kBlockM >= actual_seqlen_q) {
+      auto [n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, actual_seqlen_q, actual_seqlen_q_padded] = get_block_info(m_block, bidb);
+      if (m_block * kBlockM >= actual_seqlen_q_padded) {
         scheduler.prefetch_next_work(scheduler_params, work_tile_info);
         continue;
       }
       get_valid_block_ids(m_block, n_block_max, n_block_min, cute::bool_constant<false>{});
-      if ((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) {
+      if (((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) || m_block * kBlockM >= actual_seqlen_q) {
         scheduler.prefetch_next_work(scheduler_params, work_tile_info);
         continue;
       }
@@ -811,12 +816,12 @@ __global__ void __launch_bounds__(
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
       auto [m_block, bidh, bidb] = block_coord;
 
-      auto [n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, actual_seqlen_q] = get_block_info(m_block, bidb);
-      if (m_block * kBlockM >= actual_seqlen_q) {
+      auto [n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, actual_seqlen_q, actual_seqlen_q_padded] = get_block_info(m_block, bidb);
+      if (m_block * kBlockM >= actual_seqlen_q_padded) {
         continue;
       }
       get_valid_block_ids(m_block, n_block_max, n_block_min, cute::bool_constant<true>{});
-      if ((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) {
+      if (((Is_causal || Is_local || Is_arbitrary) && n_block_max <= n_block_min) || m_block * kBlockM >= actual_seqlen_q) {
         collective_epilogue.store_zero(
             epilogue_params,
             shared_storage,
