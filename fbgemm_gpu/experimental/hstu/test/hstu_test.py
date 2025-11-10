@@ -826,6 +826,10 @@ class HSTU16Test(unittest.TestCase):
         print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
         print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
         print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
+        
+        # for debug
+        # print(f"Output = {hstu_out}")
+        # print(f"Pytorch = {torch_out}")
 
         assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
 
@@ -1940,10 +1944,29 @@ class HSTU8Test(unittest.TestCase):
 
 if __name__ == "__main__":
     # benchmark case
+    # HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
+    # 8, 8, 0, (128, 128), 1.0, (False, False, None), (8192, 8192), (0, (-1, 0), 1, False), torch.bfloat16, True)
+    
+    # def test_hstu_attn(
+    # self,
+    # batch_size: int,
+    # heads: int,
+    # max_context_len: int,
+    # attn_hidden_dims: tuple[int, int],
+    # alpha: float,
+    # rab_params: Tuple[bool, bool, Optional[int]],
+    # seq_len_params: Tuple[int, int],
+    # target_params: Tuple[int, Tuple[int, int], int, bool],
+    # dtype: torch.dtype,
+    # full_batch: bool,
+
     HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
-    8, 8, 0, (128, 128), 1.0, (False, False, None), (8192, 8192), (0, (-1, -1), 1, False), torch.bfloat16, True)
+    8, 8, 0, (128, 128), 1.0, (False, False, None), (1024, 1024), (0, (-1, 0), 1, False), torch.bfloat16, False)
 
     # HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
-    # 1, 1, 0, (64, 64), 1.0, (False, False, None), (128, 128), (0, (-1, -1), 1, False), torch.bfloat16, True)
+    # 1, 1, 0, (128, 128), 1.0, (False, False, None), (512, 512), (0, (-1, 0), 1, False), torch.bfloat16, True)
+
+    # HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
+    # 1, 1, 0, (128, 128), 1.0, (False, False, None), (256, 256), (0, (-1, 0), 1, False), torch.bfloat16, True)
 
     # unittest.main()

@@ -1,10 +1,10 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Tuple
+from typing import Tuple, Optional, Callable
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Uint32, Float32
+from cutlass import Int32, Uint32, Float32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
@@ -103,35 +103,34 @@ class FastSilU:
         self.score_scale = score_scale * 0.5
 
     @cute.jit
-    def apply_silu_convert(
+    def silu_x2(
         self,
-        acc_S_row: cute.Tensor,
-        acc_S_row_converted: cute.Tensor,
+        acc_S: cute.Tensor,
+        acc_S_converted: cute.Tensor,
+        preds: cute.Tensor,
+        mask_fn: Optional[Callable] = None,
     ):
-        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
-        frg_tile = 32
-        assert frg_tile % 2 == 0
-        frg_cnt = cute.size(acc_S_row) // frg_tile
-        assert cute.size(acc_S_row) % frg_tile == 0
-        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
-        acc_S_row_converted_frg = cute.logical_divide(
-            acc_S_row_converted, cute.make_layout(frg_tile)
-        )
-        for j in cutlass.range_constexpr(frg_cnt):
-            for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
-                v0, v1 = mul_packed_f32x2(
-                    (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
-                    (self.score_scale, self.score_scale),
-                )
-                tanh_v0 = tanhf(v0)
-                tanh_v1 = tanhf(v1)
-                out_v0, out_v1 = fma_packed_f32x2(
-                    (v0, v1),
-                    (tanh_v0, tanh_v1),
-                    (v0, v1),
-                )
-                acc_S_row_frg[k, j] = out_v0 if v0 > -10.0 else 0.0
-                acc_S_row_frg[k + 1, j] = out_v1 if v1 > -10.0 else 0.0
-            acc_S_row_converted_frg[None, j].store(
-                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+        for i in cutlass.range_constexpr(0, cute.size(acc_S), 2):
+            v0, v1 = mul_packed_f32x2(
+                (acc_S[i], acc_S[i + 1]),
+                (self.score_scale, self.score_scale),
             )
+            tanh_v0 = tanhf(v0)
+            tanh_v1 = tanhf(v1)
+            out_v0, out_v1 = fma_packed_f32x2(
+                (v0, v1),
+                (tanh_v0, tanh_v1),
+                (v0, v1),
+            )
+            acc_S[i] = out_v0 
+            acc_S[i + 1] = out_v1 
+        # this could get better performance than mask silu, it could elim the instructions of PRMT
+        # it have better performance than comment code below (82us vs 84us) and has less instructions
+        # i can not understand
+        if const_expr(mask_fn is not None):
+            for i in cutlass.range_constexpr(cute.size(acc_S), unroll_full=True):
+                acc_S[i] = acc_S[i] if preds[i] else acc_S.element_type(0)
+        acc_S_converted.store(acc_S.load().to(acc_S_converted.element_type))
+        # if const_expr(mask_fn is not None):
+        #     for i in cutlass.range_constexpr(cute.size(acc_S_converted), unroll_full=True):
+        #         acc_S_converted[i] = acc_S_converted[i] if preds[i] else acc_S_converted.element_type(0)

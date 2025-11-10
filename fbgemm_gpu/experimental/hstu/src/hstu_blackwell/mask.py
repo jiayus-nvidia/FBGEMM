@@ -33,10 +33,35 @@ class AttentionMask:
     func: Optional[cute.Tensor] # (n_func, L_func)
     swapAB: cutlass.Constexpr[bool]
 
+    # when seqlen_q = seqlen_k && tilesize is square, we only need mask first n_tile, preds can be calculated in compile time
+    @cute.jit
+    def apply_mask_causal(
+        self,
+        preds: cute.Tensor,
+        m_block: cutlass.Int32,
+        n_block: cutlass.Int32,
+        thr_mma: cute.TiledMma,
+        thr_tmem_load: cute.TiledCopy,
+    ) -> None:
+        cS = cute.make_identity_tensor((self.kBlockM, self.kBlockN))
+        tScS = thr_mma.partition_C(cS)
+        tScS_t2r = thr_tmem_load.partition_D(tScS)
+        row_id, col_id = (1, 0) if cutlass.const_expr(self.swapAB) else (0, 1)
+
+        for i in cutlass.range_constexpr(cute.size(preds), unroll_full=True):
+            preds[i] = True
+
+        for i in cutlass.range_constexpr(cute.size(preds), unroll_full=True):
+            block_row = cute.get(tScS_t2r[i], mode=[row_id])
+            block_col = cute.get(tScS_t2r[i], mode=[col_id])
+            if block_col > block_row:
+                preds[i] = False
+
+
     @cute.jit
     def apply_mask(
         self,
-        acc_S: cute.Tensor,
+        preds: cute.Tensor,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
         thr_mma: cute.TiledMma,
@@ -50,44 +75,49 @@ class AttentionMask:
         base_col = n_block * self.kBlockN
         row_id, col_id = (1, 0) if cutlass.const_expr(self.swapAB) else (0, 1)
 
-        col_limit_right = lambda row: min(self.seqlen_k, row + 1 + self.window_size_right)
-        col_limit_left = lambda row: max(0, row - self.window_size_left)
+        limit_right = lambda row: min(self.seqlen_k, row + 1 + self.window_size_right)
+        limit_left = lambda row: max(0, row - self.window_size_left)
 
-        for i in cutlass.range(cute.size(acc_S), unroll_full=True):
-            block_row = cute.get(tScS_t2r[i], mode=[row_id])
-            row = block_row + base_row
-            target_index = (row - self.seqlen_h) // self.target_group_size if cutlass.const_expr(self.is_target) else 0
-            target_col_limit_left = self.seqlen_h + target_index * self.target_group_size if cutlass.const_expr(self.is_target) else 0
+        block_row = cute.get(tScS_t2r[0], mode=[row_id])
+        row = block_row + base_row
 
+        target_index = (row - self.seqlen_h) // self.target_group_size if cutlass.const_expr(self.is_target) else 0
+        target_col_limit_left = self.seqlen_h + target_index * self.target_group_size if cutlass.const_expr(self.is_target) else 0
+
+        col_limit_right = limit_right(row)
+        col_limit_left = limit_left(row)
+
+        for i in cutlass.range_constexpr(cute.size(preds), unroll_full=True):
+            preds[i] = True
+
+        for i in cutlass.range_constexpr(cute.size(preds), unroll_full=True):
             block_col = cute.get(tScS_t2r[i], mode=[col_id])
             col = block_col + base_col
 
             if cutlass.const_expr(not self.is_causal and not self.is_local and not self.is_arbitrary):
                 if col >= self.seqlen_k:
-                    acc_S[i] = -cutlass.Float32.inf
+                    preds[i] = False
             elif cutlass.const_expr(self.is_arbitrary):
                 func_row = row + self.offset_q - seqlen_offset
                 for j in cutlass.range(self.func_num // 2, unroll_full=True):
                     if col >= self.func[2 * j, func_row].value and col < self.func[2 * j + 1, func_row].value:
-                        acc_S[i] = -cutlass.Float32.inf
+                        preds[i] = False
                 if col >= self.func[self.func_num - 1, func_row].value or col >= self.seqlen_k:
-                    acc_S[i] = -cutlass.Float32.inf
+                    preds[i] = False
             else:
-                skip = False
+                if col >= col_limit_right:
+                    preds[i] = False
+                if cutlass.const_expr(self.is_local):
+                    if col < col_limit_left:
+                        preds[i] = False
+                if cutlass.const_expr(self.is_target):
+                    if row >= self.seqlen_h and col >= self.seqlen_h and col < target_col_limit_left:
+                    # i think we could remove row >= self.seqlen_h condition, but get worse performance (102us vs 96us)
+                    # if col >= self.seqlen_h and col < target_col_limit_left:
+                        preds[i] = False
                 if cutlass.const_expr(self.is_context):
                     if row < self.seqlen_c and col < self.seqlen_h:
-                        skip = True
-
-                if not skip:
-                    if col >= col_limit_right(row):
-                        acc_S[i] = -cutlass.Float32.inf
-                    if cutlass.const_expr(self.is_local):
-                        if col < col_limit_left(row):
-                            acc_S[i] = -cutlass.Float32.inf
-                    if cutlass.const_expr(self.is_target):
-                        if row >= self.seqlen_h and col >= self.seqlen_h and col < target_col_limit_left:
-                            acc_S[i] = -cutlass.Float32.inf
-
+                        preds[i] = True
 
     @cute.jit
     def apply_mask_swapAB(

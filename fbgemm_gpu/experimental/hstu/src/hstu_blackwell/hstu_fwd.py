@@ -94,7 +94,7 @@ class HSTUAttentionForwardSm100:
         self.qhead_per_kvhead = qhead_per_kvhead
         # Does S1 need to wait for S0 to finish
         self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
-        self.overlap_sO_sQ = self.head_dim_padded == 192 and self.head_dim_v_padded >= 64
+        self.overlap_sO_sQ = self.head_dim_padded == 192 and self.head_dim_v_padded >= 64 and not self.is_arbitrary
         if self.overlap_sO_sQ:
             assert self.head_dim_padded >= self.head_dim_v_padded  # We assume sQ is larger than sO
             self.is_persistent = False
@@ -394,6 +394,15 @@ class HSTUAttentionForwardSm100:
             ]
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, sO_size],
+                self.buffer_align_bytes,
+            ]
+            # Smem tensor for valid block ids
+            sValidBlockIds: cute.struct.Align[
+                cute.struct.MemRange[Int32, self.MaxValidBlock],
+                self.buffer_align_bytes,
+            ]
+            sBlockBound: cute.struct.Align[
+                cute.struct.MemRange[Int32, self.func_num + 1],
                 self.buffer_align_bytes,
             ]
         self.shared_storage = SharedStorage
@@ -1133,6 +1142,9 @@ class HSTUAttentionForwardSm100:
             mask_fn = partial(
                 mask.apply_mask, m_block=self.q_stage * m_block + stage, thr_mma=thr_mma_qk, thr_tmem_load=thr_tmem_load,
             )
+            # mask_fn = partial(
+            #     mask.apply_mask_causal, m_block=self.q_stage * m_block + stage, thr_mma=thr_mma_qk, thr_tmem_load=thr_tmem_load,
+            # )
             fastsilu = FastSilU(
                 score_scale=score_scale,
             )
@@ -1157,13 +1169,37 @@ class HSTUAttentionForwardSm100:
 
             n_block_valid = n_block_max - 1
             masking_step = 0
-            while n_block_valid >= n_block_min:
+            while n_block_valid >= n_block_min and masking_step < n_masking_steps:
                 n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
                 mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
-                if is_jump and masking_step == n_masking_steps - 1:
-                    n_block_valid = min(n_block_valid, n_block_history)
                 masking_step += 1
                 n_block_valid -= 1
+            
+            if is_jump:
+                n_block_valid = min(n_block_valid, n_block_history)
+                n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
+                if seqlen.seqlen_h > n_block * self.kBlockM:
+                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
+                    n_block_valid -= 1
+
+            while n_block_valid > n_block_min:
+                n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
+                # for local case, we need to apply mask to the last block cause tile size is square 128*128, but when seq_q != seq_k, the conclusion may not solid
+                # For the sake of convenience, I apply masking to all n_tiles. If the customer has optimization requirements, I will then consider the local scenarios separately.
+                if const_expr(self.is_local or self.is_arbitrary): 
+                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn)) 
+                else:
+                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block)
+                n_block_valid -= 1
+            
+            # for local case, we need to apply mask to the last block cause tile size is square 128*128\
+            assert const_expr(self.kBlockM == self.kBlockN)
+            if n_block_valid == n_block_min:
+                n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
+                if const_expr(self.is_local or self.is_arbitrary):
+                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn)) 
+                else:
+                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block)
 
             # Advance to next tile
             tile_scheduler.advance_to_next_work()
@@ -1211,15 +1247,15 @@ class HSTUAttentionForwardSm100:
         tScP = cute.make_tensor(tScS.iterator, tScP_layout)
 
         tScS_t2r_shape = thr_tmem_load.partition_D(tScS).shape
+        tSrS_t2r = cute.make_rmem_tensor(tScS_t2r_shape, self.qk_acc_dtype)
+        tSrS_preds = cute.make_rmem_tensor(tScS_t2r_shape, cutlass.Boolean)
+        if const_expr(mask_fn is not None):
+            mask_fn(tSrS_preds, n_block=n_block)
 
         # Wait for Si
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
-        tSrS_t2r = cute.make_rmem_tensor(tScS_t2r_shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)  # copy from tmem to rmem
-        for i in cutlass.range_constexpr(cute.size(tSrS_t2r), unroll_full=True):
-            tSrS_t2r[i] *= self.alpha
-        if const_expr(mask_fn is not None):
-            mask_fn(tSrS_t2r, n_block=n_block)
+        cute.arch.fence_view_async_tmem_load()
 
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
@@ -1228,7 +1264,7 @@ class HSTUAttentionForwardSm100:
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout,
         )
-        fastsilu.apply_silu_convert(tSrS_t2r, tSrP_r2t)
+        fastsilu.silu_x2(tSrS_t2r, tSrP_r2t, tSrS_preds, mask_fn=partial(mask_fn) if mask_fn is not None else None)
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
