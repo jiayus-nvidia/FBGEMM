@@ -53,6 +53,7 @@ def hstu_varlen_fwd_100(
     func_num = func.shape[-2] if func is not None else 0
 
     out = torch.empty_like(q)
+    # out = torch.zeros_like(q)  # for test
     q_tensor, k_tensor, v_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (q, k, v, out)

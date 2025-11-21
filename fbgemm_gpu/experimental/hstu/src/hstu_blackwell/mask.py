@@ -8,7 +8,7 @@ import cutlass.cute as cute
 
 import utils
 
-from cutlass.cute.typing import Int32
+from cutlass.cute.typing import Int32, Tuple
 from .utils import split_wg
 
 
@@ -16,6 +16,7 @@ from .utils import split_wg
 class AttentionMask:
     kBlockM: cutlass.Constexpr[int]
     kBlockN: cutlass.Constexpr[int]
+    cta_tiler: cutlass.Constexpr[Tuple[int, int]]
     is_arbitrary: cutlass.Constexpr[bool]
     is_causal: cutlass.Constexpr[bool]
     is_local: cutlass.Constexpr[bool]
@@ -30,6 +31,7 @@ class AttentionMask:
     seqlen_k: cutlass.Constexpr[int]
     seqlen_c: cutlass.Constexpr[int]
     seqlen_h: cutlass.Constexpr[int]
+    offset_dynamic: cutlass.Constexpr[int]
     func: Optional[cute.Tensor] # (n_func, L_func)
     swapAB: cutlass.Constexpr[bool]
 
@@ -71,7 +73,7 @@ class AttentionMask:
         cS = cute.make_identity_tensor((self.kBlockM, self.kBlockN))
         tScS = thr_mma.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
-        base_row = m_block * self.kBlockM + seqlen_offset
+        base_row = m_block * self.kBlockM + seqlen_offset - self.offset_dynamic
         base_col = n_block * self.kBlockN
         row_id, col_id = (1, 0) if cutlass.const_expr(self.swapAB) else (0, 1)
 
@@ -86,6 +88,7 @@ class AttentionMask:
 
         col_limit_right = limit_right(row)
         col_limit_left = limit_left(row)
+
 
         for i in cutlass.range_constexpr(cute.size(preds), unroll_full=True):
             preds[i] = True

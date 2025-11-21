@@ -876,10 +876,11 @@ class HSTUAttentionBackwardSm100:
         )
 
         AttentionMaskCls = partial(
-            AttentionMask, self.kBlockM, self.kBlockN,
+            AttentionMask, self.kBlockM, self.kBlockN, self.cta_tiler,
             self.is_arbitrary, self.is_causal, self.is_local, self.is_context, self.is_target,
             target_group_size=self.target_group_size, func_num=self.func_num,
             window_size_left=window_size_left, window_size_right=window_size_right,
+            offset_dynamic=0,
             swapAB=True,
         )
         mask = AttentionMaskCls(offset_q=cu_seqlens_q[bidz], seqlen_q=Q_len_cur_batch, seqlen_k=K_len_cur_batch, seqlen_c=num_contexts_cur_batch, seqlen_h=num_history_cur_batch, func=func)
