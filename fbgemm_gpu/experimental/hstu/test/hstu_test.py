@@ -852,8 +852,7 @@ class HSTU16Test(unittest.TestCase):
         #         torch_out_i = torch_out[i, 0]
         #         print(f"hstu_out[i] = {hstu_out_i}, torch_out[i] = {torch_out_i}, diff[i] = {diff_i}, i = {i}")
 
-        # assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
-        # return
+        assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
 
         g = torch.rand_like(torch_out)
         if not has_drab:
