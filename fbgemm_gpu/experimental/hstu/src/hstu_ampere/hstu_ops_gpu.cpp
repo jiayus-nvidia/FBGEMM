@@ -42,6 +42,7 @@ void set_params_fprop(
     const size_t b,
     const size_t seqlen_q,
     const size_t seqlen_k,
+    const size_t scaling_seqlen,
     const size_t target_group_size,
     const size_t seqlen_q_rounded,
     const size_t seqlen_k_rounded,
@@ -140,6 +141,7 @@ void set_params_fprop(
   params->seqlen_k = seqlen_k;
   params->seqlen_q_rounded = seqlen_q_rounded;
   params->seqlen_k_rounded = seqlen_k_rounded;
+  params->scaling_seqlen = scaling_seqlen == -1 ? seqlen_q : scaling_seqlen;
   params->d = d;
   params->alpha = alpha;
   // Set the masks.
@@ -233,6 +235,7 @@ void set_params_dgrad(
     const size_t b,
     const size_t seqlen_q,
     const size_t seqlen_k,
+    const size_t scaling_seqlen,
     const size_t target_group_size,
     const size_t seqlen_q_rounded,
     const size_t seqlen_k_rounded,
@@ -270,6 +273,7 @@ void set_params_dgrad(
       b,
       seqlen_q,
       seqlen_k,
+      scaling_seqlen,
       target_group_size,
       seqlen_q_rounded,
       seqlen_k_rounded,
@@ -472,6 +476,7 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_80(
     const std::optional<at::Tensor>& seqused_k, // b
     const int64_t max_seqlen_q,
     const int64_t max_seqlen_k,
+    const int64_t scaling_seqlen,
     const std::optional<at::Tensor>& num_contexts, // b
     const std::optional<at::Tensor>& num_targets, // b
     const int64_t target_group_size,
@@ -595,6 +600,7 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_80(
       batch_size,
       max_seqlen_q,
       max_seqlen_k,
+      scaling_seqlen,
       target_group_size,
       seqlen_q_rounded,
       seqlen_k_rounded,
@@ -645,9 +651,11 @@ template <
     int kNFunc>
 void run_hstu_bwd_headdim(Hstu_bwd_params& params, cudaStream_t stream) {
   DETERMINISTIC_SWITCH(params.deterministic, Is_deterministic, [&] {
+    ARCH_SWITCH(params.arch, Arch, [&] { // sm80 or sm86/sm89
 #ifndef HSTU_DISABLE_HDIM32
   if (params.d == 32) {
     run_hstu_bwd_80<
+        Arch,
         Dtype,
         32,
         Has_rab,
@@ -664,6 +672,7 @@ void run_hstu_bwd_headdim(Hstu_bwd_params& params, cudaStream_t stream) {
 #ifndef HSTU_DISABLE_HDIM64
   if (params.d == 64) {
     run_hstu_bwd_80<
+        Arch,
         Dtype,
         64,
         Has_rab,
@@ -680,6 +689,7 @@ void run_hstu_bwd_headdim(Hstu_bwd_params& params, cudaStream_t stream) {
 #ifndef HSTU_DISABLE_HDIM128
   if (params.d == 128) {
     run_hstu_bwd_80<
+        Arch,
         Dtype,
         128,
         Has_rab,
@@ -696,6 +706,7 @@ void run_hstu_bwd_headdim(Hstu_bwd_params& params, cudaStream_t stream) {
 #ifndef HSTU_DISABLE_HDIM256
   if (params.d == 256) {
     run_hstu_bwd_80<
+        Arch,
         Dtype,
         256,
         Has_rab,
@@ -709,6 +720,7 @@ void run_hstu_bwd_headdim(Hstu_bwd_params& params, cudaStream_t stream) {
         Is_deterministic>(params, stream);
   }
 #endif
+    });
   });
 }
 
@@ -796,6 +808,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
     const std::optional<at::Tensor>& seqused_k, // b
     const int64_t max_seqlen_q,
     const int64_t max_seqlen_k,
+    const int64_t scaling_seqlen,
     const std::optional<at::Tensor> &dq_,
     const std::optional<at::Tensor> &dk_,
     const std::optional<at::Tensor> &dv_,
@@ -811,9 +824,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
     const bool deterministic) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
-  TORCH_CHECK(
-      dprops->major == 8 && dprops->minor == 0,
-      "HSTU backward does not support sm86 or sm89.");
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   auto q_dtype = q.dtype();
@@ -970,6 +980,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
       batch_size,
       max_seqlen_q,
       max_seqlen_k,
+      scaling_seqlen,
       target_group_size,
       seqlen_q_rounded,
       seqlen_k_rounded,
@@ -1007,7 +1018,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
     // If total_q == 0, then we have an empty tensor. We need to set the output to 0.
     dk.zero_();
     dv.zero_();
-    dRab.zero_();
+    if (has_drab) {
+      dRab.zero_();
+    }
   }
 
   if (has_drab && seqlen_k_rounded != max_seqlen_k) {
@@ -1033,6 +1046,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "    Tensor? seqused_k, "
       "    int max_seqlen_q, "
       "    int max_seqlen_k, "
+      "    int scaling_seqlen=-1, "
       "    Tensor? num_contexts=None, "
       "    Tensor? num_targets=None, "
       "    int target_group_size=1, "
@@ -1058,6 +1072,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "    Tensor? seqused_k, "
       "    int max_seqlen_q, "
       "    int max_seqlen_k, "
+      "    int scaling_seqlen=-1, "
       "    Tensor? dq=None, "
       "    Tensor? dk=None, "
       "    Tensor? dv=None, "

@@ -41,6 +41,7 @@ void set_params_fprop(
     const size_t b,
     const size_t seqlen_q,
     const size_t seqlen_k,
+    const size_t scaling_seqlen, 
     const size_t target_group_size,
     const size_t seqlen_q_rounded,
     const size_t seqlen_k_rounded,
@@ -198,6 +199,7 @@ void set_params_fprop(
   params.seqlen_k = seqlen_k;
   params.seqlen_q_rounded = seqlen_q_rounded;
   params.seqlen_k_rounded = seqlen_k_rounded;
+  params.scaling_seqlen = scaling_seqlen == -1 ? seqlen_q : scaling_seqlen;
   params.d = d;
   params.alpha = alpha;
   // 1: 1xDIM&128x1 quantization, 2: per-block quantization, 3: per-head quantization, 4: per-batch quantization, 5: per-tensor quantization.
@@ -276,6 +278,7 @@ void set_params_dgrad(
     const size_t b,
     const size_t seqlen_q,
     const size_t seqlen_k,
+    const size_t scaling_seqlen,
     const size_t target_group_size,
     const size_t seqlen_q_rounded,
     const size_t seqlen_k_rounded,
@@ -328,6 +331,7 @@ void set_params_dgrad(
       b,
       seqlen_q,
       seqlen_k,
+      scaling_seqlen,
       target_group_size,
       seqlen_q_rounded,
       seqlen_k_rounded,
@@ -625,6 +629,7 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_90(
     const std::optional<at::Tensor>& seqused_k, // b
     const int64_t max_seqlen_q,
     const int64_t max_seqlen_k,
+    const int64_t scaling_seqlen,
     const std::optional<at::Tensor>& num_contexts, // b
     const std::optional<at::Tensor>& num_targets, // b
     const int64_t target_group_size,
@@ -823,6 +828,7 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_90(
       batch_size,
       max_seqlen_q,
       max_seqlen_k,
+      scaling_seqlen,
       target_group_size,
       seqlen_q_rounded,
       seqlen_k_rounded,
@@ -1084,6 +1090,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_90(
     const std::optional<at::Tensor>& seqused_k, // b
     const int64_t max_seqlen_q,
     const int64_t max_seqlen_k,
+    const int64_t scaling_seqlen,
     const std::optional<at::Tensor>& dq_,
     const std::optional<at::Tensor>& dk_,
     const std::optional<at::Tensor>& dv_,
@@ -1320,6 +1327,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_90(
       batch_size,
       max_seqlen_q,
       max_seqlen_k,
+      scaling_seqlen,
       target_group_size,
       seqlen_q_rounded,
       seqlen_k_rounded,
@@ -1409,6 +1417,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "    Tensor? seqused_k, "
       "    int max_seqlen_q, "
       "    int max_seqlen_k, "
+      "    int scaling_seqlen=-1, "
       "    Tensor? num_contexts=None, "
       "    Tensor? num_targets=None, "
       "    int target_group_size=1, "
@@ -1443,6 +1452,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "    Tensor? seqused_k, "
       "    int max_seqlen_q, "
       "    int max_seqlen_k, "
+      "    int scaling_seqlen=-1, "
       "    Tensor? dq_=None, "
       "    Tensor? dk_=None, "
       "    Tensor? dv_=None, "

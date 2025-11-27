@@ -97,6 +97,7 @@ struct Hstu_fwd_params : public Hstu_params {
 
   // The dimensions.
   int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded;
+  int scaling_seqlen;
   float alpha;
 
   int target_group_size;
@@ -171,6 +172,7 @@ template <
 void run_hstu_fwd_8x(Hstu_fwd_params& params, cudaStream_t stream);
 
 template <
+    int Arch, 
     typename T,
     int Headdim,
     bool Has_rab,

@@ -775,7 +775,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
     silu_bwd(acc_s, acc_s_silu);
 
     for (int i = 0; i < size(acc_s_silu); ++i) {
-      acc_s_silu(i) /= params.seqlen_q;
+      acc_s_silu(i) /= params.scaling_seqlen;
     }
 
     if (Has_rab && !Is_last_step) {
@@ -816,7 +816,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
         smem_thr_copy_KV);
 
     for (int i = 0; i < size(acc_dp); ++i) {
-      acc_dp(i) /= params.seqlen_q;
+      acc_dp(i) /= params.scaling_seqlen;
     }
     dsilu_bwd(acc_dp, acc_s);
     for (int i = 0; i < size(acc_dp); ++i) {
@@ -1274,6 +1274,7 @@ void run_hstu_bwd_impl_(Hstu_bwd_params& params, cudaStream_t stream) {
 }
 
 template <
+    int Arch,
     typename elem_type,
     int kHeadDim,
     bool Has_rab,
@@ -1289,10 +1290,17 @@ void run_hstu_bwd_80(Hstu_bwd_params& params, cudaStream_t stream) {
   const bool rab_one_head = params.h_rab != params.h && params.h_rab == 1;
   BOOL_SWITCH(rab_one_head, Rab_one_head, [&] {
     static constexpr auto tile_size =
-        flash::get_tile_size_bwd<kHeadDim, Has_rab>();
+        flash::get_tile_size_bwd<Arch, kHeadDim, Has_rab>();
     static constexpr int kBlockM = std::get<0>(tile_size);
     static constexpr int kBlockN = std::get<1>(tile_size);
     static constexpr int kNWarps = std::get<2>(tile_size);
+    static constexpr int AtomLayoutMSdP =
+        (Arch == 89) ? (kHeadDim <= 128 ? 2 : 1) : 4;
+    static constexpr int AtomLayoutNdKV =
+        (Arch == 89) ? (kHeadDim <= 128 ? 4 : 1) : (kHeadDim <= 64 ? 4 : 2);
+    static constexpr int AtomLayoutMdQ =
+        (Arch == 89) ? (kHeadDim <= 128 ? 4 : 1)
+                     : (kHeadDim <= 64 ? 4 : 2); // split DIM for 256
     run_hstu_bwd_impl_<
         elem_type,
         kHeadDim,
@@ -1309,9 +1317,9 @@ void run_hstu_bwd_80(Hstu_bwd_params& params, cudaStream_t stream) {
         Has_drab,
         Rab_one_head,
         kNWarps,
-        4,
-        kHeadDim <= 64 ? 4: 2,
-        kHeadDim <= 64 ? 4: 2,
+        AtomLayoutMSdP,
+        AtomLayoutNdKV,
+        AtomLayoutMdQ,
         false>(params, stream);
     });
 }

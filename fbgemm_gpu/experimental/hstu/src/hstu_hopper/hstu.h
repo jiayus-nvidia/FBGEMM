@@ -61,6 +61,7 @@ struct Hstu_fwd_params : public Qkv_params {
   // The dimensions.
   int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, total_q,
       total_k;
+  int scaling_seqlen;
   int seqlen_i;
   float alpha;
   // array of length b+1 holding starting offset of each sequence.

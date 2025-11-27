@@ -304,6 +304,7 @@ struct CollectiveMainloopBwd {
     const int window_size_left;
     const int window_size_right;
     const int target_group_size;
+    const int scaling_seqlen;
     const float alpha;
     int* dq_semaphore;
     const index_t q_block_descale_head_stride;
@@ -359,6 +360,7 @@ struct CollectiveMainloopBwd {
     const int window_size_left;
     const int window_size_right;
     const int target_group_size;
+    const int scaling_seqlen;
     const float alpha;
     int* dq_semaphore;
     const index_t q_block_descale_head_stride;
@@ -460,7 +462,7 @@ struct CollectiveMainloopBwd {
             args.descale_do_ptr, args.descale_do_head_stride, args.descale_dot_ptr, args.descale_dot_head_stride, args.descale_dot_row_stride,
             args.cu_seqlens_descale_qt_ptr, args.cu_seqlens_descale_kt_ptr, args.cu_seqlens_q_block_descale, args.cu_seqlens_kv_block_descale,
             args.func_ptr, args.func_ids_stride, args.window_size_left, args.window_size_right,
-            args.target_group_size, args.alpha, args.dq_semaphore, args.q_block_descale_head_stride, args.kv_block_descale_head_stride};
+            args.target_group_size, args.scaling_seqlen, args.alpha, args.dq_semaphore, args.q_block_descale_head_stride, args.kv_block_descale_head_stride};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best
@@ -1258,7 +1260,7 @@ struct CollectiveMainloopBwd {
         Is_context ? seqlen_traits_k.actual_seq_len_c : 0;
 
     int const actual_seqlen_offset = actual_seqlen_k - actual_seqlen_q;
-    float param_seqlen_q = static_cast<float>(seqlen_traits_q.max_seq_len);
+    float scaling_seq_len = static_cast<float>(mainloop_params.scaling_seqlen);
     int m_block = is_in_context ? 0 : m_block_min;
 
     Tensor mdQaccum = make_tensor(
@@ -1488,7 +1490,7 @@ struct CollectiveMainloopBwd {
       if constexpr (Has_drab) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tdPrdP); ++i) {
-          tdPrdP(i) /= param_seqlen_q;
+          tdPrdP(i) /= scaling_seq_len;
           tdPrdP(i) *= mainloop_params.alpha;
         }
       }
@@ -1819,13 +1821,13 @@ struct CollectiveMainloopBwd {
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tdVrdV); ++i) {
-      tdVrdV(i) /= param_seqlen_q;
+      tdVrdV(i) /= scaling_seq_len;
     }
 
     if constexpr (!Has_drab) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(tdKrdK); ++i) {
-        tdKrdK(i) /= param_seqlen_q;
+        tdKrdK(i) /= scaling_seq_len;
         tdKrdK(i) *= mainloop_params.alpha;
       }
     }
@@ -1964,7 +1966,7 @@ struct CollectiveMainloopBwd {
     int const actual_seqlen_c = Is_context ? seqlen_traits_k.actual_seq_len_c : 0;
 
     int const actual_seqlen_offset = actual_seqlen_k - actual_seqlen_q;
-    float param_seqlen_q = static_cast<float>(seqlen_traits_q.max_seq_len);
+    float scaling_seq_len = static_cast<float>(mainloop_params.scaling_seqlen);
     int m_block = is_in_context ? 0 : m_block_min;
 
     Tensor mdQaccum = make_tensor(make_gmem_ptr(mainloop_params.ptr_dQaccum), mainloop_params.layout_dQaccum)(_, _, bidh);
@@ -2460,7 +2462,7 @@ struct CollectiveMainloopBwd {
       if constexpr (Has_drab) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tdPrdP); ++i) {
-          tdPrdP(i) /= param_seqlen_q;
+          tdPrdP(i) /= scaling_seq_len;
           tdPrdP(i) *= mainloop_params.alpha;
         }
       }
@@ -2662,13 +2664,13 @@ struct CollectiveMainloopBwd {
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tdVrdV); ++i) {
-      tdVrdV(i) /= param_seqlen_q;
+      tdVrdV(i) /= scaling_seq_len;
     }
 
     if constexpr (!Has_drab) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(tdKrdK); ++i) {
-        tdKrdK(i) /= param_seqlen_q;
+        tdKrdK(i) /= scaling_seq_len;
         tdKrdK(i) *= mainloop_params.alpha;
       }
     }

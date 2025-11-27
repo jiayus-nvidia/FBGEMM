@@ -154,7 +154,7 @@ void run_hstu_bwd(Hstu_bwd_params& params, cudaStream_t stream) {
            params.descale_do_ptr, params.descale_do_head_stride, params.descale_dot_ptr, params.descale_dot_head_stride, params.descale_dot_row_stride,
            params.cu_seqlens_descale_qt_ptr, params.cu_seqlens_descale_kt_ptr, params.cu_seqlens_q_block_descale, params.cu_seqlens_kv_block_descale,
            static_cast<int const*>(params.func_ptr), params.func_ids_stride, params.window_size_left, params.window_size_right,
-           params.target_group_size, params.alpha, params.dq_semaphore, params.q_block_descale_head_stride, params.kv_block_descale_head_stride
+           params.target_group_size, params.scaling_seqlen, params.alpha, params.dq_semaphore, params.q_block_descale_head_stride, params.kv_block_descale_head_stride
            });
 
   typename CollectiveEpilogue::Params epilogue_params =
@@ -241,6 +241,7 @@ void run_hstu_bwd(Hstu_bwd_params& params, cudaStream_t stream) {
                params.dq_head_stride), // layout_dQ
            params.total_q,
            params.seqlen_q,
+           params.scaling_seqlen,
            params.alpha,
            params.cu_seqlens_q,
            params.seqused_q});

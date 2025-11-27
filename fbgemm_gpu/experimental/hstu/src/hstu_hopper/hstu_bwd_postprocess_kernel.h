@@ -107,6 +107,7 @@ class FlashAttnBwdPostprocessConvertdQ {
     typename Seqlen_traits::LayoutT layout_dQ;
     const int total_q;
     const int seqlen_q;
+    const int scaling_seqlen;
     const float alpha;
     const int* cu_seqlens_q;
     const int* seqused_q;
@@ -120,6 +121,7 @@ class FlashAttnBwdPostprocessConvertdQ {
     typename Seqlen_traits::LayoutT layout_dQ;
     const int total_q;
     const int seqlen_q;
+    const int scaling_seqlen;
     const float alpha;
     const int* cu_seqlens_q;
     const int* seqused_q;
@@ -143,6 +145,7 @@ class FlashAttnBwdPostprocessConvertdQ {
         args.layout_dQ,
         args.total_q,
         args.seqlen_q,
+        args.scaling_seqlen,
         args.alpha,
         args.cu_seqlens_q,
         args.seqused_q};
@@ -174,7 +177,7 @@ class FlashAttnBwdPostprocessConvertdQ {
         params.cu_seqlens_q,
         params.seqused_q);
     seqlen_traits_q.init(bidb);
-    int const max_seq_len_q = seqlen_traits_q.max_seq_len;
+    int const scaling_seq_len = params.scaling_seqlen;
     int const seqlen = seqlen_traits_q.actual_seq_len;
     int const seqlen_padded = seqlen_traits_q.actual_seq_len_padded;
     if (m_block * kBlockM >= seqlen_padded) {
@@ -239,7 +242,7 @@ class FlashAttnBwdPostprocessConvertdQ {
     if constexpr (!Ktraits::Has_drab) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tdQrdQaccum); ++i) {
-            tdQrdQaccum(i) /= max_seq_len_q;
+            tdQrdQaccum(i) /= scaling_seq_len;
             tdQrdQaccum(i) *= params.alpha;
         }
     }

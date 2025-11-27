@@ -334,6 +334,9 @@ __forceinline__ __device__ void copy(
 // {kBlockM, kBlockN, kNWarps}
 template <int Arch, int kHeadDim, bool Has_rab>
 constexpr std::tuple<int, int, int> get_tile_size_fwd() {
+  if constexpr (Arch == 89) {
+    return {64, 64, 4};
+  }
   if constexpr (Arch == 80) {
     if constexpr (Has_rab) {
       return {128, 64, 8};
@@ -346,26 +349,34 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd() {
         return {128, 96, 8};
       }
     }
-  } else {
-    if constexpr (Has_rab) {
-      if constexpr (kHeadDim <= 128) {
-        return {128, 64, 4};
-      } else {
-        return {64, 32, 4};
-      }
+  }
+  if constexpr (Has_rab) {
+    if constexpr (kHeadDim <= 128) {
+      return {128, 64, 4};
     } else {
-      if constexpr (kHeadDim <= 128) {
-        return {128, 96, 4};
-      } else {
-        return {64, 64, 4};
-      }
+      return {64, 32, 4};
+    }
+  } else {
+    if constexpr (kHeadDim <= 128) {
+      return {128, 96, 4};
+    } else {
+      return {64, 64, 4};
     }
   }
 }
 
 // {kBlockM, kBlockN, kNWarps}
-template <int kHeadDim, bool Has_rab>
+template <int Arch, int kHeadDim, bool Has_rab>
 constexpr std::tuple<int, int, int> get_tile_size_bwd() {
+  if constexpr (Arch == 89) {
+    if constexpr (kHeadDim <= 64) {
+      return {128, 64, 8};
+    } else if constexpr (kHeadDim <= 128) {
+      return {64, 64, 8};
+    } else {
+      return {16, 64, 4};
+    }
+  }
   if constexpr (kHeadDim <= 128) {
     return {64, 128, 8};
   } else {

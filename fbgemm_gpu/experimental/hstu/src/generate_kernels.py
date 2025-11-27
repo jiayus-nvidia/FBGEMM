@@ -130,18 +130,19 @@ template void run_hstu_fwd_8x<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>
 
 #include "hstu_bwd.h"
 
-template void run_hstu_bwd_80<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>
+template void run_hstu_bwd_80<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>
                              (Hstu_bwd_params& params, cudaStream_t stream);
 
     """
-    for hdim, dtype, rab_drab, mask, bwd_deterministic in itertools.product(
-        HEAD_DIMENSIONS, DTYPE_16, RAB_DRAB, MASK, BWD_DETERMINISTIC
+    for hdim, dtype, rab_drab, mask, bwd_deterministic, arch_sm in itertools.product(
+        HEAD_DIMENSIONS, DTYPE_16, RAB_DRAB, MASK, BWD_DETERMINISTIC, ARCH_SM
     ):
-        file_name = f"{install_dir}/hstu_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_fn{ARBITRARY_NFUNC}_{bwd_deterministic}_sm80.cu" if "arbitrary" in mask else f"{install_dir}/hstu_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_{bwd_deterministic}_sm80.cu"
+        file_name = f"{install_dir}/hstu_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_fn{ARBITRARY_NFUNC}_{bwd_deterministic}_sm{arch_sm}.cu" if "arbitrary" in mask else f"{install_dir}/hstu_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_{bwd_deterministic}_sm{arch_sm}.cu"
         if not os.path.exists(file_name):
             with open(file_name, "w") as f:
                 f.write(
                     ampere_bwd_file_head.format(
+                        arch_sm,
                         dtype_to_str[dtype],
                         hdim,
                         "true" if "_rab" in rab_drab else "false",
