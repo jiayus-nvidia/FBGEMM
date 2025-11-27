@@ -1521,26 +1521,26 @@ class HSTUAttentionForwardSm100:
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)  # copy from tmem to rmem
         cute.arch.fence_view_async_tmem_load()
 
+        tSrP_r2t_f32 = cute.make_rmem_tensor(thr_tmem_store.partition_S(tScP).shape, Float32)
+        tSrP_r2t = cute.make_tensor(
+            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout,
+        )
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             # s0_s1_sequence_phase = Int32(1 if stage == 0 else 0)
             # for stage 0, it does not need wait; for stage 1, it needs wait
             cute.arch.mbarrier_wait(mbar_ptr + mbar_s0_s1_sequence_offset + stage, s0_s1_sequence_phase)  
-        tSrP_r2t_f32 = cute.make_rmem_tensor(thr_tmem_store.partition_S(tScP).shape, Float32)
-        tSrP_r2t = cute.make_tensor(
-            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout,
-        )
         fastsilu.silu_x2(tSrS_t2r, tSrP_r2t, tSrS_preds, mask_fn=partial(mask_fn) if mask_fn is not None else None)
         # Sequence barrier arrive
+        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 2):
+            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i]) 
+        cute.arch.fence_view_async_tmem_store()
+
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage))
-        
-        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3):
-            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
-        cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
-        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3, cute.size(tStP_r2t.shape[2])):
+        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 2, cute.size(tStP_r2t.shape[2])):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
         cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that the 2nd half of P is ready

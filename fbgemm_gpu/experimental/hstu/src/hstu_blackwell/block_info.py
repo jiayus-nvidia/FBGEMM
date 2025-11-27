@@ -77,8 +77,8 @@ class BlockInfo:
         sBlockMin = cute.make_tensor(self.sBlockBound, (self.func_num // 2 + 1,))
         sBlockMax = cute.make_tensor(self.sBlockBound + (self.func_num // 2 + 1) * 4, (self.func_num // 2 + 1,))
         sValidBlockIds = self.sValidBlockIds
-        int_max = (1 << 31) - 1
-        int_min = -(1 << 31)
+        int_max = (1 << 31) - 1 # INF_MAX
+        int_min = -(1 << 31)    # INF_MIN
         if cutlass.const_expr(is_calwarp):
             sn_valid_block_max_tensor[0] = 0
             sBlockMin[0] = 0
