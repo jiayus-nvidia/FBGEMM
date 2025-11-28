@@ -51,6 +51,7 @@ from cutlass.cute.typing import Int32, Float32, Float8E4M3FN, Float16, BFloat16,
 
 from .mask import AttentionMask
 from .utils import split_wg
+from .fast_math import FastSilU
 
 """
 A fused multi-head attention (FMHA) backward pass example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -208,10 +209,10 @@ class HSTUAttentionBackwardSm100:
         self.tmem_S_offset = self.tmem_dQ_offset + max(kBlockM, head_dim)
 
         self.num_regs_reduce = 152
-        self.num_regs_compute = 128
-        self.num_regs_mma = 96
-        self.num_regs_empty = 96
-        self.num_regs_load = 96
+        self.num_regs_compute = 128+24
+        self.num_regs_mma = 48
+        self.num_regs_empty = 48
+        self.num_regs_load = 48
 
         self.buffer_align_bytes = 1024
 
@@ -244,6 +245,7 @@ class HSTUAttentionBackwardSm100:
         num_contexts: Optional[cute.Tensor],
         num_targets: Optional[cute.Tensor],
         func: Optional[cute.Tensor],
+        alpha: Float32,
         workspace: cute.Tensor,
         stream: cuda.CUstream,
     ):
@@ -618,6 +620,7 @@ class HSTUAttentionBackwardSm100:
             num_contexts,
             num_targets,
             func,
+            alpha,
             K_smem_layout_staged,
             Q_smem_layout_staged,
             V_smem_layout_staged,
@@ -696,6 +699,7 @@ class HSTUAttentionBackwardSm100:
         num_contexts: Optional[cute.Tensor],
         num_targets: Optional[cute.Tensor],
         func: Optional[cute.Tensor],
+        alpha: Float32,
         K_smem_layout_staged: cute.ComposedLayout,
         Q_smem_layout_staged: cute.ComposedLayout,
         V_smem_layout_staged: cute.ComposedLayout,
@@ -994,6 +998,7 @@ class HSTUAttentionBackwardSm100:
                         blk_offset,
                         problem_shape_cur_batch,
                         max_seqlen_q,
+                        alpha,  
                         iter_count,
                         iter_start,
                         window_size_left,
@@ -1612,6 +1617,7 @@ class HSTUAttentionBackwardSm100:
         blk_offset: cute.Shape,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Tuple[Int32, Int32], Int32]],
         max_seqlen_q: Float32,
+        alpha: Float32,
         iter_count: Int32,
         iter_index: Int32,
         window_size_left: Optional[Int32],
@@ -1702,51 +1708,27 @@ class HSTUAttentionBackwardSm100:
             thr_mma=KQ_thr_mma, thr_tmem_load=thr_t2r,
         )
 
+        fastsilu = FastSilU(alpha)
+
         while iter_count > 0:
             # Wait for S and P
             mma_compute_S_pipeline.consumer_wait(mma_compute_S_consumer_state)
             compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
 
-            # leading_causal_masking = cutlass.Boolean(False)
-            # if cutlass.const_expr(self.is_causal):
-            #     leading_causal_masking = iter_index == blk_coord_k
-            #     leading_causal_masking = cute.arch.shuffle_sync(
-            #         leading_causal_masking, 0
-            #     )
-
-            # trailing_residual_masking = cutlass.Boolean(False)
-            # trailing_residual_masking = iter_index == last_iter or is_residual_k
-            # trailing_residual_masking = cute.arch.shuffle_sync(
-            #     trailing_residual_masking, 0
-            # )
-
             # Compute P = silu(S)
             cute.copy(tiled_t2r, tTR_tST, tTR_rST)
-            mask_fn(tTR_rST, m_block=iter_index)
+            tTR_rST_preds = cute.make_rmem_tensor(tTR_rST.shape, cutlass.Boolean)
+
+            mask_fn(tTR_rST_preds, m_block=iter_index)
             tTR_rST_silu = cute.make_fragment_like(tTR_rST)
 
-            # for i in cutlass.range(cute.size(tTR_rST), unroll_full=True):
-            #     c_transpose = tTR_cST[i]
-            #     pos = (
-            #         cute.get(c_transpose, mode=[1])
-            #         + iter_index * self.tile_shape_Q,
-            #         cute.get(c_transpose, mode=[0])
-            #         + blk_coord_k * self.tile_shape_K,
-            #     )
-            #     if cutlass.const_expr(self.is_causal):
-            #         if pos[0] < pos[1] or not cute.elem_less(pos, (Q, K)):
-            #             tTR_rST[i] = -cutlass.Float32.inf
-            #     if not cute.elem_less(
-            #         pos, (Q, K)
-            #     ):
-            #         tTR_rST[i] = -cutlass.Float32.inf
-
             for i in cutlass.range(0, cute.size(tTR_rST), unroll_full=True):
-                sigmoid_v = 0.5 * cute.math.tanh(tTR_rST[i] * 0.5) + 0.5
+                tTR_rST[i] *= alpha
+                sigmoid_v = 0.5 * cute.math.tanh(tTR_rST[i] * 0.5, fastmath=True) + 0.5
                 out = tTR_rST[i] * sigmoid_v
                 temp = sigmoid_v * (1 + tTR_rST[i] * (1 - sigmoid_v))
-                dsilu_temp = temp if tTR_rST[i] > -10.0 else 0.0
-                silu_out = out if tTR_rST[i] > -10.0 else 0.0
+                dsilu_temp = temp if tTR_rST_preds[i] else 0.0
+                silu_out = out if tTR_rST_preds[i] else 0.0
                 tTR_rST[i] = dsilu_temp
                 tTR_rST_silu[i] = silu_out
 
@@ -1782,6 +1764,7 @@ class HSTUAttentionBackwardSm100:
             cute.copy(tiled_t2r, tTR_tdPT, tTR_rdPT)
 
             for i in cutlass.range(0, cute.size(tTR_rdPT), unroll_full=True):
+                tTR_rdPT[i] *= alpha
                 tTR_rdPT[i] = tTR_rST[i] * tTR_rdPT[i]
 
             # convert fp32 dS to fp16 dS which will be used in the computation of dK and DQ

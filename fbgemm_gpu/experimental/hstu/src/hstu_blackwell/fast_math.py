@@ -100,7 +100,8 @@ class FastDivmod:
 class FastSilU:
     def __init__(self, score_scale: Float32, loc=None, ip=None):
         self._loc = loc
-        self.score_scale = score_scale * 0.5
+        self.score_scale = score_scale
+        self.score_scale_half = score_scale * 0.5
 
     @cute.jit
     def silu_x2(
@@ -113,7 +114,7 @@ class FastSilU:
         for i in cutlass.range_constexpr(0, cute.size(acc_S), 2):
             v0, v1 = mul_packed_f32x2(
                 (acc_S[i], acc_S[i + 1]),
-                (self.score_scale, self.score_scale),
+                (self.score_scale_half, self.score_scale_half),
             )
             tanh_v0 = tanhf(v0)
             tanh_v1 = tanhf(v1)
@@ -134,3 +135,33 @@ class FastSilU:
         # if const_expr(mask_fn is not None):
         #     for i in cutlass.range_constexpr(cute.size(acc_S_converted), unroll_full=True):
         #         acc_S_converted[i] = acc_S_converted[i] if preds[i] else acc_S_converted.element_type(0)
+
+    @cute.jit
+    def dsilu_bwd_x2(
+        self,
+        acc_S: cute.Tensor,
+        acc_S_silu: cute.Tensor,
+        preds: cute.Tensor,
+        mask_fn: Optional[Callable] = None,
+    ):
+        for i in cutlass.range_constexpr(0, cute.size(acc_S), 2):
+            v0, v1 = mul_packed_f32x2(
+                (acc_S[i], acc_S[i + 1]),
+                (self.score_scale, self.score_scale),
+            )
+            tanh_v0 = tanhf(v0)
+            tanh_v1 = tanhf(v1)
+            out_v0, out_v1 = fma_packed_f32x2(
+                (v0, v1),
+                (tanh_v0, tanh_v1),
+                (v0, v1),
+            )
+            acc_S[i] = out_v0 
+            acc_S[i + 1] = out_v1 
+
+        if const_expr(mask_fn is not None):
+            for i in cutlass.range_constexpr(cute.size(acc_S), unroll_full=True):
+                acc_S[i] = acc_S[i] if preds[i] else acc_S.element_type(0)
+                acc_S_silu[i] = acc_S_silu[i] if preds[i] else acc_S_silu.element_type(0)
+
+    

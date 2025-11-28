@@ -125,7 +125,7 @@ class AttentionMask:
     @cute.jit
     def apply_mask_swapAB(
         self,
-        acc_S: cute.Tensor,
+        preds: cute.Tensor,
         wg_idx: cutlass.Int32,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
@@ -144,7 +144,10 @@ class AttentionMask:
         col_limit_right = lambda row: min(self.seqlen_k, row + 1 + self.window_size_right)
         col_limit_left = lambda row: max(0, row - self.window_size_left)
 
-        for i in cutlass.range(cute.size(acc_S), unroll_full=True):
+        for i in cutlass.range(cute.size(preds), unroll_full=True):
+            preds[i] = True
+
+        for i in cutlass.range(cute.size(preds), unroll_full=True):
             block_row = cute.get(tScS_t2r[i], mode=[row_id])
             row = block_row + base_row
             target_index = (row - self.seqlen_h) // self.target_group_size if cutlass.const_expr(self.is_target) else 0
@@ -153,25 +156,23 @@ class AttentionMask:
             col = block_col + base_col
 
             if col >= self.seqlen_k or row >= self.seqlen_q + seqlen_offset:
-                acc_S[i] = -cutlass.Float32.inf
+                preds[i] = False
             if cutlass.const_expr(self.is_arbitrary):
                 func_row = row + self.offset_q - seqlen_offset
                 for j in cutlass.range(self.func_num // 2, unroll_full=True):
                     if col >= self.func[2*j, func_row].value and col < self.func[2*j+1, func_row].value:
-                        acc_S[i] = -cutlass.Float32.inf
+                        preds[i] = False
                 if col >= self.func[self.func_num - 1, func_row].value:
-                    acc_S[i] = -cutlass.Float32.inf
+                    preds[i] = False
             else:
-                skip = False
+                if col >= col_limit_right(row):
+                    preds[i] = False
+                if cutlass.const_expr(self.is_local):
+                    if col < col_limit_left(row):
+                        preds[i] = False
+                if cutlass.const_expr(self.is_target):
+                    if row >= self.seqlen_h and col >= self.seqlen_h and col < target_col_limit_left:
+                        preds[i] = False
                 if cutlass.const_expr(self.is_context):
                     if row < self.seqlen_c and col < self.seqlen_h:
-                        skip = True
-                if not skip:
-                    if col >= col_limit_right(row):
-                        acc_S[i] = -cutlass.Float32.inf
-                    if cutlass.const_expr(self.is_local):
-                        if col < col_limit_left(row):
-                            acc_S[i] = -cutlass.Float32.inf
-                    if cutlass.const_expr(self.is_target):
-                        if row >= self.seqlen_h and col >= self.seqlen_h and col < target_col_limit_left:
-                            acc_S[i] = -cutlass.Float32.inf
+                        preds[i] = True

@@ -55,7 +55,6 @@ class HSTUAttentionForwardSm100:
         target_group_size: int = 1,
         is_arbitrary: bool = False,
         func_num: int = 0,
-        alpha: float = 1.0,
         kBlockM: int = 128,
         kBlockN: int = 128,
         is_persistent: bool = True,
@@ -78,8 +77,7 @@ class HSTUAttentionForwardSm100:
         assert self.q_stage in [1, 2]
         assert self.s_stage in [2]
 
-        # self.enable_offset_dynamic = True if self.q_stage == 2 else False
-        self.enable_offset_dynamic = False
+        self.enable_offset_dynamic = True if self.q_stage == 2 else False
         # q_stage Q tile per CTA
         self.cta_tiler = (self.q_stage * kBlockM, kBlockN, self.head_dim_padded)
         self.mma_tiler_qk = (kBlockM, kBlockN, self.head_dim_padded)
@@ -95,11 +93,10 @@ class HSTUAttentionForwardSm100:
         self.is_arbitrary = is_arbitrary
         self.func_num = func_num
         self.target_group_size = target_group_size
-        self.alpha = alpha
         self.qhead_per_kvhead = qhead_per_kvhead
         # Does S1 need to wait for S0 to finish
         self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local) and self.q_stage == 2
-        self.s0_s1_barrier = True  # Performance drop, TODO: check it
+        self.s0_s1_barrier = False  # Performance drop, TODO: check it
         self.overlap_sO_sQ = self.head_dim_padded == 192 and self.head_dim_v_padded >= 64 and not self.is_arbitrary
         if self.overlap_sO_sQ:
             assert self.head_dim_padded >= self.head_dim_v_padded  # We assume sQ is larger than sO
@@ -1462,7 +1459,8 @@ class HSTUAttentionForwardSm100:
                     mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block)
 
             # epilogue step
-            store_O(seqlen=seqlen, scale=cute.arch.rcp_approx(seqlen.max_seqlen_q), m_block=m_block, head_idx=head_idx, stage=stage, epi_consumer_phase=epi_consumer_phase)
+            if self.q_stage == 2 or stage == 1:
+                store_O(seqlen=seqlen, scale=cute.arch.rcp_approx(seqlen.max_seqlen_q), m_block=m_block, head_idx=head_idx, stage=stage if self.q_stage == 2 else 0, epi_consumer_phase=epi_consumer_phase)
 
             # Advance to next tile
             epi_consumer_phase ^= 1

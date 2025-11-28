@@ -199,7 +199,7 @@ def hstu_varlen_bwd_100(
             func_num=func_num,
         )
         with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
-            hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(hstu_bwd_sm100, problem_shape, q_tensor, k_tensor, v_tensor, dq_tensor, dk_tensor, dv_tensor, do_tensor, cu_seqlens_q_tensor, cu_seqlens_k_tensor, Int32(window_size_left), Int32(window_size_right), num_contexts_tensor, num_targets_tensor, func_tensor, workspace, current_stream)
+            hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(hstu_bwd_sm100, problem_shape, q_tensor, k_tensor, v_tensor, dq_tensor, dk_tensor, dv_tensor, do_tensor, cu_seqlens_q_tensor, cu_seqlens_k_tensor, Int32(window_size_left), Int32(window_size_right), num_contexts_tensor, num_targets_tensor, func_tensor, alpha, workspace, current_stream)
 
     with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
         hstu_varlen_bwd_100.compile_cache[compile_key](
@@ -218,6 +218,7 @@ def hstu_varlen_bwd_100(
         num_contexts_tensor,
         num_targets_tensor,
         func_tensor,
+        alpha,
         workspace,
         current_stream
     )
