@@ -68,6 +68,7 @@ class AttentionMask:
         n_block: cutlass.Int32,
         thr_mma: cute.TiledMma,
         thr_tmem_load: cute.TiledCopy,
+        mask_target: cutlass.Constexpr[bool],
     ) -> None:
         seqlen_offset = self.seqlen_k - self.seqlen_q
         cS = cute.make_identity_tensor((self.kBlockM, self.kBlockN))
@@ -113,7 +114,7 @@ class AttentionMask:
                 if cutlass.const_expr(self.is_local):
                     if col < col_limit_left:
                         preds[i] = False
-                if cutlass.const_expr(self.is_target):
+                if cutlass.const_expr(self.is_target and mask_target):
                     if row >= self.seqlen_h and col >= self.seqlen_h and col < target_col_limit_left:
                     # i think we could remove row >= self.seqlen_h condition, but get worse performance (102us vs 96us)
                     # if col >= self.seqlen_h and col < target_col_limit_left:

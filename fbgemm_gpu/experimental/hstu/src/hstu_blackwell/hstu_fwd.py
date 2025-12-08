@@ -96,8 +96,8 @@ class HSTUAttentionForwardSm100:
         self.qhead_per_kvhead = qhead_per_kvhead
         # Does S1 need to wait for S0 to finish
         self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local) and self.q_stage == 2
-        self.s0_s1_barrier = False  # Performance drop, TODO: check it
-        self.overlap_sO_sQ = self.head_dim_padded == 192 and self.head_dim_v_padded >= 64 and not self.is_arbitrary
+        self.s0_s1_barrier = False  # Performance drop, 
+        self.overlap_sO_sQ = (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or (self.is_arbitrary and self.q_stage == 2)
         if self.overlap_sO_sQ:
             assert self.head_dim_padded >= self.head_dim_v_padded  # We assume sQ is larger than sO
             self.is_persistent = False
@@ -626,10 +626,10 @@ class HSTUAttentionForwardSm100:
             num_contexts=num_contexts, num_targets=num_targets,
         )
         AttentionMaskCls = partial(
-            AttentionMask, self.kBlockM, self.kBlockN, self.cta_tiler,
-            self.is_arbitrary, self.is_causal, self.is_local, self.is_context, self.is_target,
+            AttentionMask, kBlockM=self.kBlockM, kBlockN=self.kBlockN, cta_tiler=self.cta_tiler,
+            is_arbitrary=self.is_arbitrary, is_causal=self.is_causal, is_local=self.is_local, is_context=self.is_context, is_target=self.is_target,
             target_group_size=self.target_group_size, func_num=self.func_num,
-            window_size_left=window_size_left, window_size_right=window_size_right,
+            window_size_left=window_size_left, window_size_right=window_size_right, 
             swapAB=False,
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
@@ -1391,9 +1391,13 @@ class HSTUAttentionForwardSm100:
             sValidBlockIds = block_info.sValidBlockIds
             # func: (head_func, n_func, L_func) -> (n_func, L_func)
             func_tensor = func[0, None, None] if func is not None else None
-            mask = AttentionMaskCls(offset_q=seqlen.offset_q, seqlen_q=seqlen.seqlen_q, seqlen_k=seqlen.seqlen_k, seqlen_c=seqlen.seqlen_c, seqlen_h=seqlen.seqlen_h, offset_dynamic=offset_dynamic, func=func_tensor)
+
+            # m_block consider q stage
+            m_block = self.q_stage * m_block + (stage if self.q_stage == 2 else 0)
+            mask = AttentionMaskCls(
+                offset_q=seqlen.offset_q, seqlen_q=seqlen.seqlen_q, seqlen_k=seqlen.seqlen_k, seqlen_c=seqlen.seqlen_c, seqlen_h=seqlen.seqlen_h, offset_dynamic=offset_dynamic, func=func_tensor)
             mask_fn = partial(
-                mask.apply_mask, m_block=self.q_stage * m_block + (stage if self.q_stage == 2 else 0), thr_mma=thr_mma_qk, thr_tmem_load=thr_tmem_load,
+                mask.apply_mask, m_block=m_block, thr_mma=thr_mma_qk, thr_tmem_load=thr_tmem_load
             )
             # mask_fn = partial(
             #     mask.apply_mask_causal, m_block=self.q_stage * m_block + (stage if self.q_stage == 2 else 0), thr_mma=thr_mma_qk, thr_tmem_load=thr_tmem_load,
@@ -1415,7 +1419,7 @@ class HSTUAttentionForwardSm100:
                 stage=stage,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
-                m_block=self.q_stage * m_block + (stage if self.q_stage == 2 else 0),
+                m_block=m_block,
                 seqlen=seqlen,
                 buffers=buffers,
                 fastdiv_mods=fastdiv_mods,
@@ -1423,9 +1427,20 @@ class HSTUAttentionForwardSm100:
             wg_stride = 1 if self.q_stage == 2 else 2
             n_block_valid = n_block_max - 1 - (0 if self.q_stage == 2 else stage)
             masking_step = 0 if self.q_stage == 2 else stage
+            
+            if const_expr(self.is_arbitrary or self.is_local):
+                while n_block_valid >= n_block_min:
+                    n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
+                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=False))
+                    masking_step += wg_stride
+                    n_block_valid -= wg_stride
+            
             while n_block_valid >= n_block_min and masking_step < n_masking_steps:
-                n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
-                mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
+                n_block = n_block_valid
+                if self.is_target and (m_block + 1) * self.kBlockN > seqlen.seqlen_h:
+                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=True))
+                else:
+                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=False))
                 masking_step += wg_stride
                 n_block_valid -= wg_stride
 
@@ -1433,30 +1448,15 @@ class HSTUAttentionForwardSm100:
                 n_block_valid = min(n_block_valid, n_block_history - 1) # 1
                 n_block_valid = n_block_valid if (self.q_stage == 2 or masking_step == n_masking_steps) else min(n_block_valid, n_block_history - 2)
                 if n_block_valid == n_block_history - 1:
-                    n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
+                    n_block = n_block_valid
                     if (n_block + 1) * self.kBlockN > seqlen.seqlen_h:
-                        mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
+                        mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=True))
                         n_block_valid -= wg_stride
             
-            while n_block_valid > n_block_min:
-                n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
-                # for local case, we need to apply mask to the last block cause tile size is square 128*128, but when seq_q != seq_k, the conclusion may not solid
-                # For the sake of convenience, I apply masking to all n_tiles. If the customer has optimization requirements, I will then consider the local scenarios separately.
-                if const_expr(self.is_local or self.is_arbitrary): 
-                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn)) 
-                else:
-                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block)
+            while n_block_valid >= n_block_min:
+                n_block = n_block_valid
+                mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block)
                 n_block_valid -= wg_stride
-
-            
-            # for local case, we need to apply mask to the last block cause tile size is square 128*128
-            assert const_expr(self.kBlockM == self.kBlockN)
-            if n_block_valid == n_block_min:
-                n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
-                if const_expr(self.is_local or self.is_arbitrary):
-                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn)) 
-                else:
-                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block)
 
             # epilogue step
             if self.q_stage == 2 or stage == 1:
@@ -1563,7 +1563,7 @@ class HSTUAttentionForwardSm100:
         mbar_ptr: cute.Pointer,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
-        offset = seqlen.offset_q + (self.q_stage * m_block + stage) * self.kBlockM
+        offset = seqlen.offset_q + m_block * self.kBlockM
         offset_dynamic = (self.cta_tiler[0] - (seqlen.seqlen_q & (self.cta_tiler[0] - 1))) & (self.cta_tiler[0] - 1)
         offset_dynamic = 0 if (offset_dynamic <= self.kBlockM or not self.enable_offset_dynamic) else offset_dynamic
         mO_cur = cute.domain_offset((offset - offset_dynamic, 0), mO[None, None, head_idx])
@@ -1618,7 +1618,7 @@ class HSTUAttentionForwardSm100:
         tOcO = gmem_thr_copy_O.partition_S(cO)
         t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
         tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
-        base_row = (self.q_stage * m_block + stage) * self.kBlockM
+        base_row = m_block * self.kBlockM
         for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
             # 1% better performance than tOcO[0, rest_m, 0][0] < seqlen.seqlen_q - (self.q_stage * m_block + stage) * self.kBlockM
             row = t0OcO[0, rest_m, 0][0] + tOcO[0][0] + base_row
