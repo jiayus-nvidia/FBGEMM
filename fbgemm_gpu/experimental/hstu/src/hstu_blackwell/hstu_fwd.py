@@ -54,6 +54,7 @@ class HSTUAttentionForwardSm100:
         is_target: bool = False,
         target_group_size: int = 1,
         is_arbitrary: bool = False,
+        is_paged: bool = False,
         func_num: int = 0,
         kBlockM: int = 128,
         kBlockN: int = 128,
@@ -91,6 +92,7 @@ class HSTUAttentionForwardSm100:
         self.is_context = is_context
         self.is_target = is_target 
         self.is_arbitrary = is_arbitrary
+        self.is_paged = is_paged
         self.func_num = func_num
         self.target_group_size = target_group_size
         self.qhead_per_kvhead = qhead_per_kvhead
@@ -179,6 +181,9 @@ class HSTUAttentionForwardSm100:
         window_size_left: Int32 | int,
         window_size_right: Int32 | int,
         func: Optional[cute.Tensor],
+        mPagedKV: Optional[cute.Tensor],
+        page_ids: Optional[cute.Tensor],
+        page_indptrs: Optional[cute.Tensor],
         buffers = None  # Not typing for now since conversion behaves a lil funny
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -215,6 +220,11 @@ class HSTUAttentionForwardSm100:
         ]
         V_layout_transpose = [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
+
+        mPagedKV = cute.make_tensor(mPagedKV.iterator, cute.make_layout(mPagedKV.shape, stride=new_stride(mPagedKV))) if mPagedKV is not None else None
+        mPagedK = cute.make_tensor(mPagedKV.iterator, cute.select(mPagedKV.layout, mode=KV_layout_transpose)) if mPagedKV is not None else None
+        mPagedV = cute.make_tensor(mPagedKV.iterator, cute.select(mPagedKV.layout, mode=KV_layout_transpose)) if mPagedKV is not None else None
+        mPagedV = cute.make_tensor(mPagedV.iterator, cute.select(mPagedV.layout, mode=V_layout_transpose)) if mPagedV is not None else None
 
         self.q_major_mode = cutlass.utils.LayoutEnum.from_tensor(mQ).mma_major_mode()
         self.k_major_mode = cutlass.utils.LayoutEnum.from_tensor(mK).mma_major_mode()
@@ -318,6 +328,26 @@ class HSTUAttentionForwardSm100:
             tiled_mma_pv,
             self.cluster_layout_vmnk.shape,
         )
+        # TMA load for PagedKV
+        tma_atom_Kp, tma_tensor_Kp = None, None
+        tma_atom_Vp, tma_tensor_Vp = None, None
+        if const_expr(self.is_paged):
+            tma_atom_Kp, tma_tensor_Kp = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                mPagedK,
+                cute.select(sK_layout, mode=[0, 1, 2]),
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+                self.cluster_layout_vmnk.shape,
+            )
+            tma_atom_Vp, tma_tensor_Vp = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                mPagedV,
+                cute.select(sV_layout, mode=[0, 1, 2]),
+                self.mma_tiler_pv,
+                tiled_mma_pv,
+                self.cluster_layout_vmnk.shape,
+            )
 
         num_epilogue_threads = cute.arch.WARP_SIZE * len(self.silu1_warp_ids)
         universal_copy_bits = 128
@@ -455,6 +485,12 @@ class HSTUAttentionForwardSm100:
             tile_sched_params,
             buffers,
             fastdiv_mods,
+            tma_atom_Kp,
+            tma_atom_Vp,
+            tma_tensor_Kp,
+            tma_tensor_Vp,
+            page_ids,
+            page_indptrs,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -496,6 +532,12 @@ class HSTUAttentionForwardSm100:
         tile_sched_params: ParamsBase,
         buffers = None,
         fastdiv_mods = (None, None),
+        tma_atom_Kp: Optional[cute.CopyAtom] = None,
+        tma_atom_Vp: Optional[cute.CopyAtom] = None,
+        mPagedK: Optional[cute.Tensor] = None,
+        mPagedV: Optional[cute.Tensor] = None,
+        page_ids: Optional[cute.Tensor] = None,
+        page_indptrs: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -604,7 +646,7 @@ class HSTUAttentionForwardSm100:
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
             self.kBlockM, self.kBlockN, self.cta_tiler, self.is_causal, self.is_local, 
-            self.is_context, self.is_target, self.target_group_size,
+            self.is_context, self.is_target, self.target_group_size, self.is_paged,
             window_size_left, window_size_right, 
             storage.sn_valid_block_max.data_ptr(), sValidBlockIdsTensor,
             storage.sBlockBound.data_ptr(), self.func_num, func_tensor,
@@ -624,6 +666,7 @@ class HSTUAttentionForwardSm100:
             max_seqlen_k=max_seqlen_k,
             cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
             num_contexts=num_contexts, num_targets=num_targets,
+            page_indptrs=page_indptrs,
         )
         AttentionMaskCls = partial(
             AttentionMask, kBlockM=self.kBlockM, kBlockN=self.kBlockN, cta_tiler=self.cta_tiler,
@@ -646,24 +689,50 @@ class HSTUAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
-            self.load(
-                thr_mma_qk,
-                thr_mma_pv,
-                mQ,
-                mK,
-                mV,
-                sQ,
-                sK,
-                sV,
-                tma_atom_Q,
-                tma_atom_K,
-                tma_atom_V,
-                pipeline_kv,
-                mbar_ptr,
-                block_info,
-                SeqlenInfoCls,
-                TileSchedulerCls,
-            )
+            if const_expr(not self.is_paged):
+                self.load(
+                    thr_mma_qk,
+                    thr_mma_pv,
+                    mQ,
+                    mK,
+                    mV,
+                    sQ,
+                    sK,
+                    sV,
+                    tma_atom_Q,
+                    tma_atom_K,
+                    tma_atom_V,
+                    pipeline_kv,
+                    mbar_ptr,
+                    block_info,
+                    SeqlenInfoCls,
+                    TileSchedulerCls,
+                )
+            else:
+                self.load_paged(
+                    thr_mma_qk,
+                    thr_mma_pv,
+                    mQ,
+                    mK,
+                    mV,
+                    sQ,
+                    sK,
+                    sV,
+                    tma_atom_Q,
+                    tma_atom_K,
+                    tma_atom_V,
+                    pipeline_kv,
+                    mbar_ptr,
+                    block_info,
+                    SeqlenInfoCls,
+                    TileSchedulerCls,
+                    tma_atom_Kp,
+                    tma_atom_Vp,
+                    mPagedK,
+                    mPagedV,
+                    page_ids,
+                    page_indptrs,
+                )
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
@@ -851,7 +920,7 @@ class HSTUAttentionForwardSm100:
                 mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
                 K_or_V="V",
             )
-            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
+            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
             if const_expr(self.is_arbitrary):
                 n_block_max, n_block_min = block_info.get_valid_block_ids(seqlen, m_block, n_block_max, n_block_min, is_calwarp=True)
             sValidBlockIds = block_info.sValidBlockIds
@@ -938,6 +1007,231 @@ class HSTUAttentionForwardSm100:
             # End of persistent scheduler loop
 
     @cute.jit
+    def load_paged(
+        self,
+        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_pv: cute.core.ThrMma,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        sQ: cute.Tensor,
+        sK: cute.Tensor,
+        sV: cute.Tensor,
+        tma_atom_Q: cute.CopyAtom,
+        tma_atom_K: cute.CopyAtom,
+        tma_atom_V: cute.CopyAtom,
+        pipeline_kv: cutlass.pipeline.PipelineAsync,
+        mbar_ptr: cute.Pointer,
+        block_info: BlockInfo,
+        SeqlenInfoCls: Callable,
+        TileSchedulerCls: Callable,
+        tma_atom_Kp: cute.CopyAtom,
+        tma_atom_Vp: cute.CopyAtom,
+        mPagedK: cute.Tensor,
+        mPagedV: cute.Tensor,
+        page_ids: cute.Tensor,
+        page_indptrs: cute.Tensor,
+    ):
+        q_producer_phase = Int32(1)
+        kv_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.kv_stage)
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            m_block, head_idx, batch_idx = work_tile.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            offset = seqlen.offset_q
+            offset_dynamic = (self.cta_tiler[0] - (seqlen.seqlen_q & (self.cta_tiler[0] - 1))) & (self.cta_tiler[0] - 1)
+            offset_dynamic = 0 if (offset_dynamic <= self.kBlockM or not self.enable_offset_dynamic) else offset_dynamic
+            mQ_cur = cute.domain_offset((offset - offset_dynamic, 0), mQ[None, None, head_idx])
+            gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
+            page_ind = seqlen.page_ind
+            page_idx = 0
+
+            head_idx_kv = head_idx // self.qhead_per_kvhead
+
+            offset_kv = seqlen.offset_q + seqlen.seqlen_q + seqlen.seqlen_h - seqlen.seqlen_k 
+            mK_cur = cute.domain_offset((offset_kv, 0), mK[None, None, head_idx_kv])
+            mV_cur = cute.domain_offset((0, offset_kv), mV[None, None, head_idx_kv])
+            gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+            gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+
+            mK_paged = mPagedK[None, None, head_idx_kv]  #(#tokens, headdim, head_idx)
+            mV_paged = mPagedV[None, None, head_idx_kv]  #(headdim, #tokens, head_idx)
+            gK_paged = cute.local_tile(mK_paged, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+            gV_paged = cute.local_tile(mV_paged, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+
+            tSgQ = thr_mma_qk.partition_A(gQ)
+            tSgK = thr_mma_qk.partition_B(gK)
+            tOgV = thr_mma_pv.partition_B(gV)
+            tQsQ, tQgQ = cpasync.tma_partition(
+                tma_atom_Q,
+                0,  # no multicast
+                cute.make_layout(1),
+                cute.group_modes(sQ, 0, 3),
+                cute.group_modes(tSgQ, 0, 3),
+            )
+            tKsK, tKgK = cpasync.tma_partition(
+                tma_atom_K,
+                0,  # no multicast
+                cute.make_layout(1),
+                cute.group_modes(sK, 0, 3),
+                cute.group_modes(tSgK, 0, 3),
+            )
+            tVsV, tVgV = cpasync.tma_partition(
+                tma_atom_V,
+                0,  # no multicast
+                cute.make_layout(1),
+                cute.group_modes(sV, 0, 3),
+                cute.group_modes(tOgV, 0, 3),
+            )
+
+            tSgKp = thr_mma_qk.partition_B(gK_paged)
+            tOgVp = thr_mma_pv.partition_B(gV_paged)
+            tKsKp, tKgKp = cpasync.tma_partition(
+                tma_atom_Kp,
+                0,  # no multicast
+                cute.make_layout(1),
+                cute.group_modes(sK, 0, 3),
+                cute.group_modes(tSgKp, 0, 3),
+            )
+            tVsVp, tVgVp = cpasync.tma_partition(
+                tma_atom_Vp,
+                0,  # no multicast
+                cute.make_layout(1),
+                cute.group_modes(sV, 0, 3),
+                cute.group_modes(tOgVp, 0, 3),
+            )
+
+            load_Q = partial(
+                self.load_Q, tma_atom_Q, tQgQ, tQsQ,
+                mbar_ptr + self.mbar_load_q_full_offset, mbar_ptr + self.mbar_load_q_empty_offset,
+                phase=q_producer_phase,
+            )
+            # We have to use mbarrier directly in the load for KV instead of replying on
+            # pipeline_kv, because we could have different number of TMA bytes for K and V
+            load_K = partial(
+                self.load_KV, tma_atom_K, tKgK, tKsK,
+                mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
+                K_or_V="K",
+            )
+            load_V = partial(
+                self.load_KV, tma_atom_V, tVgV, tVsV,
+                mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
+                K_or_V="V",
+            )
+
+            load_Kp = partial(
+                self.load_KV, tma_atom_Kp, tKgKp, tKsKp,
+                mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
+                K_or_V="K",
+            )
+            load_Vp = partial(
+                self.load_KV, tma_atom_Vp, tVgVp, tVsVp,
+                mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
+                K_or_V="V",
+            )
+            tidx, _, _ = cute.arch.thread_idx()
+
+            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, n_block_target_min = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
+            n_block = n_block_max - 1
+
+            if const_expr(self.q_stage == 2):
+                load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
+                if n_block < n_block_history:
+                    page_idx = page_ids[n_block + page_ind] * 2
+                    load_Kp(block=page_idx, producer_state=kv_producer_state)  # K0
+                else:
+                    load_K(block=n_block-n_block_history, producer_state=kv_producer_state)  # K0
+                kv_producer_state.advance()
+                load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1
+                q_producer_phase ^= 1
+                if n_block < n_block_history:
+                    page_idx = page_ids[n_block + page_ind] * 2 + 1
+                    load_Vp(block=page_idx, producer_state=kv_producer_state)  # V0
+                else:
+                    load_V(block=n_block-n_block_history, producer_state=kv_producer_state)  # V0
+                kv_producer_state.advance()
+                masking_step = 0
+                n_block_valid = n_block_max - 1
+                if is_jump and masking_step == n_masking_steps - 1:
+                    n_block_valid = min(n_block_valid, n_block_history)
+                masking_step += 1
+                n_block_valid -= 1
+
+                while n_block_valid >= n_block_target_min:
+                    n_block = n_block_valid - n_block_history
+                    load_K(block=n_block, producer_state=kv_producer_state)  # Ki
+                    kv_producer_state.advance()
+                    load_V(block=n_block, producer_state=kv_producer_state)  # Vi
+                    kv_producer_state.advance()
+                    n_block_valid -= 1
+                if n_block_max > n_block_history:
+                    n_block_valid = n_block_history - 1
+
+                while n_block_valid >= n_block_min:
+                    n_block = n_block_valid
+                    page_idx = page_ids[n_block + page_ind] * 2
+                    load_Kp(block=page_idx, producer_state=kv_producer_state)  # Ki
+                    kv_producer_state.advance()
+                    v_page_idx = page_ids[n_block + page_ind] * 2 + 1
+                    load_Vp(block=v_page_idx, producer_state=kv_producer_state)  # Vi
+                    kv_producer_state.advance()
+                    n_block_valid -= 1
+                
+                tile_scheduler.prefetch_next_work()
+                tile_scheduler.advance_to_next_work()
+                work_tile = tile_scheduler.get_current_work()
+            elif const_expr(self.q_stage == 1):
+                load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
+                q_producer_phase ^= 1
+                page_idx_k = 0
+                page_idx_v = 0
+                if n_block < n_block_history:
+                    page_idx_k = page_ids[n_block + page_ind] * 2
+                    load_Kp(block=page_idx_k, producer_state=kv_producer_state)  # K0
+                    page_idx_v = page_idx_k + 1
+                else:
+                    load_K(block=n_block-n_block_history, producer_state=kv_producer_state)  # K0
+                kv_producer_state.advance()
+
+                # From target: K(i+1), V(i)
+                while n_block > n_block_target_min:
+                    load_K(block=n_block-1-n_block_history, producer_state=kv_producer_state)
+                    kv_producer_state.advance()
+                    load_V(block=n_block-n_block_history, producer_state=kv_producer_state)
+                    kv_producer_state.advance()
+                    n_block -= 1
+                
+                # From history: K(i+1); target: V(i)
+                if n_block == n_block_target_min:
+                    n_block_valid_k = min(n_block - 1, n_block_history - 1)
+                    page_idx_k = page_ids[n_block_valid_k + page_ind] * 2
+                    load_Kp(block=page_idx_k, producer_state=kv_producer_state)  # K0
+                    kv_producer_state.advance()
+                    load_V(block=n_block-n_block_history, producer_state=kv_producer_state)
+                    kv_producer_state.advance()
+                    n_block = n_block_valid_k
+                    page_idx_v = page_idx_k + 1
+
+                # From history: K(i+1), V(i)
+                while n_block - 1 >= n_block_min:
+                    page_idx_k = page_ids[n_block - 1 + page_ind] * 2
+                    load_Kp(block=page_idx_k, producer_state=kv_producer_state)  # K0
+                    kv_producer_state.advance()
+                    load_Vp(block=page_idx_v, producer_state=kv_producer_state)
+                    kv_producer_state.advance()
+                    n_block -= 1
+                    page_idx_v = page_idx_k + 1
+
+                # assert n_block == n_block_min
+                load_Vp(block=page_idx_v, producer_state=kv_producer_state)  # V0
+                
+                tile_scheduler.prefetch_next_work()
+                tile_scheduler.advance_to_next_work()
+                work_tile = tile_scheduler.get_current_work()
+            ### End of persistent scheduler loop
+
+    @cute.jit
     def mma(
         self,
         tiled_mma_qk: cute.core.ThrMma,
@@ -999,7 +1293,7 @@ class HSTUAttentionForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             offset_dynamic = (self.cta_tiler[0] - (seqlen.seqlen_q & (self.cta_tiler[0] - 1))) & (self.cta_tiler[0] - 1)
             offset_dynamic = 0 if (offset_dynamic <= self.kBlockM or not self.enable_offset_dynamic) else offset_dynamic
-            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
+            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
             if const_expr(self.is_arbitrary):
                 n_block_max, n_block_min = block_info.get_valid_block_ids(seqlen, m_block, n_block_max, n_block_min, is_calwarp=False)
             n_block_nums = n_block_max - n_block_min
@@ -1197,7 +1491,7 @@ class HSTUAttentionForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             offset_dynamic = (self.cta_tiler[0] - (seqlen.seqlen_q & (self.cta_tiler[0] - 1))) & (self.cta_tiler[0] - 1)
             offset_dynamic = 0 if (offset_dynamic <= self.kBlockM or not self.enable_offset_dynamic) else offset_dynamic
-            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
+            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
             if const_expr(self.is_arbitrary):
                 n_block_max, n_block_min = block_info.get_valid_block_ids(seqlen, m_block, n_block_max, n_block_min, is_calwarp=False)
             sValidBlockIds = block_info.sValidBlockIds
@@ -1385,7 +1679,7 @@ class HSTUAttentionForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             offset_dynamic = (self.cta_tiler[0] - (seqlen.seqlen_q & (self.cta_tiler[0] - 1))) & (self.cta_tiler[0] - 1)
             offset_dynamic = 0 if (offset_dynamic <= self.kBlockM or not self.enable_offset_dynamic) else offset_dynamic
-            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
+            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, n_block_target_min = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
             if const_expr(self.is_arbitrary):
                 n_block_max, n_block_min = block_info.get_valid_block_ids(seqlen, m_block, n_block_max, n_block_min, is_calwarp=False)
             sValidBlockIds = block_info.sValidBlockIds
@@ -1438,12 +1732,18 @@ class HSTUAttentionForwardSm100:
             while n_block_valid >= n_block_min and masking_step < n_masking_steps:
                 n_block = n_block_valid
                 if self.is_target and (n_block + 1) * self.kBlockN > seqlen.seqlen_h:
-                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=True))
+                    if const_expr(not self.is_paged):
+                        mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=True))
+                    else:
+                        if n_block >= n_block_history:
+                            mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, (n_block - n_block_history), mask_fn=partial(mask_fn, mask_target=True, mask_paged=1))
+                        else:
+                            mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_paged=-1))
                 else:
                     mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=False))
                 masking_step += wg_stride
                 n_block_valid -= wg_stride
-
+            
             if is_jump and n_block_valid >= n_block_min:
                 n_block_valid = min(n_block_valid, n_block_history - 1) # 1
                 n_block_valid = n_block_valid if (self.q_stage == 2 or masking_step == n_masking_steps) else min(n_block_valid, n_block_history - 2)
