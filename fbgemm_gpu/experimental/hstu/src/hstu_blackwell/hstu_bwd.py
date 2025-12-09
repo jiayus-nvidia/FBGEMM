@@ -50,7 +50,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Float32, Float8E4M3FN, Float16, BFloat16, Boolean
 
 from .mask import AttentionMask
-from .utils import split_wg
+from .utils import split_wg, tanhf, mul_packed_f32x2, fma_packed_f32x2, sub_packed_f32x2, add_packed_f32x2
 from .fast_math import FastSilU
 
 """
@@ -209,10 +209,10 @@ class HSTUAttentionBackwardSm100:
         self.tmem_S_offset = self.tmem_dQ_offset + max(kBlockM, head_dim)
 
         self.num_regs_reduce = 152
-        self.num_regs_compute = 128+24
-        self.num_regs_mma = 48
-        self.num_regs_empty = 48
-        self.num_regs_load = 48
+        self.num_regs_compute = 128
+        self.num_regs_mma = 96
+        self.num_regs_empty = 96
+        self.num_regs_load = 96
 
         self.buffer_align_bytes = 1024
 
@@ -1718,19 +1718,39 @@ class HSTUAttentionBackwardSm100:
             # Compute P = silu(S)
             cute.copy(tiled_t2r, tTR_tST, tTR_rST)
             tTR_rST_preds = cute.make_rmem_tensor(tTR_rST.shape, cutlass.Boolean)
+            for i in cutlass.range(0, cute.size(tTR_rST), unroll_full=True):
+                tTR_rST_preds[i] = True
 
             mask_fn(tTR_rST_preds, m_block=iter_index)
             tTR_rST_silu = cute.make_fragment_like(tTR_rST)
 
-            for i in cutlass.range(0, cute.size(tTR_rST), unroll_full=True):
-                tTR_rST[i] *= alpha
-                sigmoid_v = 0.5 * cute.math.tanh(tTR_rST[i] * 0.5, fastmath=True) + 0.5
-                out = tTR_rST[i] * sigmoid_v
-                temp = sigmoid_v * (1 + tTR_rST[i] * (1 - sigmoid_v))
-                dsilu_temp = temp if tTR_rST_preds[i] else 0.0
-                silu_out = out if tTR_rST_preds[i] else 0.0
-                tTR_rST[i] = dsilu_temp
-                tTR_rST_silu[i] = silu_out
+            # fastsilu.dsilu_bwd_x2(tTR_rST, tTR_rST_silu, tTR_rST_preds, mask_fn)
+            # for i in cutlass.range(0, cute.size(tTR_rST), unroll_full=True):
+            #     tTR_rST[i] *= alpha
+            #     sigmoid_v = 0.5 * cute.math.tanh(tTR_rST[i] * 0.5, fastmath=True) + 0.5
+            #     out = tTR_rST[i] * sigmoid_v
+            #     temp = sigmoid_v * (1 + tTR_rST[i] * (1 - sigmoid_v)) = silu*(1-sigmoid) + (1-sigmoid) #
+            #     dsilu_temp = temp if tTR_rST_preds[i] else 0.0
+            #     silu_out = out if tTR_rST_preds[i] else 0.0
+            #     tTR_rST[i] = dsilu_temp
+            #     tTR_rST_silu[i] = silu_out
+
+            for i in cutlass.range_constexpr(0, cute.size(tTR_rST), 2):
+                v0, v1 = mul_packed_f32x2((tTR_rST[i], tTR_rST[i + 1]), (alpha, alpha))
+                tanh_in0, tanh_in1 = mul_packed_f32x2((v0, v1), (0.5, 0.5))
+                tanh_v0 = tanhf(tanh_in0)
+                tanh_v1 = tanhf(tanh_in1)
+                sigmoid_v0, sigmoid_v1 = fma_packed_f32x2((0.5, 0.5), (tanh_v0, tanh_v1), (0.5, 0.5))
+                sigmoid_v0 = sigmoid_v0 if tTR_rST_preds[i] else tTR_rST.element_type(0)
+                sigmoid_v1 = sigmoid_v1 if tTR_rST_preds[i + 1] else tTR_rST.element_type(0)
+                out_v0, out_v1 = mul_packed_f32x2((v0, v1), (sigmoid_v0, sigmoid_v1))
+                one_minus_sig0, one_minus_sig1 = sub_packed_f32x2((1.0, 1.0), (sigmoid_v0, sigmoid_v1))
+                inner0, inner1 = fma_packed_f32x2((v0, v1), (one_minus_sig0, one_minus_sig1), (1.0, 1.0))
+                dsilu0, dsilu1 = mul_packed_f32x2((sigmoid_v0, sigmoid_v1), (inner0, inner1))
+                tTR_rST[i] = dsilu0
+                tTR_rST[i + 1] = dsilu1
+                tTR_rST_silu[i] = out_v0
+                tTR_rST_silu[i + 1] = out_v1
 
             # convert fp32 P to fp16 P which will be used in the PdO
             tRT_rST = self.quantize(tTR_rST_silu, 4)
@@ -1763,8 +1783,11 @@ class HSTUAttentionBackwardSm100:
             # Compute dS = dsilu(S, dP)
             cute.copy(tiled_t2r, tTR_tdPT, tTR_rdPT)
 
+            # for i in cutlass.range(0, cute.size(tTR_rdPT), unroll_full=True):
+            #     tTR_rdPT[i] *= alpha
+            #     tTR_rdPT[i] = tTR_rST[i] * tTR_rdPT[i]
+
             for i in cutlass.range(0, cute.size(tTR_rdPT), unroll_full=True):
-                tTR_rdPT[i] *= alpha
                 tTR_rdPT[i] = tTR_rST[i] * tTR_rdPT[i]
 
             # convert fp32 dS to fp16 dS which will be used in the computation of dK and DQ
@@ -1871,6 +1894,7 @@ class HSTUAttentionBackwardSm100:
             cute.group_modes(gdQ, 0, 2),
         )
 
+        inv_max_seq_len = 1.0 / max_seqlen_q
         while iter_count > 0:
             mma_reduce_dQ_pipeline.consumer_wait(mma_reduce_dQ_consumer_state)
 
@@ -1879,8 +1903,8 @@ class HSTUAttentionBackwardSm100:
             # Load dQ from tmem to rmem
             cute.copy(tiled_t2r, tTR_tdQ, tTR_rdQ)
 
-            for i in cutlass.range(0, cute.size(tTR_rdQ), unroll_full=True):
-                tTR_rdQ[i] /= max_seqlen_q
+            for i in cutlass.range(0, cute.size(tTR_rdQ), 2, unroll_full=True):
+                tTR_rdQ[i], tTR_rdQ[i + 1] = mul_packed_f32x2((tTR_rdQ[i], tTR_rdQ[i + 1]), (inv_max_seq_len, inv_max_seq_len))
 
             cute.arch.fence_view_async_tmem_load()
 
@@ -1921,41 +1945,6 @@ class HSTUAttentionBackwardSm100:
             iter_index += 1
 
         reduce_tma_store_pipeline.producer_tail()
-
-    # @cute.jit
-    # def split_wg(
-    #     self,
-    #     t: cute.Tensor,
-    #     num_warp_groups: Int32,
-    #     wg_idx: Int32,
-    # ) -> cute.Tensor:
-    #     ret = None
-    #     if cutlass.const_expr(cute.rank(t.layout) == 3):
-    #         p = cute.composition(
-    #             t,
-    #             cute.make_layout(
-    #                 (
-    #                     t.shape[0],
-    #                     t.shape[1],
-    #                     (num_warp_groups, cute.size(t, mode=[2]) // num_warp_groups),
-    #                 )
-    #             ),
-    #         )
-    #         ret = p[None, None, (wg_idx, None)]
-    #     else:
-    #         p = cute.composition(
-    #             t,
-    #             cute.make_layout(
-    #                 (
-    #                     t.shape[0],
-    #                     t.shape[1],
-    #                     t.shape[2],
-    #                     (num_warp_groups, cute.size(t, mode=[3]) // num_warp_groups),
-    #                 )
-    #             ),
-    #         )
-    #         ret = p[None, None, None, (wg_idx, None)]
-    #     return ret
 
     @cute.jit
     def quantize(
@@ -2153,13 +2142,16 @@ class HSTUAttentionBackwardSm100:
         tTR_tdV = thread_t2r_dV.partition_S(tdVtdV)
         tTR_tdV = split_wg(tTR_tdV, num_warp_groups, wg_idx)
 
+        inv_max_seq_len = 1.0 / max_seqlen_q
+
         mma_compute_dKdV_pipeline.consumer_wait(mma_compute_dKdV_consumer_state)
+        
 
         # Load tdVtdV
         cute.copy(tiled_t2r_dV, tTR_tdV, tTR_rdV)
 
-        for i in cutlass.range(cute.size(tTR_rdV), unroll_full=True):
-            tTR_rdV[i] /= max_seqlen_q
+        for i in cutlass.range(0, cute.size(tTR_rdV), 2, unroll_full=True):
+            tTR_rdV[i], tTR_rdV[i + 1] = mul_packed_f32x2((tTR_rdV[i], tTR_rdV[i + 1]), (inv_max_seq_len, inv_max_seq_len))
 
         # Store tdVgdV
         self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
@@ -2174,8 +2166,8 @@ class HSTUAttentionBackwardSm100:
         # Load tdKtdK
         cute.copy(tiled_t2r_dK, tTR_tdK, tTR_rdK)
 
-        for i in cutlass.range(cute.size(tTR_rdK), unroll_full=True):
-            tTR_rdK[i] /= max_seqlen_q
+        for i in cutlass.range(0, cute.size(tTR_rdK), 2, unroll_full=True):
+            tTR_rdK[i], tTR_rdK[i + 1] = mul_packed_f32x2((tTR_rdK[i], tTR_rdK[i + 1]), (inv_max_seq_len, inv_max_seq_len))
 
         # Store tdKgdK
         self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))

@@ -1437,7 +1437,7 @@ class HSTUAttentionForwardSm100:
             
             while n_block_valid >= n_block_min and masking_step < n_masking_steps:
                 n_block = n_block_valid
-                if self.is_target and (m_block + 1) * self.kBlockN > seqlen.seqlen_h:
+                if self.is_target and (m_block + 1) * self.kBlockM + seqlen.offset_q > seqlen.seqlen_h:
                     mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=True))
                 else:
                     mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=False))

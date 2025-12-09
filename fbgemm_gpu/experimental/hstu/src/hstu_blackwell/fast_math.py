@@ -8,7 +8,7 @@ from cutlass import Int32, Uint32, Float32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-from .utils import tanhf, mul_packed_f32x2, fma_packed_f32x2
+from .utils import tanhf, mul_packed_f32x2, fma_packed_f32x2, sub_packed_f32x2, add_packed_f32x2
 
 @cute.jit
 def clz(x: Int32) -> Int32:
@@ -142,26 +142,26 @@ class FastSilU:
         acc_S: cute.Tensor,
         acc_S_silu: cute.Tensor,
         preds: cute.Tensor,
+        score_scale: Float32,
         mask_fn: Optional[Callable] = None,
     ):
         for i in cutlass.range_constexpr(0, cute.size(acc_S), 2):
-            v0, v1 = mul_packed_f32x2(
-                (acc_S[i], acc_S[i + 1]),
-                (self.score_scale, self.score_scale),
-            )
-            tanh_v0 = tanhf(v0)
-            tanh_v1 = tanhf(v1)
-            out_v0, out_v1 = fma_packed_f32x2(
-                (v0, v1),
-                (tanh_v0, tanh_v1),
-                (v0, v1),
-            )
-            acc_S[i] = out_v0 
-            acc_S[i + 1] = out_v1 
-
-        if const_expr(mask_fn is not None):
-            for i in cutlass.range_constexpr(cute.size(acc_S), unroll_full=True):
-                acc_S[i] = acc_S[i] if preds[i] else acc_S.element_type(0)
-                acc_S_silu[i] = acc_S_silu[i] if preds[i] else acc_S_silu.element_type(0)
+            v0, v1 = mul_packed_f32x2((acc_S[i], acc_S[i + 1]), (score_scale, score_scale))
+            tanh_in0, tanh_in1 = mul_packed_f32x2((v0, v1), (0.5, 0.5))
+            tanh_v0 = tanhf(tanh_in0)
+            tanh_v1 = tanhf(tanh_in1)
+            sigmoid_v0, sigmoid_v1 = fma_packed_f32x2((0.5, 0.5), (tanh_v0, tanh_v1), (0.5, 0.5))
+            sigmoid_v0 = sigmoid_v0 if preds[i] else acc_S.element_type(0)
+            sigmoid_v1 = sigmoid_v1 if preds[i + 1] else acc_S.element_type(0)
+            out_v0, out_v1 = mul_packed_f32x2((v0, v1), (sigmoid_v0, sigmoid_v1))
+            one_minus_sig0, one_minus_sig1 = sub_packed_f32x2((1.0, 1.0), (sigmoid_v0, sigmoid_v1))
+            inner0, inner1 = fma_packed_f32x2((v0, v1), (one_minus_sig0, one_minus_sig1), (1.0, 1.0))
+            dsilu0, dsilu1 = mul_packed_f32x2((sigmoid_v0, sigmoid_v1), (inner0, inner1))
+            acc_S[i] = dsilu0
+            acc_S[i + 1] = dsilu1
+            acc_S_silu[i] = out_v0
+            acc_S_silu[i + 1] = out_v1
+    
+        
 
     
