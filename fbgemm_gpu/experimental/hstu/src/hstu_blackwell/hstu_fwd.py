@@ -1431,13 +1431,13 @@ class HSTUAttentionForwardSm100:
             if const_expr(self.is_arbitrary or self.is_local):
                 while n_block_valid >= n_block_min:
                     n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
-                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=False))
+                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
                     masking_step += wg_stride
                     n_block_valid -= wg_stride
             
             while n_block_valid >= n_block_min and masking_step < n_masking_steps:
                 n_block = n_block_valid
-                if self.is_target and (m_block + 1) * self.kBlockM + seqlen.offset_q > seqlen.seqlen_h:
+                if self.is_target and (n_block + 1) * self.kBlockN > seqlen.seqlen_h:
                     mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=True))
                 else:
                     mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=False))
@@ -1450,7 +1450,7 @@ class HSTUAttentionForwardSm100:
                 if n_block_valid == n_block_history - 1:
                     n_block = n_block_valid
                     if (n_block + 1) * self.kBlockN > seqlen.seqlen_h:
-                        mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=True))
+                        mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_history=True))
                         n_block_valid -= wg_stride
             
             while n_block_valid >= n_block_min:

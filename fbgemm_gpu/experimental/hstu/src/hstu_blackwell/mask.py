@@ -68,7 +68,8 @@ class AttentionMask:
         n_block: cutlass.Int32,
         thr_mma: cute.TiledMma,
         thr_tmem_load: cute.TiledCopy,
-        mask_target: cutlass.Constexpr[bool],
+        mask_target: cutlass.Constexpr[bool] = False,
+        mask_history: cutlass.Constexpr[bool] = False,
     ) -> None:
         seqlen_offset = self.seqlen_k - self.seqlen_q
         cS = cute.make_identity_tensor((self.kBlockM, self.kBlockN))
@@ -84,12 +85,11 @@ class AttentionMask:
         block_row = cute.get(tScS_t2r[0], mode=[row_id])
         row = block_row + base_row
 
-        target_index = (row - self.seqlen_h) // self.target_group_size if cutlass.const_expr(self.is_target) else 0
-        target_col_limit_left = self.seqlen_h + target_index * self.target_group_size if cutlass.const_expr(self.is_target) else 0
+        target_index = (row - self.seqlen_h) // self.target_group_size if cutlass.const_expr(mask_target) else 0
+        target_col_limit_left = self.seqlen_h + target_index * self.target_group_size if cutlass.const_expr(mask_target) else 0
 
         col_limit_right = limit_right(row)
         col_limit_left = limit_left(row)
-
 
         for i in cutlass.range_constexpr(cute.size(preds), unroll_full=True):
             preds[i] = True
@@ -101,6 +101,9 @@ class AttentionMask:
             if cutlass.const_expr(not self.is_causal and not self.is_local and not self.is_arbitrary):
                 if col >= self.seqlen_k:
                     preds[i] = False
+            elif cutlass.const_expr(mask_history):
+                if col >= self.seqlen_h:
+                    preds[i] = False
             elif cutlass.const_expr(self.is_arbitrary):
                 func_row = row + self.offset_q - seqlen_offset
                 for j in cutlass.range(self.func_num // 2, unroll_full=True):
@@ -109,12 +112,12 @@ class AttentionMask:
                 if col >= self.func[self.func_num - 1, func_row].value or col >= self.seqlen_k:
                     preds[i] = False
             else:
-                if col >= col_limit_right:
+                if col >= col_limit_right: # causal
                     preds[i] = False
                 if cutlass.const_expr(self.is_local):
                     if col < col_limit_left:
                         preds[i] = False
-                if cutlass.const_expr(self.is_target and mask_target):
+                if cutlass.const_expr(mask_target):
                     if row >= self.seqlen_h and col >= self.seqlen_h and col < target_col_limit_left:
                     # i think we could remove row >= self.seqlen_h condition, but get worse performance (102us vs 96us)
                     # if col >= self.seqlen_h and col < target_col_limit_left:
