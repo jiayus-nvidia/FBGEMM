@@ -70,6 +70,7 @@ class AttentionMask:
         thr_tmem_load: cute.TiledCopy,
         mask_target: cutlass.Constexpr[bool] = False,
         mask_history: cutlass.Constexpr[bool] = False,
+        mask_paged: cutlass.Constexpr[int] = 0,
     ) -> None:
         seqlen_offset = self.seqlen_k - self.seqlen_q
         cS = cute.make_identity_tensor((self.kBlockM, self.kBlockN))
@@ -90,6 +91,10 @@ class AttentionMask:
 
         col_limit_right = limit_right(row)
         col_limit_left = limit_left(row)
+        if cutlass.const_expr(mask_paged == 1):
+            base_col += self.seqlen_h
+        elif cutlass.const_expr(mask_paged == -1):
+            col_limit_right = min(col_limit_right, self.seqlen_h)
 
         for i in cutlass.range_constexpr(cute.size(preds), unroll_full=True):
             preds[i] = True

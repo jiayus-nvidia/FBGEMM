@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
+from cutlass import const_expr
 
 from .seqlen_info import SeqlenInfo
 import fbgemm_gpu.experimental.hstu.src.hstu_blackwell.utils as utils
@@ -20,6 +21,7 @@ class BlockInfo:
     is_context: cutlass.Constexpr[bool] = False
     is_target: cutlass.Constexpr[bool] = False
     target_group_size: cutlass.Constexpr[int] = 1
+    is_paged: cutlass.Constexpr[bool] = False
     window_size_left: Optional[cutlass.Int32] = None
     window_size_right: Optional[cutlass.Int32] = None
     sn_valid_block_max: cute.Pointer = None
@@ -55,17 +57,36 @@ class BlockInfo:
             n_block_min = 0 if (is_in_context or is_in_mixed_context) else n_block_min
             n_block_max = max(cute.ceil_div(seqlen_info.seqlen_h, self.cta_tiler[1]), n_block_max) if (is_in_context or is_in_mixed_context) else n_block_max
 
-        n_masking_block_max = cute.ceil_div(min(seqlen_info.seqlen_k, row_end + seqlen_offset), self.cta_tiler[1])
-        n_masking_block_min = (row_begin + seqlen_offset) // self.cta_tiler[1]
-        if self.is_target:
-            n_masking_block_min = (seqlen_info.seqlen_h + seqlen_offset + target_index * self.target_group_size) // self.cta_tiler[1] if is_jump else n_masking_block_min
-        if self.is_context:
-            n_masking_block_min = n_block_min if is_in_mixed_context else n_masking_block_min
-            n_masking_block_max = n_block_max if is_in_mixed_context else n_masking_block_max
+        n_masking_steps = 0
+        n_block_target_min = 0
+        if const_expr(not self.is_paged):
+            n_masking_block_max = cute.ceil_div(min(seqlen_info.seqlen_k, row_end + seqlen_offset), self.cta_tiler[1])
+            n_masking_block_min = (row_begin + seqlen_offset) // self.cta_tiler[1]
+            if self.is_target:
+                n_masking_block_min = (seqlen_info.seqlen_h + seqlen_offset + target_index * self.target_group_size) // self.cta_tiler[1] if is_jump else n_masking_block_min
+            if self.is_context:
+                n_masking_block_min = n_block_min if is_in_mixed_context else n_masking_block_min
+                n_masking_block_max = n_block_max if is_in_mixed_context else n_masking_block_max
+            
+            # 1: first tile should be masked for boundary check
+            n_masking_steps = 1 if (not self.is_causal or is_in_context) else n_masking_block_max - n_masking_block_min 
+        else:
+            is_jump = self.is_target and row_begin + seqlen_offset >= seqlen_info.seqlen_h
+            n_block_history = min(n_block_history, n_block_max)
+            n_masking_pages = 0
+            if row_begin + seqlen_offset < seqlen_info.seqlen_h:
+                n_masking_pages = cute.ceil_div(min(seqlen_info.seqlen_h, row_end + seqlen_offset), self.cta_tiler[1])
+                n_masking_pages -= max((row_begin + seqlen_offset) // self.cta_tiler[1], 0)
+            n_masking_targets = 0
+            n_block_target_min = n_block_history
+            if self.is_target and row_end + seqlen_offset > seqlen_info.seqlen_h:
+                n_block_target_min = max(row_begin + seqlen_offset - seqlen_info.seqlen_h, 0) // self.cta_tiler[1] + n_block_history
+                n_block_target_max = cute.ceil_div(min(row_end + seqlen_offset, seqlen_info.seqlen_k) - seqlen_info.seqlen_h, self.cta_tiler[1]) + n_block_history
+                n_masking_targets = n_block_target_max - n_block_target_min
+                n_block_max = n_block_target_max
+            n_masking_steps = n_masking_pages + n_masking_targets
         
-        # 1: first tile should be masked for boundary check
-        n_masking_steps = 1 if (not self.is_causal or is_in_context) else n_masking_block_max - n_masking_block_min 
-        return n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history
+        return n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, n_block_target_min
 
 
     @cute.jit

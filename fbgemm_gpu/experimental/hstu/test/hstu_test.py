@@ -1173,10 +1173,10 @@ class HSTUPagedKVTest(unittest.TestCase):
             func=None
         )
 
-        # print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
-        # print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
-        # print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
-        # print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
+        print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
+        print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
+        print(f"Output mean diff: {(hstu_out - out_ref).abs().mean().item()}")
+        print(f"Pytorch mean diff: {(torch_out - out_ref).abs().mean().item()}")
 
         assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
         torch.cuda.synchronize()
@@ -1984,6 +1984,23 @@ if __name__ == "__main__":
     torch.set_printoptions(profile="full")
     HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
     8, 8, 0, (128, 128), 1.0, (False, False, None), (1024, 1024), (0, (-1, 0), 1, False), torch.bfloat16, False)
+
+    HSTUPagedKVTest().test_paged_kv_attn.hypothesis.inner_test(HSTUPagedKVTest(),
+    4, 4, 1000, 1000, 1000, (128, 128), 128, 1.0, torch.bfloat16, True)
+
+    # print("Paged:")
+    # for inc_qlen in [0, 100, 128, 200, 256, 300, 500, 512, 750, 1000, 1024]:
+    #     for k2q_len in [0, 100, 128, 200, 256, 300, 500, 512, 750, 1000, 1024]:
+    #         for tlen in [0, 100, 128, 200, 256, 300, 500, 512, 750, 1000, 1024]:
+    #             if (inc_qlen + k2q_len) == 0:
+    #                 continue
+    #             if (inc_qlen + tlen) == 0:
+    #                 continue
+                
+    #             HSTUPagedKVTest().test_paged_kv_attn.hypothesis.inner_test(HSTUPagedKVTest(),
+    #             8, 4, inc_qlen, k2q_len, tlen, (128, 128), 128, 1.0, torch.bfloat16, True)
+    #             print(f"Qlen{inc_qlen}-Klen{inc_qlen+k2q_len}-Tlen{tlen}: Passed")
+    #             print()
 
     # HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
     # 1, 1, 0, (128, 128), 1.0, (False, False, None), (512, 512), (0, (-1, 0), 1, False), torch.bfloat16, True)
