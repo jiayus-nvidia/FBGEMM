@@ -140,6 +140,9 @@ class AttentionMask:
         n_block: cutlass.Int32,
         thr_mma: cute.TiledMma,
         thr_tmem_load: cute.TiledCopy,
+        mask_casual: cutlass.Constexpr[bool] = False,
+        mask_target: cutlass.Constexpr[bool] = False,
+        mask_seqlen: cutlass.Constexpr[bool] = False,
     ) -> None:
         seqlen_offset = self.seqlen_k - self.seqlen_q
         cS = cute.make_identity_tensor((self.kBlockM, self.kBlockN))
@@ -159,12 +162,15 @@ class AttentionMask:
         for i in cutlass.range(cute.size(preds), unroll_full=True):
             block_row = cute.get(tScS_t2r[i], mode=[row_id])
             row = block_row + base_row
-            target_index = (row - self.seqlen_h) // self.target_group_size if cutlass.const_expr(self.is_target) else 0
-            target_col_limit_left = self.seqlen_h + target_index * self.target_group_size if cutlass.const_expr(self.is_target) else 0
+            # target_index = (row - self.seqlen_h) // self.target_group_size if cutlass.const_expr(self.is_target) else 0
+            # target_col_limit_left = self.seqlen_h + target_index * self.target_group_size if cutlass.const_expr(self.is_target) else 0
+            target_index = (row - self.seqlen_h) // self.target_group_size if cutlass.const_expr(mask_target) else 0
+            target_col_limit_left = self.seqlen_h + target_index * self.target_group_size if cutlass.const_expr(mask_target) else 0
+
             block_col = cute.get(tScS_t2r[i], mode=[col_id])
             col = block_col + base_col
 
-            if col >= self.seqlen_k or row >= self.seqlen_q + seqlen_offset:
+            if col >= self.seqlen_k or row >= self.seqlen_q + seqlen_offset and mask_seqlen:
                 preds[i] = False
             if cutlass.const_expr(self.is_arbitrary):
                 func_row = row + self.offset_q - seqlen_offset
@@ -174,12 +180,13 @@ class AttentionMask:
                 if col >= self.func[self.func_num - 1, func_row].value:
                     preds[i] = False
             else:
-                if col >= col_limit_right(row):
+                if col >= col_limit_right(row) and mask_casual:
                     preds[i] = False
                 if cutlass.const_expr(self.is_local):
                     if col < col_limit_left(row):
                         preds[i] = False
-                if cutlass.const_expr(self.is_target):
+                # if cutlass.const_expr(self.is_target):
+                if cutlass.const_expr(mask_target):
                     if row >= self.seqlen_h and col >= self.seqlen_h and col < target_col_limit_left:
                         preds[i] = False
                 if cutlass.const_expr(self.is_context):

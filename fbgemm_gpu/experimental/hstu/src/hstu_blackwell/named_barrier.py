@@ -24,3 +24,4 @@ class NamedBarrierBwd(enum.IntEnum):
 
     dQFull = enum.auto()
     dQEmpty = enum.auto()
+    Arbitrary = enum.auto()

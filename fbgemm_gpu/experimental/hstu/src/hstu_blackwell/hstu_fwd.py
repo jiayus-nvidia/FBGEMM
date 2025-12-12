@@ -94,6 +94,7 @@ class HSTUAttentionForwardSm100:
         self.is_arbitrary = is_arbitrary
         self.is_paged = is_paged
         self.func_num = func_num
+        assert not (self.is_arbitrary and (self.is_causal or self.is_local or self.is_context or self.is_target)), "a and b cannot both be True"
         self.target_group_size = target_group_size
         self.qhead_per_kvhead = qhead_per_kvhead
         # Does S1 need to wait for S0 to finish
