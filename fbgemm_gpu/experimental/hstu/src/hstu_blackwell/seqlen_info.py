@@ -19,7 +19,7 @@ class SeqlenInfo:
         cu_seqlens_k: cute.Tensor,
         num_contexts: Optional[cute.Tensor],
         num_targets: Optional[cute.Tensor],
-        page_indptrs: Optional[cute.Tensor],
+        page_indptrs: Optional[cute.Tensor] = None,
     ):
         assert cu_seqlens_q is not None and cu_seqlens_k is not None
         self.offset_q = cu_seqlens_q[batch_idx]

@@ -1971,62 +1971,6 @@ class HSTUAttentionBackwardSm100:
                 
                 m_block += 1
 
-
-                    
-
-
-
-
-
-            # if cutlass.const_expr(self.is_arbitrary or self.is_local):
-            #     while m_block < m_block_max:
-            #         m_block_valid = sValidBlockIds[m_block] if cutlass.const_expr(self.is_arbitrary) else m_block
-
-            #         mma_compute_S_consumer_state, compute_mma_P_producer_state, mma_compute_dP_consumer_state, compute_mma_dS_producer_state = compute_mask_step(
-            #         m_block_valid = m_block_valid,
-            #         mma_compute_S_consumer_state = mma_compute_S_consumer_state,
-            #         compute_mma_P_producer_state = compute_mma_P_producer_state,
-            #         mma_compute_dP_consumer_state = mma_compute_dP_consumer_state,
-            #         compute_mma_dS_producer_state = compute_mma_dS_producer_state,
-            #         mask_fn = mask_fn)
-
-            #         m_block += 1
-            
-            # while m_block < m_block_max and masking_step < m_masking_steps:
-            #     m_block_valid = sValidBlockIds[m_block] if cutlass.const_expr(self.is_arbitrary) else m_block
-            #     if self.is_target and (n_block + 1) * self.kBlockN > seqlen.seqlen_h:
-            #         mma_compute_S_consumer_state, compute_mma_P_producer_state, mma_compute_dP_consumer_state, compute_mma_dS_producer_state = compute_mask_step(
-            #         m_block_valid = m_block_valid,
-            #         mma_compute_S_consumer_state = mma_compute_S_consumer_state,
-            #         compute_mma_P_producer_state = compute_mma_P_producer_state,
-            #         mma_compute_dP_consumer_state = mma_compute_dP_consumer_state,
-            #         compute_mma_dS_producer_state = compute_mma_dS_producer_state,
-            #         mask_fn = partial(mask_fn, mask_target=True))
-            #     else:
-            #         mma_compute_S_consumer_state, compute_mma_P_producer_state, mma_compute_dP_consumer_state, compute_mma_dS_producer_state = compute_mask_step(
-            #         m_block_valid = m_block_valid,
-            #         mma_compute_S_consumer_state = mma_compute_S_consumer_state,
-            #         compute_mma_P_producer_state = compute_mma_P_producer_state,
-            #         mma_compute_dP_consumer_state = mma_compute_dP_consumer_state,
-            #         compute_mma_dS_producer_state = compute_mma_dS_producer_state,
-            #         mask_fn = partial(mask_fn, mask_target=False))
-
-            #         masking_step += 1
-            #         m_block += 1
-            
-            # while m_block < m_block_max:
-            #     m_block_valid = sValidBlockIds[m_block] if cutlass.const_expr(self.is_arbitrary) else m_block
-
-            #     mma_compute_S_consumer_state, compute_mma_P_producer_state, mma_compute_dP_consumer_state, compute_mma_dS_producer_state = compute_mask_step(
-            #         m_block_valid = m_block_valid,
-            #         mma_compute_S_consumer_state = mma_compute_S_consumer_state,
-            #         compute_mma_P_producer_state = compute_mma_P_producer_state,
-            #         mma_compute_dP_consumer_state = mma_compute_dP_consumer_state,
-            #         compute_mma_dS_producer_state = compute_mma_dS_producer_state,
-            #         mask_fn = None) #don't need to mask, full attention
-                
-            #     m_block += 1
-
             # Epilogue
             self.epilogue(
                 blk_coord,

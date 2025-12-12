@@ -282,7 +282,4 @@ class BWDBlockInfo:
             #         sm_valid_block_max_tensor[0] = sm_valid_block_max_tensor[0] + 1
 
         cute.arch.barrier(barrier_id=self.arbitrary_barrier, number_of_threads=self.arbitrary_barrier_threads)
-        # if lane_id == 0:
-        #     cute.printf("=== sm_valid_block_max_tensor[0] is {}", sm_valid_block_max_tensor[0])
-        #     cute.printf("=== m_block_min is {}, m_block_max is {}", m_block_min, m_block_max)
         return sm_valid_block_max_tensor[0], 0
