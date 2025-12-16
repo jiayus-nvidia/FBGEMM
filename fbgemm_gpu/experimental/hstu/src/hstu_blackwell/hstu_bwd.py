@@ -212,11 +212,11 @@ class HSTUAttentionBackwardSm100:
         self.tmem_dP_offset = self.tmem_dQ_offset
         self.tmem_S_offset = self.tmem_dQ_offset + max(kBlockM, head_dim)
 
-        self.num_regs_reduce = 152
-        self.num_regs_compute = 128
-        self.num_regs_mma = 96
-        self.num_regs_empty = 96
-        self.num_regs_load = 96
+        self.num_regs_reduce = 136
+        self.num_regs_compute = 160
+        self.num_regs_mma = 56
+        self.num_regs_empty = 24
+        self.num_regs_load = 56
 
         self.buffer_align_bytes = 1024
 
@@ -1073,6 +1073,7 @@ class HSTUAttentionBackwardSm100:
                     and warp_idx <= self.reduce_warp_id[-1]
                 ):
                     cute.arch.warpgroup_reg_alloc(self.num_regs_reduce)
+                    # cute.arch.warpgroup_reg_dealloc(self.num_regs_reduce)
 
                     self.reduce(
                         dSK_tiled_mma,
@@ -1759,7 +1760,7 @@ class HSTUAttentionBackwardSm100:
 
         n_block = blk_coord_k
         offset_dynamic = 0
-        m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context = block_info.get_m_block_info(seqlen_obj, n_block, offset_dynamic) #TODO m_masking_steps what is m_masking_steps here? and  do we need it? [cause load don't need it]
+        m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context = block_info.get_m_block_info(seqlen_obj, n_block, offset_dynamic) 
         
         if cutlass.const_expr(self.is_arbitrary):
             m_block_max, m_block_min = block_info.get_bwd_valid_block_ids(seqlen_obj, n_block, m_block_min, m_block_max, is_calwarp=False)
@@ -1854,37 +1855,6 @@ class HSTUAttentionBackwardSm100:
                 dV,
             )
         else:
-            ## 
-            # s_p_pipline_args = (mma_compute_S_pipeline, compute_mma_P_pipeline)
-            # ds_dp_pipeline_args = (mma_compute_dP_pipeline, compute_mma_dS_pipeline)
-            # while m_block < m_block_max:
-            #     m_block_valid = sValidBlockIds[m_block] if cutlass.const_expr(self.is_arbitrary) else m_block
-            #     mma_compute_S_consumer_state, compute_mma_P_producer_state, mma_compute_dP_consumer_state, compute_mma_dS_producer_state = self.compute_step(
-            #         m_block_valid,
-            #         s_p_pipline_args,
-            #         mma_compute_S_consumer_state,
-            #         compute_mma_P_producer_state,
-            #         tiled_t2r,
-            #         tiled_r2t,
-            #         tTR_tST,
-            #         tTR_rST,
-            #         tRT_cST,
-            #         tRT_tP,
-            #         ds_dp_pipeline_args,
-            #         mma_compute_dP_consumer_state,
-            #         compute_mma_dS_producer_state,
-            #         tTR_tdPT,
-            #         tTR_rdPT,
-            #         sdS,
-            #         dp_idx,
-            #         tTR_cdPT_p,
-            #         num_warp_groups,
-            #         wg_idx,
-            #         alpha,
-            #         mask_fn,
-            #     )
-            #     m_block += 1
-
             s_p_pipline_args = (mma_compute_S_pipeline, compute_mma_P_pipeline)
             ds_dp_pipeline_args = (mma_compute_dP_pipeline, compute_mma_dS_pipeline)
             compute_mask_step = partial(
@@ -1926,7 +1896,7 @@ class HSTUAttentionBackwardSm100:
                     m_block += 1
 
             while m_block < m_block_max and masking_step < m_masking_steps:
-                m_block_valid = sValidBlockIds[m_block] if cutlass.const_expr(self.is_arbitrary) else m_block
+                m_block_valid = m_block
                 if cutlass.const_expr(self.is_target) and (n_block + 1) * self.kBlockN > seqlen_obj.seqlen_h:
                     mma_compute_S_consumer_state, compute_mma_P_producer_state, mma_compute_dP_consumer_state, compute_mma_dS_producer_state = compute_mask_step(
                     m_block_valid = m_block_valid,
@@ -1948,7 +1918,7 @@ class HSTUAttentionBackwardSm100:
                 m_block += 1
             
             while m_block < m_block_max - 1 and (n_block + 1) * self.kBlockN <= seqlen_obj.seqlen_k:
-                m_block_valid = sValidBlockIds[m_block] if cutlass.const_expr(self.is_arbitrary) else m_block
+                m_block_valid = m_block
                 mma_compute_S_consumer_state, compute_mma_P_producer_state, mma_compute_dP_consumer_state, compute_mma_dS_producer_state = compute_mask_step(
                     m_block_valid = m_block_valid,
                     mma_compute_S_consumer_state = mma_compute_S_consumer_state,
@@ -1960,7 +1930,7 @@ class HSTUAttentionBackwardSm100:
                 m_block += 1
 
             while m_block < m_block_max:
-                m_block_valid = sValidBlockIds[m_block] if cutlass.const_expr(self.is_arbitrary) else m_block
+                m_block_valid = m_block
                 mma_compute_S_consumer_state, compute_mma_P_producer_state, mma_compute_dP_consumer_state, compute_mma_dS_producer_state = compute_mask_step(
                     m_block_valid = m_block_valid,
                     mma_compute_S_consumer_state = mma_compute_S_consumer_state,
@@ -2026,17 +1996,6 @@ class HSTUAttentionBackwardSm100:
             mask_fn(tTR_rST_preds, m_block=m_block_valid)
         tTR_rST_silu = cute.make_fragment_like(tTR_rST)
 
-        # fastsilu.dsilu_bwd_x2(tTR_rST, tTR_rST_silu, tTR_rST_preds, mask_fn)
-        # for i in cutlass.range(0, cute.size(tTR_rST), unroll_full=True):
-        #     tTR_rST[i] *= alpha
-        #     sigmoid_v = 0.5 * cute.math.tanh(tTR_rST[i] * 0.5, fastmath=True) + 0.5
-        #     out = tTR_rST[i] * sigmoid_v
-        #     temp = sigmoid_v * (1 + tTR_rST[i] * (1 - sigmoid_v)) = silu*(1-sigmoid) + (1-sigmoid) #
-        #     dsilu_temp = temp if tTR_rST_preds[i] else 0.0
-        #     silu_out = out if tTR_rST_preds[i] else 0.0
-        #     tTR_rST[i] = dsilu_temp
-        #     tTR_rST_silu[i] = silu_out
-
         for i in cutlass.range_constexpr(0, cute.size(tTR_rST), 2):
             v0, v1 = mul_packed_f32x2((tTR_rST[i], tTR_rST[i + 1]), (alpha, alpha))
             tanh_in0, tanh_in1 = mul_packed_f32x2((v0, v1), (0.5, 0.5))
@@ -2085,12 +2044,9 @@ class HSTUAttentionBackwardSm100:
         # Compute dS = dsilu(S, dP)
         cute.copy(tiled_t2r, tTR_tdPT, tTR_rdPT)
 
-        for i in cutlass.range(0, cute.size(tTR_rdPT), unroll_full=True):
-            tTR_rdPT[i] *= alpha
-            tTR_rdPT[i] = tTR_rST[i] * tTR_rdPT[i]
-
-        # for i in cutlass.range(0, cute.size(tTR_rdPT), unroll_full=True):
-        #     tTR_rdPT[i] = tTR_rST[i] * tTR_rdPT[i]
+        for i in cutlass.range_constexpr(0, cute.size(tTR_rdPT), 2):
+            tTR_rdPT[i], tTR_rdPT[i + 1] = mul_packed_f32x2((tTR_rdPT[i], tTR_rdPT[i + 1]), (alpha, alpha))
+            tTR_rdPT[i], tTR_rdPT[i + 1] = mul_packed_f32x2((tTR_rdPT[i], tTR_rdPT[i + 1]), (tTR_rST[i], tTR_rST[i + 1]))
 
         # convert fp32 dS to fp16 dS which will be used in the computation of dK and DQ
         tTR_rdST = self.quantize(tTR_rdPT, 4)
@@ -2333,11 +2289,6 @@ class HSTUAttentionBackwardSm100:
         tCr = thr_copy.partition_S(self.quantize(regs, 4))
         tPc = thr_copy.partition_D(coord)
 
-        # {$nv-internal-release begin}
-        # FIXME cute.copy expects mode 0 (atom_v,rest_v) to be removed
-        #       Fix this so that the predicate tensor can simply be congruent to
-        #       the original partitioned tensor
-        # {$nv-internal-release end}
         preds_shape = (tPc.shape[0][1], tPc.shape[1], tPc.shape[2], tPc.shape[3])
         preds = cute.make_fragment(preds_shape, Boolean)
         
@@ -2721,671 +2672,3 @@ class HSTUAttentionBackwardSm100:
             producer_group=reduce_tma_store_producer_group,
         )
 
-
-def run(
-    s_q: int | Tuple[int, ...],
-    s_k: int | Tuple[int, ...],
-    h_q: int,
-    h_k: int,
-    d: int,
-    b: int,
-    is_causal: bool,
-    element_dtype: Type[cutlass.Numeric],
-    acc_dtype: Type[cutlass.Numeric],
-    mma_tiler_mn: Tuple[int, int],
-    window_size: Tuple[int, int],
-    warmup_iterations: int,
-    iterations: int,
-    skip_ref_check: bool,
-    use_cold_l2: bool = False,
-    **kwargs,
-):
-    print("Running Blackwell SM100 FMHA bwd test with:")
-    print(f"  s_q: {s_q}")
-    print(f"  s_k: {s_k}")
-    print(f"  h_q: {h_q}")
-    print(f"  h_k: {h_k}")
-    print(f"  d: {d}")
-    print(f"  b: {b}")
-    print(f"  is_causal: {is_causal}")
-    print(f"  element_dtype: {element_dtype}")
-    print(f"  acc_dtype: {acc_dtype}")
-    print(f"  mma_tiler_mn: {mma_tiler_mn}")
-    print(f"  window_size: {window_size}")
-    print(f"  warmup_iterations: {warmup_iterations}")
-    print(f"  iterations: {iterations}")
-    print(f"  skip_ref_check: {skip_ref_check}")
-
-    if d not in {64, 128}:
-        raise ValueError("head dimension must be 64, or 128")
-
-    if h_q % h_k != 0:
-        raise ValueError("h_q must be divisible by h_k")
-
-    if element_dtype not in {Float8E4M3FN, Float16, BFloat16}:
-        raise ValueError("in_dtype must be Float8E4M3FN or Float16 or BFloat16")
-
-    if acc_dtype not in {Float32}:
-        raise ValueError("acc_dtype must be Float32")
-
-    if iterations < 1:
-        raise ValueError("iterations must be at least 1")
-
-    if isinstance(s_q, tuple) and len(s_q) != b:
-        raise ValueError("s_q must be a tuple of length b")
-
-    window_size_left, window_size_right = window_size
-    if window_size_left == -1:
-        window_size_left = None
-    if window_size_right == -1:
-        window_size_right = None
-
-    h_r = h_q // h_k
-    orig_b = b
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("GPU is required to run this example!")
-
-    def create_and_permute_tensor(
-        shape,
-        permute_order,
-        dtype,
-        min_val=-1,
-        max_val=1,
-        is_dynamic_layout=True,
-        zero_out=False,
-    ):
-        # (b, h_k, h_r, s, d) -> (s, d, h_r, h_k, b)
-        ref_tensor = (
-            torch.empty(*shape, dtype=torch.float32)
-            .uniform_(min_val, max_val)
-            .permute(permute_order)
-        )
-        print(ref_tensor.shape)
-        print(ref_tensor.stride())
-        if zero_out:
-            ref_tensor.zero_()
-
-        torch_dtype = cutlass_torch.dtype(dtype)
-
-        dst_tensor = ref_tensor.to(dtype=torch_dtype).cuda()
-        cute_tensor = from_dlpack(dst_tensor, assumed_align=16)
-        cute_tensor.element_type = dtype
-        if is_dynamic_layout:
-            cute_tensor = cute_tensor.mark_layout_dynamic(
-                leading_dim=1
-            ).mark_compact_shape_dynamic(
-                mode=1, stride_order=(4, 3, 2, 0, 1), divisibility=64
-            )
-
-        return ref_tensor, cute_tensor, dst_tensor
-
-    # create sequence lengths for variable length inputs
-    cu_seqlens_q = [0]
-    cu_seqlens_k = [0]
-    varlen = False
-    if isinstance(s_q, tuple):
-        varlen = True
-        for i in range(b):
-            cu_seqlens_q.append(cu_seqlens_q[-1] + s_q[i])
-            cu_seqlens_k.append(cu_seqlens_k[-1] + s_k[i])
-        s_q_max = max(s_q)
-        s_k_max = max(s_k)
-        s_q = sum(s_q)
-        s_k = sum(s_k)
-        b = 1
-    else:
-        s_q_max = s_q
-        s_k_max = s_k
-
-    mask_type = MaskType.NO_MASK
-    if varlen or s_q % mma_tiler_mn[0] != 0:
-        mask_type = MaskType.RESIDUAL_MASK_FOR_BACKWARD
-    if is_causal:
-        mask_type = MaskType.CAUSAL_MASK_FOR_BACKWARD
-
-    window_size_left, window_size_right = window_size
-    if is_causal:
-        window_size_right = 0
-    if window_size_left >= s_k_max - 1:
-        raise ValueError("window_size_left must be less than s_k_max - 1")
-    if window_size_right >= s_q_max - 1:
-        raise ValueError("window_size_right must be less than s_q_max - 1")
-
-    if window_size_left > 0 or window_size_right > 0:
-        if isinstance(s_q, tuple):
-            for i in range(b):
-                if s_q[i] != s_k[i]:
-                    # TODO: support s_q != s_k for sliding window
-                    raise ValueError("s_q and s_k must be the same for sliding window")
-
-    problem_shape = (s_q_max, s_k_max, d, ((h_r, h_k), orig_b))
-    cumulative_s_q_torch_tensor = (
-        torch.tensor(cu_seqlens_q, dtype=torch.int32).cuda() if varlen else None
-    )
-    cumulative_s_k_torch_tensor = (
-        torch.tensor(cu_seqlens_k, dtype=torch.int32).cuda() if varlen else None
-    )
-    cumulative_s_q_cute_tensor = (
-        from_dlpack(cumulative_s_q_torch_tensor).mark_layout_dynamic()
-        if varlen
-        else None
-    )
-    cumulative_s_k_cute_tensor = (
-        from_dlpack(cumulative_s_k_torch_tensor).mark_layout_dynamic()
-        if varlen
-        else None
-    )
-
-    q_ref, q_tensor, q_torch = create_and_permute_tensor(
-        (b, h_k, h_r, s_q, d), (3, 4, 2, 1, 0), element_dtype, is_dynamic_layout=True
-    )
-    dq_ref, dq_tensor, dq_torch = create_and_permute_tensor(
-        (b, h_k, h_r, s_q, d),
-        (3, 4, 2, 1, 0),
-        element_dtype,
-        is_dynamic_layout=True,
-        zero_out=True,
-    )
-    k_ref, k_tensor, k_torch = create_and_permute_tensor(
-        (b, h_k, 1, s_k, d), (3, 4, 2, 1, 0), element_dtype, is_dynamic_layout=True
-    )
-    dk_ref, dk_tensor, dk_torch = create_and_permute_tensor(
-        (b, h_k, 1, s_k, d),
-        (3, 4, 2, 1, 0),
-        element_dtype,
-        is_dynamic_layout=True,
-        zero_out=True,
-    )
-    v_ref, v_tensor, v_torch = create_and_permute_tensor(
-        (b, h_k, 1, s_k, d), (3, 4, 2, 1, 0), element_dtype, is_dynamic_layout=True
-    )
-    dv_ref, dv_tensor, dv_torch = create_and_permute_tensor(
-        (b, h_k, 1, s_k, d),
-        (3, 4, 2, 1, 0),
-        element_dtype,
-        is_dynamic_layout=True,
-        zero_out=True,
-    )
-    do_ref, do_tensor, do_torch = create_and_permute_tensor(
-        (b, h_k, h_r, s_q, d), (3, 4, 2, 1, 0), element_dtype, is_dynamic_layout=True
-    )
-
-    mma_tiler = (*mma_tiler_mn, d)
-
-    fmha_bwd = HSTUAttentionBackwardSm100(
-        element_dtype, acc_dtype, mma_tiler, varlen, mask_type
-    )
-
-    workspace_size = HSTUAttentionBackwardSm100._get_workspace_size(
-        s_q_max, s_k_max, d, h_q, orig_b
-    )
-    workspace_torch = torch.zeros(workspace_size, dtype=torch.uint8).cuda()
-    workspace = from_dlpack(workspace_torch, assumed_align=16).mark_layout_dynamic()
-
-    # Initialize Stream
-    current_stream = cutlass_torch.default_stream()
-
-    print("Compiling kernel with cute.compile ...")
-    start_time = time.time()
-    compiled_fmha_bwd = cute.compile(
-        fmha_bwd,
-        problem_shape,
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        dq_tensor,
-        dk_tensor,
-        dv_tensor,
-        do_tensor,
-        cumulative_s_q_cute_tensor,
-        cumulative_s_k_cute_tensor,
-        window_size_left if window_size_left is None else Int32(window_size_left),
-        window_size_right if window_size_right is None else Int32(window_size_right),
-        workspace,
-        current_stream,
-    )
-    compilation_time = time.time() - start_time
-    print(f"Compilation time: {compilation_time:.4f} seconds")
-
-    for _ in range(warmup_iterations):
-        compiled_fmha_bwd(
-            problem_shape,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            dq_tensor,
-            dk_tensor,
-            dv_tensor,
-            do_tensor,
-            cumulative_s_q_cute_tensor,
-            cumulative_s_k_cute_tensor,
-            window_size_left if window_size_left is None else Int32(window_size_left),
-            window_size_right if window_size_right is None else Int32(window_size_right),
-            workspace,
-            current_stream,
-        )
-
-    for _ in range(iterations):
-        compiled_fmha_bwd(
-            problem_shape,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            dq_tensor,
-            dk_tensor,
-            dv_tensor,
-            do_tensor,
-            cumulative_s_q_cute_tensor,
-            cumulative_s_k_cute_tensor,
-            window_size_left if window_size_left is None else Int32(window_size_left),
-            window_size_right if window_size_right is None else Int32(window_size_right),
-            workspace,
-            current_stream,
-        )
-
-    def get_tensor_for_reference(t, s, d, h_r, h_k, b, dtype):
-        t = t.reshape((s, d, h_r * h_k * b))
-        t = t.permute((2, 0, 1))  # (b*h, s, d)
-        t = t.to(dtype=dtype)
-        return t
-
-    def get_result_from_fmha_bwd(t, s, d, h_r, h_k, b):
-        t = t.reshape((s, d, h_r * h_k * b)).permute((2, 0, 1)).to(dtype=torch.float32)
-        return t
-
-    if not skip_ref_check:
-        workspace_torch.fill_(0)
-        compiled_fmha_bwd(
-            problem_shape,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            dq_tensor,
-            dk_tensor,
-            dv_tensor,
-            do_tensor,
-            cumulative_s_q_cute_tensor,
-            cumulative_s_k_cute_tensor,
-            window_size_left if window_size_left is None else Int32(window_size_left),
-            window_size_right if window_size_right is None else Int32(window_size_right),
-            workspace,
-            current_stream,
-        )
-        torch.cuda.synchronize()
-        print("Verifying results...")
-
-        q_ref = q_ref.cuda().to(cutlass.torch.dtype(element_dtype))
-        k_ref = k_ref.cuda().to(cutlass.torch.dtype(element_dtype))
-        v_ref = v_ref.cuda().to(cutlass.torch.dtype(element_dtype))
-        do_ref = do_ref.cuda().to(cutlass.torch.dtype(element_dtype))
-        dv = dv_torch.to(dtype=torch.float32)
-        dk = dk_torch.to(dtype=torch.float32)
-        dq = dq_torch.to(dtype=torch.float32)
-
-        dv_ref, dk_ref, dq_ref = fmha_bwd_reference(
-            problem_shape,
-            q_ref,
-            k_ref,
-            v_ref,
-            do_ref,
-            cumulative_s_q_torch_tensor,
-            cumulative_s_k_torch_tensor,
-            is_causal,
-            window_size_left,
-            window_size_right,
-        )
-        dv_pt, dk_pt, dq_pt = fmha_bwd_reference(
-            problem_shape,
-            q_ref,
-            k_ref,
-            v_ref,
-            do_ref,
-            cumulative_s_q_torch_tensor,
-            cumulative_s_k_torch_tensor,
-            is_causal,
-            window_size_left,
-            window_size_right,
-            upcast=False,
-        )
-
-        rtol = 2
-        dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item()
-        dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item()
-        dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item()
-
-        print(f"Pytorch dv max diff: {(dv_pt - dv_ref).abs().max().item()}")
-        print(f"dv max diff: {(dv - dv_ref).abs().max().item()}")
-        print(f"Pytorch dk max diff: {(dk_pt - dk_ref).abs().max().item()}")
-        print(f"dk max diff: {(dk - dk_ref).abs().max().item()}")
-        print(f"Pytorch dq max diff: {(dq_pt - dq_ref).abs().max().item()}")
-        print(f"dq max diff: {(dq - dq_ref).abs().max().item()}")
-
-        assert (dv - dv_ref).abs().max().item() <= rtol * (
-            dv_pt - dv_ref
-        ).abs().max().item() + dv_atol
-        assert (dk - dk_ref).abs().max().item() <= rtol * (
-            dk_pt - dk_ref
-        ).abs().max().item() + dk_atol
-        assert (dq - dq_ref).abs().max().item() <= rtol * (
-            dq_pt - dq_ref
-        ).abs().max().item() + dq_atol
-
-        print("Results verified successfully!")
-
-    def generate_tensors():
-        _, q_tensor_new, _ = create_and_permute_tensor(
-            (b, h_k, h_r, s_q, d),
-            (3, 4, 2, 1, 0),
-            element_dtype,
-            is_dynamic_layout=True,
-        )
-        _, dq_tensor_new, _ = create_and_permute_tensor(
-            (b, h_k, h_r, s_q, d),
-            (3, 4, 2, 1, 0),
-            element_dtype,
-            is_dynamic_layout=True,
-        )
-        _, k_tensor_new, _ = create_and_permute_tensor(
-            (b, h_k, 1, s_k, d),
-            (3, 4, 2, 1, 0),
-            element_dtype,
-            is_dynamic_layout=True,
-        )
-        _, dk_tensor_new, _ = create_and_permute_tensor(
-            (b, h_k, 1, s_k, d), (3, 4, 2, 1, 0), element_dtype, is_dynamic_layout=True
-        )
-        _, v_tensor_new, _ = create_and_permute_tensor(
-            (b, h_k, 1, s_k, d), (3, 4, 2, 1, 0), element_dtype, is_dynamic_layout=True
-        )
-        _, dv_tensor_new, _ = create_and_permute_tensor(
-            (b, h_k, 1, s_k, d), (3, 4, 2, 1, 0), element_dtype, is_dynamic_layout=True
-        )
-        _, do_tensor_new, _ = create_and_permute_tensor(
-            (b, h_k, h_r, s_q, d),
-            (3, 4, 2, 1, 0),
-            element_dtype,
-            is_dynamic_layout=True,
-        )
-
-        return testing.JitArguments(
-            problem_shape,
-            q_tensor_new,
-            k_tensor_new,
-            v_tensor_new,
-            dq_tensor_new,
-            dk_tensor_new,
-            dv_tensor_new,
-            do_tensor_new,
-            cumulative_s_q_cute_tensor,
-            cumulative_s_k_cute_tensor,
-            window_size_left if window_size_left is None else Int32(window_size_left),
-            window_size_right if window_size_right is None else Int32(window_size_right),
-            workspace,
-            current_stream,
-        )
-
-    workspace_count = 1
-    if use_cold_l2:
-        one_workspace_bytes = (
-            q_torch.numel() * q_torch.element_size()
-            + dq_torch.numel() * dq_torch.element_size()
-            + k_torch.numel() * k_torch.element_size()
-            + dk_torch.numel() * dk_torch.element_size()
-            + v_torch.numel() * v_torch.element_size()
-            + dv_torch.numel() * dv_torch.element_size()
-            + do_torch.numel() * do_torch.element_size()
-        )
-        workspace_count = testing.get_workspace_count(
-            one_workspace_bytes, warmup_iterations, iterations
-        )
-
-    exec_time = testing.benchmark(
-        compiled_fmha_bwd,
-        workspace_generator=generate_tensors,
-        workspace_count=workspace_count,
-        stream=current_stream,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-    )
-
-    return exec_time  # Return execution time in microseconds
-
-
-def fmha_bwd_reference(
-    problem_shape: Tuple[int, int, int, Tuple[Tuple[int, int], int]],
-    Q: torch.Tensor,  # [Q, D, H_R, H_K, B]
-    K: torch.Tensor,  # [K, D, 1, H_K, B]
-    V: torch.Tensor,  # [K, D, 1, H_K, B]
-    dO: torch.Tensor,  # [Q, D, H_R, H_K, B]
-    cu_seqlens_q: Union[torch.Tensor, None],
-    cu_seqlens_k: Union[torch.Tensor, None],
-    is_causal: bool,
-    window_size_left=None,
-    window_size_right=None,
-    upcast=True,
-):
-    s_q_max, s_k_max, d, hb = problem_shape
-    h, orig_b = hb
-    h_r, h_k = h
-
-    if upcast:
-        Q = Q.to(dtype=torch.float32)
-        K = K.to(dtype=torch.float32)
-        V = V.to(dtype=torch.float32)
-        dO = dO.to(dtype=torch.float32)
-
-    dV = torch.zeros_like(V)
-    dK = torch.zeros_like(K)
-    dQ = torch.zeros_like(Q)
-
-    def dsilu(dy, x):
-        dy = dy.to(torch.float32)
-        x = x.to(torch.float32)
-        sigmoid = F.sigmoid(x)
-        return dy * sigmoid * (1 + x * (1 - sigmoid))
-
-    for b in range(orig_b):
-        q_offset = cu_seqlens_q[b] if cu_seqlens_q is not None else 0
-        k_offset = cu_seqlens_k[b] if cu_seqlens_k is not None else 0
-        s_q = (
-            cu_seqlens_q[b + 1] - cu_seqlens_q[b]
-            if cu_seqlens_q is not None
-            else s_q_max
-        )
-        s_k = (
-            cu_seqlens_k[b + 1] - cu_seqlens_k[b]
-            if cu_seqlens_k is not None
-            else s_k_max
-        )
-
-        for h_k_idx in range(h_k):
-            b_idx = b if cu_seqlens_k is None else 0
-            cur_K = K[k_offset : k_offset + s_k, :, 0, h_k_idx, b_idx]
-            cur_V = V[k_offset : k_offset + s_k, :, 0, h_k_idx, b_idx]
-            for h_r_idx in range(h_r):
-                cur_Q = Q[q_offset : q_offset + s_q, :, h_r_idx, h_k_idx, b_idx]
-                cur_dO = dO[q_offset : q_offset + s_q, :, h_r_idx, h_k_idx, b_idx]
-                cur_S = torch.einsum("qd,kd->qk", cur_Q, cur_K)
-                cur_P = F.silu(cur_S)
-                if is_causal:
-                    window_size_right = 0
-                mask = None
-                if window_size_left != -1 or window_size_right != -1:
-                    q_coords = torch.arange(0, s_q).cuda().view(-1, 1)
-                    k_coords = torch.arange(0, s_k).cuda().view(1, -1)
-                    offset = s_k - s_q
-                    if window_size_left == -1:
-                        mask = k_coords > q_coords + offset + window_size_right
-                    elif window_size_right == -1:
-                        mask = k_coords < q_coords + offset - window_size_left
-                    else:
-                        mask = (k_coords > q_coords + offset + window_size_right) | (
-                            k_coords < q_coords + offset - window_size_left
-                        )
-                    cur_P = cur_P.masked_fill(mask, 0.0)
-
-                cur_PT = cur_P.transpose(1, 0).to(dtype=Q.dtype)
-                cur_dV = torch.einsum("kq,qd->kd", [cur_PT, cur_dO])
-
-                cur_dP = torch.einsum("qd,kd->qk", cur_dO, cur_V)
-                if mask is not None:
-                    cur_dP = cur_dP.masked_fill(mask, 0.0)
-                cur_dS = dsilu(cur_dP, cur_S).to(dtype=Q.dtype)
-                cur_dST = cur_dS.transpose(1, 0)
-                cur_dK = torch.einsum("kq,qd->kd", cur_dST, cur_Q)
-                cur_dQ = torch.einsum("qk,kd->qd", cur_dS, cur_K)
-
-                dQ[q_offset : q_offset + s_q, :, h_r_idx, h_k_idx, b_idx] = cur_dQ
-                dV[k_offset : k_offset + s_k, :, 0, h_k_idx, b_idx] = cur_dV
-                dK[k_offset : k_offset + s_k, :, 0, h_k_idx, b_idx] = cur_dK
-
-    dV = dV.to(dtype=torch.float32) / problem_shape[0]
-    dK = dK.to(dtype=torch.float32) / problem_shape[0]
-    dQ = dQ.to(dtype=torch.float32) / problem_shape[0]
-
-    return dV, dK, dQ
-
-
-if __name__ == "__main__":
-
-    def parse_comma_separated_ints(s: str) -> Tuple[int, ...] | int:
-        try:
-            seqlen = tuple(int(x.strip()) for x in s.split(","))
-            if len(seqlen) == 1:
-                return seqlen[0]
-            return seqlen
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                "Invalid format. Expected comma-separated integers."
-            )
-
-    parser = argparse.ArgumentParser(description="Example of bwd FMHA on Blackwell.")
-
-    parser.add_argument(
-        "--element_dtype",
-        type=cutlass.dtype,
-        default=Float16,
-        help="Input data type",
-    )
-
-    parser.add_argument(
-        "--acc_dtype",
-        type=cutlass.dtype,
-        default=Float32,
-        help="accumulator data type",
-    )
-
-    parser.add_argument(
-        "--mma_tiler_mn",
-        type=parse_comma_separated_ints,
-        default=(128, 128),
-        help="MMA tile shape (M, N)",
-    )
-
-    parser.add_argument(
-        "--is_causal",
-        action="store_true",
-        help="Whether to use causal mask",
-    )
-
-    parser.add_argument(
-        "--s_q",
-        type=parse_comma_separated_ints,
-        default=32,
-        help="max sequence length of Q",
-    )
-
-    parser.add_argument(
-        "--s_k",
-        type=parse_comma_separated_ints,
-        default=32,
-        help="max sequence length of K",
-    )
-
-    parser.add_argument(
-        "--d",
-        type=int,
-        default=64,
-        help="head dimension",
-    )
-
-    parser.add_argument(
-        "--h_q",
-        type=int,
-        default=2,
-        help="number of heads of Q",
-    )
-
-    parser.add_argument(
-        "--h_k",
-        type=int,
-        default=2,
-        help="number of heads of K",
-    )
-
-    parser.add_argument(
-        "--b",
-        type=int,
-        default=1,
-        help="batch size",
-    )
-
-    parser.add_argument(
-        "--window_size",
-        type=parse_comma_separated_ints,
-        default=(-1, -1),
-        help="Sliding window size (left, right) for attention masking.",
-    )
-
-    parser.add_argument(
-        "--warmup_iterations",
-        type=int,
-        default=0,
-        help="Number of iterations for warmup",
-    )
-
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=1,
-        help="Number of iterations after warmup",
-    )
-
-    parser.add_argument(
-        "--skip_ref_check",
-        action="store_true",
-        help="Skip reference check",
-    )
-
-    parser.add_argument(
-        "--use_cold_l2",
-        action="store_true",
-        default=False,
-        help="Use circular buffer tensor sets to ensure L2 cold cache",
-    )
-
-    args = parser.parse_args()
-
-    if args.mma_tiler_mn != (128, 128):
-        parser.error("--mma_tiler_mn only supports (128, 128)")
-
-    run(
-        args.s_q,
-        args.s_k,
-        args.h_q,
-        args.h_k,
-        args.d,
-        args.b,
-        args.is_causal,
-        args.element_dtype,
-        args.acc_dtype,
-        args.mma_tiler_mn,
-        args.window_size,
-        args.warmup_iterations,
-        args.iterations,
-        args.skip_ref_check,
-        args.use_cold_l2,
-    )
-
-    print("PASS")

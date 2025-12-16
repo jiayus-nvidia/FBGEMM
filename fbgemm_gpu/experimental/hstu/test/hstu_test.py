@@ -1983,7 +1983,8 @@ if __name__ == "__main__":
 
     torch.set_printoptions(profile="full")
     HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
-    8, 8, 0, (128, 128), 1.0, (False, False, None), (1024, 1024), (0, (-1, 0), 1, False), torch.bfloat16, False)
+    8, 8, 0, (128, 128), 0.7, (False, False, None), (10240, 10240), (20, (-1, 0), 1, False), torch.bfloat16, True
+    )
 
     HSTUPagedKVTest().test_paged_kv_attn.hypothesis.inner_test(HSTUPagedKVTest(),
     4, 4, 1000, 1000, 1000, (128, 128), 128, 1.0, torch.bfloat16, True)
