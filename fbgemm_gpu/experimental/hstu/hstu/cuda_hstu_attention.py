@@ -180,15 +180,24 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         page_ids: Optional[torch.Tensor] = None,
         last_page_lens: Optional[torch.Tensor] = None,
         quant_mode: Optional[int] = -1,
+        return_pscores: bool = False, #this feature is only for testing purpose
+        dropout_p:float = 0.0,
     ) -> torch.Tensor:
         assert q.dim() == 3, "q shape should be (L, num_heads, head_dim)"
         assert k.dim() == 3, "k shape should be (L, num_heads, head_dim)"
         assert v.dim() == 3, "v shape should be (L, num_heads, hidden_dim)"
 
+        # return_pscores is only supported when p_dropout > 0.0
+        if return_pscores:
+            assert dropout_p > 0.0, "return_pscores is only supported when dropout_p > 0.0"
+
+        scaling_seqlen = -1 #defalut value
+
         major_version = torch.cuda.get_device_capability()[0]
         assert major_version == 8 or major_version == 9, "Only support sm80 and sm90"
+        dropout_rng_state = None
         if major_version == 8:
-            out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_80(
+            out, rab_padded, S_dmask, rng_state = torch.ops.fbgemm.hstu_varlen_fwd_80(
                 q,
                 k,
                 v,
@@ -211,7 +220,11 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 page_offsets,
                 page_ids,
                 last_page_lens,
+                dropout_p,
+                return_pscores,
+                None,
             )
+            dropout_rng_state = rng_state
         else:
             vt = None
             q_descale = None
@@ -290,6 +303,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             num_contexts,
             num_targets,
             rab_padded,
+            dropout_rng_state
         )
         ctx.major_version = major_version
         ctx.max_seqlen_q = max_seqlen_q
@@ -302,7 +316,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         ctx.has_drab = has_drab
         ctx.func = func
         ctx.quant_mode = quant_mode
-        return out
+        ctx.dropout_p = dropout_p
+        return (out, None) if not return_pscores else (out, S_dmask)
 
     @staticmethod
     def backward(  # pyre-ignore[14]
@@ -343,6 +358,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             num_contexts,
             num_targets,
             rab_padded,
+            dropout_rng_state
         ) = ctx.saved_tensors
 
         max_seqlen_q = ctx.max_seqlen_q
@@ -355,6 +371,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         has_drab = ctx.has_drab
         func = ctx.func
         quant_mode = ctx.quant_mode
+        dropout_p = ctx.dropout_p
+        scaling_seqlen = -1 #defalut value
 
         if ctx.major_version == 8:
             dq, dk, dv, dRab = torch.ops.fbgemm.hstu_varlen_bwd_80(
@@ -382,6 +400,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 has_drab,
                 func,
                 False,  # deterministic
+                p_dropout=dropout_p,
+                rng_state=dropout_rng_state
             )
         else:
             dout_t = None
@@ -499,6 +519,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None
         )
 
 
@@ -527,6 +549,8 @@ def hstu_attn_varlen_func(
     last_page_lens: Optional[torch.Tensor] = None,
     func: Optional[torch.Tensor] = None,
     quant_mode: Optional[int] = -1,
+    return_pscores: bool = False, #this feature is only for testing purpose
+    dropout_p:float = 0.0, #this feature is only for testing purpose
 ):
     """
     Arguments:
@@ -553,6 +577,8 @@ def hstu_attn_varlen_func(
         last_page_lens: (batch_size,). The lengths of the last pages in the batch.
         func: (nheads, total_q + 256). Function to describe the mask shape in arbitrary mask.
         quant_mode: int. Quantization mode.
+        return_pscores: bool. Whether to return the attention scores for testing purpose.
+        dropout_p: float. Dropout probability for testing purpose.
     Return:
         out: (total, nheads, headdim).
     """
@@ -601,6 +627,8 @@ def hstu_attn_varlen_func(
         page_ids,
         last_page_lens,
         quant_mode,
+        return_pscores,
+        dropout_p,
     )
 
 
@@ -629,9 +657,10 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         k = qkv[:, 1, :, :].detach()
         v = qkv[:, 2, :, :].detach()
         major_version = torch.cuda.get_device_capability()[0]
+        scaling_seqlen = -1 #defalut value
         assert major_version == 8 or major_version == 9, "Only support sm8x and sm90"
         if major_version == 8:
-            out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_80(
+            out, rab_padded, S_dmask, rng_state= torch.ops.fbgemm.hstu_varlen_fwd_80(
                 q,
                 k,
                 v,
@@ -931,6 +960,7 @@ def cuda_hstu_attn_varlen(
         major_version = torch.cuda.get_device_capability()[0]
         assert major_version == 8 or major_version == 9, "Only support sm80 and sm90"
         if major_version == 8:
+            scaling_seqlen = -1
             out, _ = torch.ops.fbgemm.hstu_varlen_fwd_80(
                 q,
                 k,
@@ -939,9 +969,9 @@ def cuda_hstu_attn_varlen(
                 cu_seqlens_k,
                 seqused_q,
                 seqused_k,
-                scaling_seqlen,
                 max_seqlen_q,
                 max_seqlen_k,
+                scaling_seqlen,
                 None,  # num_contexts,
                 num_targets,
                 1,  # target_group_size

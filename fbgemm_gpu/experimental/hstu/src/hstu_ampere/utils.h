@@ -342,11 +342,14 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd() {
       return {128, 64, 8};
     } else {
       if constexpr (kHeadDim <= 64) {
-        return {128, 96, 4};
+        // return {128, 96, 4};
+        return {128, 64, 4};
       } else if constexpr (kHeadDim <= 128) {
-        return {128, 96, 8};
+        // return {128, 96, 8};
+        return {128, 32, 4};
       } else {
-        return {128, 96, 8};
+        // return {128, 96, 8};
+        return {128, 64, 4};
       }
     }
   }
@@ -358,7 +361,8 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd() {
     }
   } else {
     if constexpr (kHeadDim <= 128) {
-      return {128, 96, 4};
+      // return {128, 96, 4};
+      return {128, 64, 4};
     } else {
       return {64, 64, 4};
     }

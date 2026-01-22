@@ -57,6 +57,8 @@ struct Hstu_params {
 struct Hstu_fwd_params : public Hstu_params {
   // The O matrix (output).
   void* __restrict__ o_ptr;
+  // The pointer to the P matrix.
+  void * __restrict__ p_ptr;
 
   // The stride between rows of O.
   index_t o_row_stride;
@@ -113,6 +115,17 @@ struct Hstu_fwd_params : public Hstu_params {
   bool is_context;
   bool is_paged_kv;
   bool is_arbitrary_mask;
+  // The dropout probability (probability of keeping an activation).
+  float p_dropout;
+  uint8_t p_dropout_in_uint8_t;
+  // Scale factor of 1 / (1 - p_dropout).
+  float rp_dropout;
+
+  // Random state.
+  at::PhiloxCudaState philox_args;
+
+  // Pointer to the RNG seed (idx 0) and offset (idx 1).
+  uint64_t * rng_state;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

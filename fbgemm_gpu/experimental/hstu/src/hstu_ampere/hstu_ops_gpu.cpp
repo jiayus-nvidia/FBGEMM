@@ -20,7 +20,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
 #include <torch/nn/functional.h>
-
+#include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::Generator and at::PhiloxCudaState
 #include <optional>
 
 #include "hstu.h"
@@ -71,12 +71,20 @@ void set_params_fprop(
     bool is_paged_kv,
     const at::Tensor& func,
     int window_size_left,
-    int window_size_right) {
+    int window_size_right,
+    void *p_d,
+    float p_dropout) {
   // Reset the parameters
   *params = {};
 
   params->arch = at::cuda::getCurrentDeviceProperties()->major * 10 +
       at::cuda::getCurrentDeviceProperties()->minor;
+
+  params->p_ptr = p_d;
+  params->p_dropout = 1.f - p_dropout;
+  params->p_dropout_in_uint8_t = uint8_t(std::floor(params->p_dropout * 255.0));
+  params->rp_dropout = 1.f / params->p_dropout;
+  TORCH_CHECK(p_dropout < 1.f);
 
   // Set the pointers and strides.
   params->q_ptr = q.data_ptr();
@@ -266,7 +274,8 @@ void set_params_dgrad(
     int window_size_right,
     bool deterministic,
     bool has_rab,
-    bool has_drab) {
+    bool has_drab,
+    float p_dropout) {
   *params = {};
   set_params_fprop(
       params,
@@ -301,7 +310,9 @@ void set_params_dgrad(
       false,
       func,
       window_size_left,
-      window_size_right);
+      window_size_right,
+      nullptr,
+      p_dropout);
 
   params->has_drab = has_drab;
 #ifdef HSTU_DISABLE_DRAB
@@ -463,7 +474,7 @@ void run_hstu_fwd_ampere(Hstu_fwd_params& params, cudaStream_t stream) {
   });
 }
 
-std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_80(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_fwd_80(
     const at::Tensor&
         q, // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
     const at::Tensor&
@@ -488,7 +499,10 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_80(
     const std::optional<at::Tensor>& kv_cache,
     const std::optional<at::Tensor>& page_offsets,
     const std::optional<at::Tensor>& page_ids,
-    const std::optional<at::Tensor>& last_page_lens) {
+    const std::optional<at::Tensor>& last_page_lens,
+    const double p_dropout,
+    const bool return_pscores,
+    std::optional<at::Generator> gen_) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
 
@@ -595,6 +609,22 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_80(
 
   bool is_paged_kv = kv_cache.has_value() && page_offsets.has_value() && page_ids.has_value() && last_page_lens.has_value();
   Hstu_fwd_params params;
+
+  //return S scores for dropout only during testing
+  at::Tensor p;
+  auto opts = q.options();
+  if (return_pscores) {
+    TORCH_CHECK(p_dropout > 0.0f, "return_pscores is only supported when p_dropout > 0.0");
+    p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts);
+  } else {
+    p = torch::empty({ 0 }, opts);
+  }
+  
+  // Always allocate rng_state, even if not used immediately
+  // This ensures the pointer remains valid during kernel execution
+  auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+  auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+
   set_params_fprop(
       &params,
       batch_size,
@@ -628,7 +658,22 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_80(
       is_paged_kv,
       func.has_value() ? func.value() : torch::Tensor(),
       window_size_left,
-      window_size_right);
+      window_size_right,
+      return_pscores ? p.data_ptr() : nullptr,
+      p_dropout);
+
+  params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+  int64_t counter_offset = params.b * params.h * 32;
+  if (p_dropout > 0.0)  {
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        gen_, at::cuda::detail::getDefaultCUDAGenerator());
+    // See Note [Acquire lock when using random generators]
+    std::lock_guard<std::mutex> lock(gen->mutex_);
+    params.philox_args = gen->philox_cuda_state(counter_offset);
+    // params.philox_args.seed_ = 2213111726676327;
+    // params.philox_args.offset_ = 4;
+  }
+
   if (total_k > 0) {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     run_hstu_fwd_ampere(params, stream);
@@ -636,7 +681,7 @@ std::tuple<at::Tensor, at::Tensor> hstu_varlen_fwd_80(
     out.zero_();
   }
 
-  return {out, has_rab ? rab.value() : at::Tensor()};
+  return {out, has_rab ? rab.value() : at::Tensor(), p, rng_state};
 }
 
 template <
@@ -821,7 +866,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
     const std::optional<at::Tensor>& rab,
     const bool has_drab,
     const std::optional<at::Tensor>& func,
-    const bool deterministic) {
+    const bool deterministic,
+    const double p_dropout,
+    std::optional<at::Generator> gen_,
+    std::optional<at::Tensor> rng_state) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -1010,7 +1058,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
       window_size_right,
       deterministic,
       has_rab,
-      has_drab);
+      has_drab,
+      p_dropout);
+
+  bool is_dropout = p_dropout > 0.0;
+  auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+    gen_, at::cuda::detail::getDefaultCUDAGenerator());
+  int64_t counter_offset = params.b * params.h * 32;
+  
+  if(rng_state.has_value()) {
+    params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
+  } else if( is_dropout ) {
+        // See Note [Acquire lock when using random generators]
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        params.philox_args = gen->philox_cuda_state(counter_offset);
+        auto seeds = at::cuda::philox::unpack(params.philox_args);
+        params.rng_state[0] = std::get<0>(seeds);
+        params.rng_state[1] = std::get<1>(seeds);
+  }
 
   if (total_q > 0) {
     run_hstu_bwd_ampere(params, stream);
@@ -1058,8 +1123,11 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "    Tensor? kv_cache=None, "
       "    Tensor? page_offsets=None, "
       "    Tensor? page_ids=None, "
-      "    Tensor? last_page_lens=None"
-      ") -> (Tensor, Tensor)");
+      "    Tensor? last_page_lens=None, "
+      "    float p_dropout=0.0, "
+      "    bool return_pscores=False, "
+      "    Generator? gen_=None"
+      ") -> (Tensor, Tensor, Tensor, Tensor)");
   m.def(
       "hstu_varlen_bwd_80("
       "    Tensor dout, "
@@ -1085,7 +1153,10 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "    Tensor? rab=None, "
       "    bool has_drab=False, "
       "    Tensor? func=None, "
-      "    bool deterministic=False"
+      "    bool deterministic=False, "
+      "    float p_dropout=0.0, "
+      "    Generator? gen_=None, "
+      "    Tensor? rng_state=None"
       ") -> (Tensor, Tensor, Tensor, Tensor)");
 }
 

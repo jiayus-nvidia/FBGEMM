@@ -26,6 +26,7 @@
 #include "kernel_traits.h"
 #include "static_switch.h"
 #include "utils.h"
+#include "dropout.h"
 
 namespace flash {
 
@@ -51,6 +52,9 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
   constexpr int  kNFunc = Kernel_traits::kNFunc;
   constexpr bool Is_deterministic = Kernel_traits::Is_deterministic;
   constexpr bool Rab_one_head = Kernel_traits::Rab_one_head;
+  constexpr bool Is_dropout = Kernel_traits::Is_dropout;
+  constexpr int kNWarps = Kernel_traits::kNWarps;
+  constexpr int AtomLayoutMS = Kernel_traits::AtomLayoutMSdP;
 
   // Shared memory.
   extern __shared__ char smem_[];
@@ -70,6 +74,9 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
   const HstuBlockInfo<Kernel_traits, Hstu_bwd_params> binfo(params, bidb);
   if (n_block * kBlockN >= binfo.actual_seqlen_k_padded)
     return;
+
+  FLASH_NAMESPACE::Dropout dropout(params.rng_state[0], params.rng_state[1], params.p_dropout_in_uint8_t,
+                           bidb, bidh, tidx, params.h);
 
   const int actual_seqlen_q = binfo.actual_seqlen_q;
   const int actual_seqlen_k = binfo.actual_seqlen_k;
@@ -774,6 +781,18 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
     auto acc_s_silu = make_fragment_like(acc_s);
     silu_bwd(acc_s, acc_s_silu);
 
+    //dropout operation
+    if constexpr (Is_dropout) {
+      int warp_id = tidx / 32;
+      int block_row_idx = m_block * (kBlockM / 16) + warp_id % AtomLayoutMS;
+      // Need col to be multiples of 32, since we're doing dropout with block of 16 x 32
+      static_assert(MMA_N_SdP % 2 == 0);
+      int block_col_idx = n_block * (kBlockN / 32) + (warp_id / AtomLayoutMS) * (MMA_N_SdP / 2);
+      dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+          acc_s, block_row_idx, block_col_idx, AtomLayoutMS
+      );
+    }
+
     for (int i = 0; i < size(acc_s_silu); ++i) {
       acc_s_silu(i) /= params.scaling_seqlen;
     }
@@ -992,6 +1011,13 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
 
   // Epilogue
   // Convert acc_dk and acc_dv from fp32 to fp16/bf16
+
+  if (Is_dropout) {
+    for (int i = 0; i < size(acc_dv); i++) {
+      acc_dv(i) *= params.rp_dropout;
+      acc_dk(i) *= params.rp_dropout;
+    }
+  }
   Tensor rdK = make_tensor_like<Element>(acc_dk);
   flash::convert_type_safe(acc_dk, rdK);
   Tensor rdV = make_tensor_like<Element>(acc_dv);
@@ -1218,7 +1244,8 @@ template <
     int AtomLayoutMSdP,
     int AtomLayoutNdKV,
     int AtomLayoutMdQ,
-    bool Is_V_in_regs>
+    bool Is_V_in_regs,
+    bool Is_dropout = false>
 void run_hstu_bwd_impl_(Hstu_bwd_params& params, cudaStream_t stream) {
   using Kernel_traits = Hstu_bwd_kernel_traits<
       kHeadDim,
@@ -1239,7 +1266,8 @@ void run_hstu_bwd_impl_(Hstu_bwd_params& params, cudaStream_t stream) {
       AtomLayoutNdKV,
       AtomLayoutMdQ,
       Is_V_in_regs,
-      elem_type>;
+      elem_type,
+      Is_dropout>;
 
   int gridDimx = (params.seqlen_k + kBlockN - 1) / kBlockN;
   if constexpr (Is_deterministic) {
@@ -1289,6 +1317,7 @@ template <
 void run_hstu_bwd_80(Hstu_bwd_params& params, cudaStream_t stream) {
   const bool rab_one_head = params.h_rab != params.h && params.h_rab == 1;
   BOOL_SWITCH(rab_one_head, Rab_one_head, [&] {
+    BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
     static constexpr auto tile_size =
         flash::get_tile_size_bwd<Arch, kHeadDim, Has_rab>();
     static constexpr int kBlockM = std::get<0>(tile_size);
@@ -1320,6 +1349,8 @@ void run_hstu_bwd_80(Hstu_bwd_params& params, cudaStream_t stream) {
         AtomLayoutMSdP,
         AtomLayoutNdKV,
         AtomLayoutMdQ,
-        false>(params, stream);
+        false,
+        Is_dropout>(params, stream);
     });
+  });
 }

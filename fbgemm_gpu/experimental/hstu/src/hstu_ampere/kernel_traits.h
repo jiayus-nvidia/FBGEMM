@@ -55,6 +55,8 @@ template <
     bool Is_Q_in_regs_ = false,
     bool Share_Q_K_smem_ = false,
     typename elem_type = cutlass::half_t,
+    bool Is_dropout_ = false,
+    bool Return_pscores_ = false,
     typename Base =
         Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type>>
 struct Hstu_fwd_kernel_traits : public Base {
@@ -66,6 +68,8 @@ struct Hstu_fwd_kernel_traits : public Base {
   static constexpr int  kNFunc = Is_arbitrary_ ? kNFunc_ : 0;
   static constexpr bool Has_rab = Has_rab_;
   static constexpr bool Paged_KV = Paged_KV_;
+  static constexpr bool Is_dropout = Is_dropout_;
+  static constexpr bool Return_pscores = Return_pscores_;
 
   using Element = typename Base::Element;
   using ElementAccum = typename Base::ElementAccum;
@@ -227,6 +231,7 @@ template <
     int AtomLayoutMdQ_ = 4,
     bool Is_V_in_regs_ = false,
     typename elem_type = cutlass::half_t,
+    bool Is_dropout_ = false,
     typename Base =
         Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type>>
 struct Hstu_bwd_kernel_traits : public Base {
@@ -248,6 +253,7 @@ struct Hstu_bwd_kernel_traits : public Base {
   static constexpr bool Has_drab = Has_drab_;
   static constexpr bool Rab_one_head = Rab_one_head_;
   static constexpr bool Is_V_in_regs = Is_V_in_regs_;
+  static constexpr bool Is_dropout = Is_dropout_;
 
   // The number of threads.
   static constexpr int kNWarps = kNWarps_;

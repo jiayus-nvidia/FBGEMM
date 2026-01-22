@@ -25,6 +25,7 @@
 #include "kernel_traits.h"
 #include "static_switch.h"
 #include "utils.h"
+#include "dropout.h"
 
 namespace flash {
 
@@ -60,10 +61,28 @@ inline __device__ void hstu_compute_attn_1rowblock(
   constexpr int kBlockM = Kernel_traits::kBlockM;
   constexpr int kBlockN = Kernel_traits::kBlockN;
   constexpr int kHeadDim = Kernel_traits::kHeadDim;
+  constexpr bool Is_dropout = Kernel_traits::Is_dropout;
+  constexpr bool Return_pscores = Kernel_traits::Return_pscores;
+  constexpr int kNWarps = Kernel_traits::kNWarps;
 
   const HstuBlockInfo<Kernel_traits, Params> binfo(params, bidb);
   if (m_block * kBlockM >= binfo.actual_seqlen_q_padded) {
     return;
+  }
+
+  auto seed_offset = at::cuda::philox::unpack(params.philox_args);
+  // seed_offset.first = 2213111726676327;
+  // seed_offset.second = 4;
+  // FLASH_NAMESPACE::Dropout dropout(2213111726676327, 4, params.p_dropout_in_uint8_t,
+  //     bidb, bidh, tidx, params.h);
+  FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
+    bidb, bidh, tidx, params.h);
+  
+  if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
+    params.rng_state[0] = std::get<0>(seed_offset);
+    params.rng_state[1] = std::get<1>(seed_offset);
+    // params.rng_state[0] = 2213111726676327;
+    // params.rng_state[1] = 4;
   }
 
   char *smem_q = reinterpret_cast<char*>(smem_);
@@ -167,6 +186,9 @@ inline __device__ void hstu_compute_attn_1rowblock(
                               make_shape(Int<kNFunc/2>{}, Int<kBlockM>{}),
                               make_coord(Int<0>{}, m_block));
 
+  const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
+        + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
+
   // We iterate over the blocks in reverse order.
   Tensor mQ = make_tensor(
       make_gmem_ptr(
@@ -198,6 +220,10 @@ inline __device__ void hstu_compute_attn_1rowblock(
       mV(_, bidh / params.h_h_k_ratio, _),
       Shape<Int<kBlockN>, Int<kHeadDim>>{},
       make_coord(_, 0));
+  
+  Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
+    Shape<Int<kBlockM>, Int<kBlockN>>{},
+    make_stride(params.seqlen_k_rounded, _1{}));
 
   Tensor mKV_page = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.kv_cache_ptr)),
                                 make_shape(params.total_pages, 2, params.page_size, params.h_k, params.d),
@@ -381,7 +407,7 @@ inline __device__ void hstu_compute_attn_1rowblock(
   Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle(_, _, _0{}));
   Tensor acc_o =
       partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
-
+  Tensor tSgS  = thr_mma.partition_C(gP);
   //
   // Copy Atom retiling
   //
@@ -689,6 +715,20 @@ inline __device__ void hstu_compute_attn_1rowblock(
     // Convert acc_s from fp32 to fp16/bf16
     Tensor rP = make_tensor_like<Element>(acc_s);
     flash::convert_type_safe(acc_s, rP);
+    int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+    int block_col_idx = n_block * (kBlockN / 32);
+    if (Return_pscores) {
+      Tensor rP_drop = make_fragment_like(rP);
+      cute::copy(rP, rP_drop);
+      dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+          rP_drop, block_row_idx, block_col_idx, kNWarps
+      );
+      cute::copy(rP_drop, tSgS);
+      tSgS.data() = tSgS.data() + (-kBlockN);
+    }
+    if (Is_dropout) {
+      dropout.template apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
+    }
 
     // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2) if
     // using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
@@ -716,6 +756,7 @@ inline __device__ void hstu_compute_attn_1rowblock(
   // scale acc_o
   for (int i = 0; i < size(acc_o); ++i) {
     acc_o(i) /= params.scaling_seqlen;
+    acc_o(i) *= params.rp_dropout;
   }
 
   // Epilogue
@@ -778,7 +819,8 @@ inline __device__ void hstu_compute_attn_1rowblock(
 
 template <typename Kernel_traits, typename Params>
 __global__ void hstu_fwd_kernel(Params params) {
-  int m_block = gridDim.x - blockIdx.x - 1;
+  // int m_block = gridDim.x - blockIdx.x - 1;
+  int m_block = blockIdx.x;
   int bidh = blockIdx.y;
   int bidb = blockIdx.z;
 
@@ -802,7 +844,9 @@ template <
     bool Has_rab,
     bool Paged_KV,
     bool Is_Q_in_regs = false,
-    bool Share_Q_K_smem = false>
+    bool Share_Q_K_smem = false,
+    bool Is_dropout = false,
+    bool Return_pscores = false>
 void run_hstu_fwd_impl(Hstu_fwd_params& params, cudaStream_t stream) {
   using Kernel_traits = Hstu_fwd_kernel_traits<
       kHeadDim,
@@ -819,7 +863,9 @@ void run_hstu_fwd_impl(Hstu_fwd_params& params, cudaStream_t stream) {
       Paged_KV,
       Is_Q_in_regs,
       Share_Q_K_smem,
-      elem_type>;
+      elem_type,
+      Is_dropout,
+      Return_pscores>;
 
   size_t smem_size = Kernel_traits::kSmemSize;
   const int num_m_block = (params.seqlen_q + kBlockM - 1) / kBlockM;
@@ -847,7 +893,10 @@ template <
     bool Is_arbitrary,
     int kNFunc>
 void run_hstu_fwd_8x(Hstu_fwd_params& params, cudaStream_t stream) {
+  const bool return_pscores = params.p_ptr != nullptr;
   INT_SWITCH(params.page_size, Page_Size, [&] {
+    BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+       BOOL_SWITCH(return_pscores, ReturnPScoresConst, [&] {
     static constexpr bool Paged_KV = Page_Size > 0;
     static constexpr auto tile_size =
         flash::get_tile_size_fwd<Arch, kHeadDim, Has_rab>();
@@ -856,6 +905,7 @@ void run_hstu_fwd_8x(Hstu_fwd_params& params, cudaStream_t stream) {
     static constexpr int kNWarps = std::get<2>(tile_size);
     static constexpr bool Is_Q_in_regs = kHeadDim <= 128;
     static constexpr bool Share_Q_K_smem = kHeadDim <= 128;
+    static constexpr bool Return_pscores = ReturnPScoresConst && Is_dropout;
     run_hstu_fwd_impl<
         elem_type,
         kHeadDim,
@@ -871,6 +921,10 @@ void run_hstu_fwd_8x(Hstu_fwd_params& params, cudaStream_t stream) {
         Has_rab,
         Paged_KV,
         Is_Q_in_regs,
-        Share_Q_K_smem>(params, stream);
+        Share_Q_K_smem,
+        Is_dropout,
+        Return_pscores>(params, stream);
+      });
+    });
   });
 }
