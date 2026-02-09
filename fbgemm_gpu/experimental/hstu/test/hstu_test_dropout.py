@@ -377,8 +377,7 @@ def generate_input(
     )
 
     if is_delta_q is False and dtype != torch.float8_e4m3fn:
-        # qkv = torch.empty((L_q, 3, heads, attn_dim), dtype=dtype, device=torch.device("cuda")).uniform_(-1, 1).requires_grad_()
-        qkv = torch.ones((L_q, 3, heads, attn_dim), dtype=dtype, device=torch.device("cuda")).requires_grad_()
+        qkv = torch.empty((L_q, 3, heads, attn_dim), dtype=dtype, device=torch.device("cuda")).uniform_(-1, 1).requires_grad_()
         q = qkv[:, 0, :, :]
         k = qkv[:, 1, :, :]
         v = qkv[:, 2, :, :]
@@ -707,7 +706,7 @@ def _hstu_attention_maybe_from_cache(
         masked_qk_attn = qk_attn
     masked_qk_attn = masked_qk_attn * alpha
     dropout_scaling = 1.0 / (1 - dropout_p)
-    # masked_qk_attn = F.silu(masked_qk_attn)
+    masked_qk_attn = F.silu(masked_qk_attn)
     if dropout_mask is not None:
         # print("dropout_mask type is {}".format((dropout_mask)))
         print("dropout_mask shape is {}".format((dropout_mask.shape)))
@@ -950,9 +949,9 @@ class HSTU16Test(unittest.TestCase):
                 causal=is_causal,
                 window_size=window_size,
             )
-            num_negative = (S_dmask_converted < 0).sum().item()
-            num_positive = (S_dmask_converted >= 0).sum().item()
-            dropout_mask = S_dmask_converted >= 0.0
+            dropout_mask = ~torch.isinf(S_dmask_converted)
+            num_negative = (~dropout_mask).sum().item()
+            num_positive = dropout_mask.sum().item()
             print("=== dropout_mask is {}".format(dropout_mask))
             num_true_int = dropout_mask.sum().item()  # 3，Python int
             all_num = dropout_mask.numel()  # 8，Python int
@@ -2296,7 +2295,7 @@ if __name__ == "__main__":
     '''
     for i in range(1):
         HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
-        1, 1, 0, (128, 128), 1.0, (False, False, None), (1024, 1024), (0, (-1, 0), 1, False), torch.bfloat16, True, dropout_p=0.30)
+        2, 16, 0, (128, 128), 1.0, (False, False, None), (1024, 1024), (0, (-1, 0), 1, False), torch.bfloat16, True, dropout_p=0.30)
         # HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
         # 1, 1, 0, (128, 128), 1.0, (False, False, None), (128, 128), (0, (-1, -1), 1, False), torch.bfloat16, True, dropout_p=0.17)
 

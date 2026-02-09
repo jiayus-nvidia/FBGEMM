@@ -71,18 +71,11 @@ inline __device__ void hstu_compute_attn_1rowblock(
   }
 
   auto seed_offset = at::cuda::philox::unpack(params.philox_args);
-  // seed_offset.first = 2213111726676327;
-  // seed_offset.second = 4;
-  // FLASH_NAMESPACE::Dropout dropout(2213111726676327, 4, params.p_dropout_in_uint8_t,
-  //     bidb, bidh, tidx, params.h);
   FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
     bidb, bidh, tidx, params.h);
-  
   if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
     params.rng_state[0] = std::get<0>(seed_offset);
     params.rng_state[1] = std::get<1>(seed_offset);
-    // params.rng_state[0] = 2213111726676327;
-    // params.rng_state[1] = 4;
   }
 
   char *smem_q = reinterpret_cast<char*>(smem_);
@@ -710,26 +703,30 @@ inline __device__ void hstu_compute_attn_1rowblock(
     for (int i = 0; i < size(acc_s); ++i) {
       acc_s(i) *= params.alpha;
     }
+    // global coordinates dropout cjerry 
+    if (Is_dropout) {
+      Tensor cS_fwd = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+      Tensor tScS_fwd = thr_mma.partition_C(cS_fwd);
+      dropout.apply_dropout_global(acc_s, tScS_fwd, m_block, n_block,
+                                    kBlockM, kBlockN, ElementAccum(-INFINITY));
+    }
     fast_silu(acc_s);
 
     // Convert acc_s from fp32 to fp16/bf16
     Tensor rP = make_tensor_like<Element>(acc_s);
     flash::convert_type_safe(acc_s, rP);
-    int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
-    int block_col_idx = n_block * (kBlockN / 32);
-    if (Return_pscores) {
-      Tensor rP_drop = make_fragment_like(rP);
-      cute::copy(rP, rP_drop);
-      dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-          rP_drop, block_row_idx, block_col_idx, kNWarps
-      );
-      cute::copy(rP_drop, tSgS);
+
+    // Write S_dmask for testing: re-apply same dropout pattern on rP with -inf
+    if (Is_dropout && Return_pscores) {
+      Tensor cS_fwd = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+      Tensor tScS_fwd = thr_mma.partition_C(cS_fwd);
+      Tensor rP_dmask = make_fragment_like(rP);
+      cute::copy(rP, rP_dmask);
+      dropout.apply_dropout_global(rP_dmask, tScS_fwd, m_block, n_block,
+                                    kBlockM, kBlockN, Element(-INFINITY));
+      cute::copy(rP_dmask, tSgS);
       tSgS.data() = tSgS.data() + (-kBlockN);
     }
-    if (Is_dropout) {
-      dropout.template apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
-    }
-
     // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2) if
     // using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
     Tensor tOrP = make_tensor(

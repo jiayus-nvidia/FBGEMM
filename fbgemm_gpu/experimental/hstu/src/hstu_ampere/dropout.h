@@ -82,15 +82,22 @@ struct Dropout {
             , offset(offset + (bid * nheads + hid) * 32 + tid % 32)
             , p_dropout_in_uint8_t(p_dropout_in_uint8_t) {
     }
-
-    template <bool encode_dropout_in_sign_bit=false, typename Engine, typename Layout>
+    
+    template <bool encode_dropout_in_sign_bit=false, bool drop_value_neg_inf=false, typename Engine, typename Layout>
     __forceinline__ __device__ void apply_dropout(Tensor<Engine, Layout> &tensor_,
                                          int block_row_start, int block_col_start, int block_row_stride) {
         // convert shape from (4, MMA_M, MMA_N) to (8, MMA_M, MMA_N / 2)
         Tensor tensor = make_tensor(tensor_.data(), convert_layout_acc_dropout(tensor_.layout()));
         using T = typename Engine::value_type;
         auto encode_dropout = [](bool keep, T val) {
-            return keep ? val : (encode_dropout_in_sign_bit ? -val : T(0));
+            if constexpr (drop_value_neg_inf) {
+                return keep ? val : T(-INFINITY);
+            } else if constexpr (!encode_dropout_in_sign_bit) {
+                return keep ? val : T(0);
+            } else {
+                T abs_val = val < T(0) ? -val : val;
+                return keep ? abs_val : -abs_val;
+            }
         };
         static_assert(decltype(size<2>(tensor))::value % 2 == 0);
         const uint16_t p_dropout_8bit_in_uint16_t = uint16_t(p_dropout_in_uint8_t);
@@ -147,6 +154,34 @@ struct Dropout {
                 // // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0)) {
                 // //     printf("n = %d, ph  Philox: %u, %u, %u, %u\n", n, rnd_8.x, rnd_8.y, rnd_8.z, rnd_8.w);
                 // // }
+            }
+        }
+    }
+
+    // using global coordinates 
+    template <typename TensorAcc, typename CoordTensor, typename T_drop>
+    __forceinline__ __device__ void apply_dropout_global(
+        TensorAcc &tensor,
+        const CoordTensor &coords,
+        int m_block, int n_block, int kBlockM, int kBlockN,
+        T_drop drop_value) {
+        using T = typename TensorAcc::value_type;
+        #pragma unroll
+        for (int i = 0; i < size<0>(tensor); ++i) {
+            #pragma unroll
+            for (int m = 0; m < size<1>(tensor); ++m) {
+                #pragma unroll
+                for (int n = 0; n < size<2>(tensor); ++n) {
+                    int global_row = m_block * kBlockM + get<0>(coords(i, m, n));
+                    int global_col = n_block * kBlockN + get<1>(coords(i, m, n));
+                    uint2 pos = make_uint2(global_row, global_col);
+                    uint4 random = philox(seed,
+                        reinterpret_cast<unsigned long long&>(pos), offset);
+                    uint8_t rnd = reinterpret_cast<uint8_t*>(&random)[0];
+                    if (rnd > p_dropout_in_uint8_t) {
+                        tensor(i, m, n) = T(drop_value);
+                    }
+                }
             }
         }
     }

@@ -778,20 +778,14 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
     for (int i = 0; i < size(acc_s); ++i) {
       acc_s(i) *= params.alpha;
     }
+    // global coordinates dropout cjerry
+    if constexpr (Is_dropout) {
+      Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+      Tensor tScS = thr_mma_sdp.partition_C(cS);
+      dropout.apply_dropout_global(acc_s, tScS, m_block, n_block, kBlockM, kBlockN, ElementAccum(-INFINITY));
+    }
     auto acc_s_silu = make_fragment_like(acc_s);
     silu_bwd(acc_s, acc_s_silu);
-
-    //dropout operation
-    if constexpr (Is_dropout) {
-      int warp_id = tidx / 32;
-      int block_row_idx = m_block * (kBlockM / 16) + warp_id % AtomLayoutMS;
-      // Need col to be multiples of 32, since we're doing dropout with block of 16 x 32
-      static_assert(MMA_N_SdP % 2 == 0);
-      int block_col_idx = n_block * (kBlockN / 32) + (warp_id / AtomLayoutMS) * (MMA_N_SdP / 2);
-      dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-          acc_s, block_row_idx, block_col_idx, AtomLayoutMS
-      );
-    }
 
     for (int i = 0; i < size(acc_s_silu); ++i) {
       acc_s_silu(i) /= params.scaling_seqlen;
@@ -836,6 +830,9 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
 
     for (int i = 0; i < size(acc_dp); ++i) {
       acc_dp(i) /= params.scaling_seqlen;
+      if constexpr (Is_dropout) {
+        acc_dp(i) *= params.rp_dropout;
+      }
     }
     dsilu_bwd(acc_dp, acc_s);
     for (int i = 0; i < size(acc_dp); ++i) {
@@ -1015,7 +1012,7 @@ inline __device__ void hstu_compute_dq_dk_dv_1colblock(
   if (Is_dropout) {
     for (int i = 0; i < size(acc_dv); i++) {
       acc_dv(i) *= params.rp_dropout;
-      acc_dk(i) *= params.rp_dropout;
+      // acc_dk(i) *= params.rp_dropout;  // dp has mul rp_dropout
     }
   }
   Tensor rdK = make_tensor_like<Element>(acc_dk);

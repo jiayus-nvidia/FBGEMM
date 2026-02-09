@@ -809,7 +809,7 @@ class HSTU16Test(unittest.TestCase):
             is_delta_q=is_delta_q,
         )
         if qkv is None:
-            hstu_out = hstu_attn_varlen_func(
+            hstu_out, _ = hstu_attn_varlen_func(
                 q=q.to(dtype),
                 k=k.to(dtype),
                 v=v.to(dtype),
@@ -830,7 +830,7 @@ class HSTU16Test(unittest.TestCase):
                 func=func,
             )
         else:
-            hstu_out = hstu_attn_qkvpacked_func(
+            hstu_out, _ = hstu_attn_qkvpacked_func(
                 qkv=qkv.to(dtype),
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,

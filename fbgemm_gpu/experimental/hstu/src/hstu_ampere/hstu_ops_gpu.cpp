@@ -616,6 +616,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_fwd_80(
   if (return_pscores) {
     TORCH_CHECK(p_dropout > 0.0f, "return_pscores is only supported when p_dropout > 0.0");
     p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts);
+    // should be clear, otherwise will have undefined value in ref? be careful
+    // p.zero_();
   } else {
     p = torch::empty({ 0 }, opts);
   }
