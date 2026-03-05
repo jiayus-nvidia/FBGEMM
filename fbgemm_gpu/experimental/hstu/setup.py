@@ -332,6 +332,9 @@ class NinjaBuildExtension(BuildExtension):
 
     def build_extensions(self):
         super().build_extensions()
+
+    def run(self):
+        super().run()
         import sysconfig
         for ext in self.extensions:
             ext_suffix = sysconfig.get_config_var('EXT_SUFFIX')
