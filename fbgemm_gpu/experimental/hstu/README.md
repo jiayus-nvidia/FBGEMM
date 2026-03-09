@@ -7,8 +7,9 @@ FBGEMM HSTU (Hierarchical Sequential Transduction Units)
 FBGEMM HSTU is a high-performance attention implementation for different NVIDIA GPU architectures:
 - **HSTU-Ampere**: Runs on Ampere and Ada GPUs (A100, L20...)
 - **HSTU-Hopper**: Optimized for Hopper GPUs (H100, H20...)
+- **HSTU-Blackwell**: Optimized for Blackwell GPUs (B200...)
 
-Both HSTU-2 and HSTU-3 share the same API:
+All above share the same API:
 
 ```python
 def hstu_attn_varlen_func(
@@ -39,7 +40,7 @@ def hstu_attn_varlen_func(
 )
 ```
 
-**Note:** This function automatically detects the GPU architecture at runtime and dispatches to the appropriate implementation (HSTU-Ampere or HSTU-Hopper).
+**Note:** This function automatically detects the GPU architecture at runtime and dispatches to the appropriate implementation (HSTU-Ampere, HSTU-Hopper or HSTU-Blackwell).
 
 
 # **2. Installation**
@@ -111,9 +112,16 @@ export HSTU_DISABLE_DETERMINISTIC=TRUE; \
 export HSTU_DISABLE_86OR89=TRUE; \
 python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="8.0 9.0"
 
+# Install HSTU-Blackwell
+pip install nvidia-cutlass-dsl && python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="10.0"
+
 # If you don't add -DTORCH_CUDA_ARCH_LIST, the default is "8.0 9.0".
 # If you change any environment variables above, please run `python setup.py clean` and delete all *.cu files in src/hstu_hopper/instantiations/ and/or src/hstu_ampere/instantiations/ before compiling again.
-# If you want to only install HSTU, without covering other parts of fbgemm_gpu, please run `cd experimental/hstu` and then `export ... export HSTU_ARCH_LIST="8.0"/"9.0"/"8.0 9.0"; python setup.py install`. And if you install this way, please import hstu, instead of fbgemm_gpu.experimental.hstu.
+# To install HSTU standalone (without the rest of fbgemm_gpu), run from experimental/hstu/:
+#   export HSTU_DISABLE_BACKWARD=FALSE ...  # same environment variables as above
+#   HSTU_ARCH_LIST="8.0 9.0 10.0" python setup.py install
+# For sm100-only, the export variables are not needed since Blackwell is pure Python/Triton.
+# Then import hstu instead of fbgemm_gpu.experimental.hstu.
 ```
 
 # **3. Features**
@@ -162,3 +170,14 @@ python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="8.0 9.0"
   * quant_mode == 4: Per batch quantization. Shape of q_descale is (batch_size).
   * quant_mode == 5: Per tensor quantization. Shape of q_descale is (1).
 - **Note**: Only undeterministic backward implementation
+
+### HSTU-Blackwell
+- **Supported GPUs**: Blackwell only (B200)
+- **Data types**: FP16, BF16
+- **Head dimensions**: 64, 128
+- **Attention masks**: Almost same as HSTU-Ampere, only without context mask.
+- **Paged attention**: Supported in forward only. Page size is 128.
+- **RAB/dRAB**: Not supported.
+- **Quantization mode**: Not supported. (no FP8)
+- **Note**: Implemented using NVIDIA CUTLASS DSL (cute-dsl), JIT compiled at first call. Only undeterministic backward implementation.
+- **Note**: HSTU-Blackwell does **not** support `seqused_q` and `seqused_k`, i.e., variable valid token length is not supported.

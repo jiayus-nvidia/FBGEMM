@@ -57,7 +57,7 @@ DISABLE_HDIM64 = os.getenv("HSTU_DISABLE_HDIM64", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("HSTU_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("HSTU_DISABLE_HDIM256", "FALSE") == "TRUE"
 DISABLE_86OR89 = os.getenv("HSTU_DISABLE_86OR89", "TRUE") == "TRUE"
-arch_list = os.getenv("HSTU_ARCH_LIST", "8.0 9.0")
+arch_list = os.getenv("HSTU_ARCH_LIST", "8.0 9.0 10.0")
 
 ONLY_COMPILE_SO = os.getenv("HSTU_ONLY_COMPILE_SO", "FALSE") == "TRUE"
 
@@ -182,126 +182,130 @@ if not SKIP_CUDA_BUILD:
     if bare_metal_version < Version("12.3"):
         raise RuntimeError("HSTU is only supported on CUDA 12.3 and above")
 
-    cc_flag = []
-    cc_flag.append("-gencode")
-    if "9.0" in arch_list:
-        cc_flag.append("arch=compute_90a,code=sm_90a")
-    if "8.0" in arch_list:
-        cc_flag.append("arch=compute_80,code=sm_80")
+    if "8.0" not in arch_list and "9.0" not in arch_list and "10.0" not in arch_list:
+        raise ValueError("At least one of 8.0, 9.0, or 10.0 must be in arch_list")
 
-    # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
-    # torch._C._GLIBCXX_USE_CXX11_ABI
-    # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
-    if FORCE_CXX11_ABI:
-        torch._C._GLIBCXX_USE_CXX11_ABI = True
-    repo_dir = Path(this_dir).parent.parent.parent
-    cutlass_dir = repo_dir / "external" / "cutlass"
+    # sm100 (Blackwell) is pure Python/Triton, only sm80/sm90 need CUDA compilation
+    if "8.0" in arch_list or "9.0" in arch_list:
+        cc_flag = []
+        if "9.0" in arch_list:
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_90a,code=sm_90a")
+        if "8.0" in arch_list:
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_80,code=sm_80")
 
-    feature_args = (
-        []
-        + (["-DHSTU_DISABLE_BACKWARD"] if DISABLE_BACKWARD else [])
-        + (["-DHSTU_DISABLE_DETERMINISTIC"] if DISABLE_DETERMINISTIC else [])
-        + (["-DHSTU_DISABLE_LOCAL"] if DISABLE_LOCAL else [])
-        + (["-DHSTU_DISABLE_CAUSAL"] if DISABLE_CAUSAL else [])
-        + (["-DHSTU_DISABLE_CONTEXT"] if DISABLE_CONTEXT else [])
-        + (["-DHSTU_DISABLE_TARGET"] if DISABLE_TARGET else [])
-        + (["-DHSTU_DISABLE_ARBITRARY"] if DISABLE_ARBITRARY else [])
-        + (["-DHSTU_ARBITRARY_NFUNC=" + str(ARBITRARY_NFUNC)])
-        + (["-DHSTU_DISABLE_RAB"] if DISABLE_RAB else [])
-        + (["-DHSTU_DISABLE_DRAB"] if DISABLE_DRAB else [])
-        + (["-DHSTU_DISABLE_BF16"] if DISABLE_BF16 else [])
-        + (["-DHSTU_DISABLE_FP16"] if DISABLE_FP16 else [])
-        + (["-DHSTU_DISABLE_FP8"] if DISABLE_FP8 else [])
-        + (["-DHSTU_USE_E5M2_BWD"] if USE_E5M2_BWD else [])
-        + (["-DHSTU_DISABLE_HDIM32"] if DISABLE_HDIM32 else [])
-        + (["-DHSTU_DISABLE_HDIM64"] if DISABLE_HDIM64 else [])
-        + (["-DHSTU_DISABLE_HDIM128"] if DISABLE_HDIM128 else [])
-        + (["-DHSTU_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
-        + (["-DHSTU_DISABLE_86OR89"] if DISABLE_86OR89 else [])
-    )
+        # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
+        # torch._C._GLIBCXX_USE_CXX11_ABI
+        # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
+        if FORCE_CXX11_ABI:
+            torch._C._GLIBCXX_USE_CXX11_ABI = True
+        repo_dir = Path(this_dir).parent.parent.parent
+        cutlass_dir = repo_dir / "external" / "cutlass"
 
-    if DISABLE_BF16 and DISABLE_FP16 and DISABLE_FP8:
-        raise ValueError("At least one of DISABLE_BF16, DISABLE_FP16, or DISABLE_FP8 must be False")
-    if DISABLE_FP8 and USE_E5M2_BWD:
-        raise ValueError("Cannot support e5m2 bwd with fp8 disabled")
-    if DISABLE_HDIM32 and DISABLE_HDIM64 and DISABLE_HDIM128 and DISABLE_HDIM256:
-        raise ValueError("At least one of DISABLE_HDIM32, DISABLE_HDIM64, DISABLE_HDIM128, or DISABLE_HDIM256 must be False")
-    if DISABLE_BACKWARD and not DISABLE_DRAB:
-        raise ValueError("Cannot support drab without backward")
-    if DISABLE_RAB and not DISABLE_DRAB:
-        raise ValueError("Cannot support drab without rab")
-    if DISABLE_CAUSAL and not DISABLE_TARGET:
-        raise ValueError("Cannot support target without causal")
-    if DISABLE_CAUSAL and not DISABLE_CONTEXT:
-        raise ValueError("Cannot support context without causal")
-    if not DISABLE_ARBITRARY and ARBITRARY_NFUNC % 2 == 0:
-        raise ValueError("ARBITRARY_NFUNC must be odd")
-    if "8.0" not in arch_list and "9.0" not in arch_list:
-        raise ValueError("At least one of 8.0 or 9.0 must be in arch_list")
-
-    torch_cpp_sources = []
-    subprocess.run(["rm", "-rf", "src/hstu_ampere/instantiations/*"])
-    subprocess.run(["rm", "-rf", "src/hstu_hopper/instantiations/*"])
-    if "8.0" in arch_list:
-        torch_cpp_sources.append("src/hstu_ampere/hstu_ops_gpu.cpp")
-        generate_kernels_ampere("src/hstu_ampere/instantiations")
-    if "9.0" in arch_list:
-        torch_cpp_sources.append("src/hstu_hopper/hstu_ops_gpu.cpp")
-        generate_kernels_hopper("src/hstu_hopper/instantiations")
-    cuda_sources = (glob.glob("src/hstu_ampere/instantiations/*.cu") if "8.0" in arch_list else []) + (glob.glob("src/hstu_hopper/instantiations/*.cu") if "9.0" in arch_list else [])
-
-    nvcc_flags = [
-        "-O3",
-        "-std=c++17",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_BFLOAT16_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "-U__CUDA_NO_BFLOAT162_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "--use_fast_math",
-        # "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",  # printing out number of registers
-        # "--resource-usage",  # printing out number of registers
-        # "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
-        "-DNDEBUG",  # Important, otherwise performance is severely impacted
-        "-lineinfo",
-    ]
-    if get_platform() == "win_amd64":
-        nvcc_flags.extend(
-            [
-                "-D_USE_MATH_DEFINES",  # for M_LN2
-                "-Xcompiler=/Zc:__cplusplus",  # sets __cplusplus correctly, CUTLASS_CONSTEXPR_IF_CXX17 needed for cutlass::gcd
-            ]
+        feature_args = (
+            []
+            + (["-DHSTU_DISABLE_BACKWARD"] if DISABLE_BACKWARD else [])
+            + (["-DHSTU_DISABLE_DETERMINISTIC"] if DISABLE_DETERMINISTIC else [])
+            + (["-DHSTU_DISABLE_LOCAL"] if DISABLE_LOCAL else [])
+            + (["-DHSTU_DISABLE_CAUSAL"] if DISABLE_CAUSAL else [])
+            + (["-DHSTU_DISABLE_CONTEXT"] if DISABLE_CONTEXT else [])
+            + (["-DHSTU_DISABLE_TARGET"] if DISABLE_TARGET else [])
+            + (["-DHSTU_DISABLE_ARBITRARY"] if DISABLE_ARBITRARY else [])
+            + (["-DHSTU_ARBITRARY_NFUNC=" + str(ARBITRARY_NFUNC)])
+            + (["-DHSTU_DISABLE_RAB"] if DISABLE_RAB else [])
+            + (["-DHSTU_DISABLE_DRAB"] if DISABLE_DRAB else [])
+            + (["-DHSTU_DISABLE_BF16"] if DISABLE_BF16 else [])
+            + (["-DHSTU_DISABLE_FP16"] if DISABLE_FP16 else [])
+            + (["-DHSTU_DISABLE_FP8"] if DISABLE_FP8 else [])
+            + (["-DHSTU_USE_E5M2_BWD"] if USE_E5M2_BWD else [])
+            + (["-DHSTU_DISABLE_HDIM32"] if DISABLE_HDIM32 else [])
+            + (["-DHSTU_DISABLE_HDIM64"] if DISABLE_HDIM64 else [])
+            + (["-DHSTU_DISABLE_HDIM128"] if DISABLE_HDIM128 else [])
+            + (["-DHSTU_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
+            + (["-DHSTU_DISABLE_86OR89"] if DISABLE_86OR89 else [])
         )
-    include_dirs = [
-        cutlass_dir / "include",
-    ]
-    if "8.0" in arch_list:
-        include_dirs.append(Path(this_dir) / "src" / "hstu_ampere")
-    if "9.0" in arch_list:
-        include_dirs.append(Path(this_dir) / "src" / "hstu_hopper")
 
-    sources = None
-    if ONLY_COMPILE_SO:
-        sources = cuda_sources
-    else:
-        sources = torch_cpp_sources + cuda_sources
+        if DISABLE_BF16 and DISABLE_FP16 and DISABLE_FP8:
+            raise ValueError("At least one of DISABLE_BF16, DISABLE_FP16, or DISABLE_FP8 must be False")
+        if DISABLE_FP8 and USE_E5M2_BWD:
+            raise ValueError("Cannot support e5m2 bwd with fp8 disabled")
+        if DISABLE_HDIM32 and DISABLE_HDIM64 and DISABLE_HDIM128 and DISABLE_HDIM256:
+            raise ValueError("At least one of DISABLE_HDIM32, DISABLE_HDIM64, DISABLE_HDIM128, or DISABLE_HDIM256 must be False")
+        if DISABLE_BACKWARD and not DISABLE_DRAB:
+            raise ValueError("Cannot support drab without backward")
+        if DISABLE_RAB and not DISABLE_DRAB:
+            raise ValueError("Cannot support drab without rab")
+        if DISABLE_CAUSAL and not DISABLE_TARGET:
+            raise ValueError("Cannot support target without causal")
+        if DISABLE_CAUSAL and not DISABLE_CONTEXT:
+            raise ValueError("Cannot support context without causal")
+        if not DISABLE_ARBITRARY and ARBITRARY_NFUNC % 2 == 0:
+            raise ValueError("ARBITRARY_NFUNC must be odd")
 
-    ext_modules.append(
-        CUDAExtension(
-            name="hstu.fbgemm_gpu_experimental_hstu",
-            sources=sources,
-            extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"] + feature_args,
-                "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
-            },
-            include_dirs=include_dirs,
-            # Without this we get and error about cuTensorMapEncodeTiled not defined
-            libraries=["cuda"]
+        torch_cpp_sources = []
+        subprocess.run(["rm", "-rf", "src/hstu_ampere/instantiations/*"])
+        subprocess.run(["rm", "-rf", "src/hstu_hopper/instantiations/*"])
+        if "8.0" in arch_list:
+            torch_cpp_sources.append("src/hstu_ampere/hstu_ops_gpu.cpp")
+            generate_kernels_ampere("src/hstu_ampere/instantiations")
+        if "9.0" in arch_list:
+            torch_cpp_sources.append("src/hstu_hopper/hstu_ops_gpu.cpp")
+            generate_kernels_hopper("src/hstu_hopper/instantiations")
+        cuda_sources = (glob.glob("src/hstu_ampere/instantiations/*.cu") if "8.0" in arch_list else []) + (glob.glob("src/hstu_hopper/instantiations/*.cu") if "9.0" in arch_list else [])
+
+        nvcc_flags = [
+            "-O3",
+            "-std=c++17",
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+            "--expt-relaxed-constexpr",
+            "--expt-extended-lambda",
+            "--use_fast_math",
+            # "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",  # printing out number of registers
+            # "--resource-usage",  # printing out number of registers
+            # "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
+            "-DNDEBUG",  # Important, otherwise performance is severely impacted
+            "-lineinfo",
+        ]
+        if get_platform() == "win_amd64":
+            nvcc_flags.extend(
+                [
+                    "-D_USE_MATH_DEFINES",  # for M_LN2
+                    "-Xcompiler=/Zc:__cplusplus",  # sets __cplusplus correctly, CUTLASS_CONSTEXPR_IF_CXX17 needed for cutlass::gcd
+                ]
+            )
+        include_dirs = [
+            cutlass_dir / "include",
+        ]
+        if "8.0" in arch_list:
+            include_dirs.append(Path(this_dir) / "src" / "hstu_ampere")
+        if "9.0" in arch_list:
+            include_dirs.append(Path(this_dir) / "src" / "hstu_hopper")
+
+        sources = None
+        if ONLY_COMPILE_SO:
+            sources = cuda_sources
+        else:
+            sources = torch_cpp_sources + cuda_sources
+
+        ext_modules.append(
+            CUDAExtension(
+                name="hstu.fbgemm_gpu_experimental_hstu",
+                sources=sources,
+                extra_compile_args={
+                    "cxx": ["-O3", "-std=c++17"] + feature_args,
+                    "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
+                },
+                include_dirs=include_dirs,
+                # Without this we get and error about cuTensorMapEncodeTiled not defined
+                libraries=["cuda"]
+            )
         )
-    )
 
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
@@ -337,20 +341,28 @@ class NinjaBuildExtension(BuildExtension):
                 if os.path.exists(ext_path) and ext_path != simple_path:
                     shutil.copy2(ext_path, simple_path)
 
+packages = find_packages(
+    exclude=(
+        "build",
+        "csrc",
+        "include",
+        "tests",
+        "dist",
+        "docs",
+        "benchmarks",
+    )
+)
+package_dir = {}
+
+if "10.0" in arch_list:
+    packages.append("hstu.hstu_blackwell")
+    package_dir["hstu.hstu_blackwell"] = "src/hstu_blackwell"
+
 setup(
     name=PACKAGE_NAME,
     version="0.1.0" + '+cu' + str(bare_metal_version),
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "include",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-        )
-    ),
+    packages=packages,
+    package_dir=package_dir,
     author="NVIDIA-DevTech",
     py_modules=["cuda_hstu_attention"],
     description="HSTU Attention",

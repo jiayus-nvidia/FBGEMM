@@ -335,7 +335,7 @@ def generate_input(
     )
     cu_seqlens_k_wt = cu_seqlens_c + cu_seqlens_k + cu_seqlens_t
 
-    seqused_is_not_none = torch.rand(1) < 0.5
+    seqused_is_not_none = (torch.rand(1) < 0.5) and (torch.cuda.get_device_capability()[0] < 10)
     seqused_q = torch.ones(batch_size, dtype=torch.int32, device=torch.device("cuda")) if seqused_is_not_none else None
     seqused_k = torch.ones(batch_size, dtype=torch.int32, device=torch.device("cuda")) if seqused_is_not_none else None
     if seqused_is_not_none:
@@ -1719,7 +1719,9 @@ def _bwd_reference_fp8(
     )
 
 @unittest.skipIf(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() < (9, 0)
+    or torch.cuda.get_device_capability() >= (10, 0),
     "Skip when no Hopper GPU is available. This test is only for Hopper GPU.",
 )
 class HSTU8Test(unittest.TestCase):
@@ -2027,6 +2029,6 @@ if __name__ == "__main__":
     # 2, 1, (8, 99), 0, (0, (-1, -1), 1, True), (64, 64), 1.0, (False, False, None), torch.float8_e4m3fn, (0, True))
 
     HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
-    32, 2, 0, (64, 64), 1.0, (True, False, None), (51, 256), (0, (-1, -1), 1, True), torch.bfloat16, False)
+    1, 1, 0, (128, 128), 1.0, (False, False, None), (256, 256), (0, (-1, 0), 1, False), torch.bfloat16, False)
 
     # unittest.main()
