@@ -134,7 +134,7 @@ if("9.0" IN_LIST TORCH_CUDA_ARCH_LIST OR "9.0a" IN_LIST TORCH_CUDA_ARCH_LIST)
 endif()
 
 # Check if any sources were selected
-if(NOT hstu_cpp_source_files AND NOT hstu_cpp_source_files_gpu)
+if(NOT hstu_cpp_source_files AND NOT hstu_cpp_source_files_gpu AND NOT "10.0" IN_LIST TORCH_CUDA_ARCH_LIST)
   message(WARNING "HSTU: Neither Ampere (8.0) nor Hopper (9.0) architectures found in TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}, would compile both")
   list(APPEND hstu_cpp_source_files ${hstu_ampere_cpp_source_files} ${hstu_hopper_cpp_source_files})
   list(APPEND hstu_cuda_source_files ${hstu_ampere_cuda_source_files} ${hstu_hopper_cuda_source_files})
@@ -149,28 +149,40 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${HSTU_CUDA_FLAGS}")
 # Build Shared Library
 ################################################################################
 
-gpu_cpp_library(
-  PREFIX
-    fbgemm_gpu_experimental_hstu
-  TYPE
-    SHARED
-  INCLUDE_DIRS
-    ${fbgemm_sources_include_directories}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_ampere
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_hopper
-  CPU_SRCS
-    ${hstu_cpp_source_files}
-  GPU_SRCS
-    ${hstu_cuda_source_files})
+if(hstu_cpp_source_files OR hstu_cpp_source_files_gpu)
+  gpu_cpp_library(
+    PREFIX
+      fbgemm_gpu_experimental_hstu
+    TYPE
+      SHARED
+    INCLUDE_DIRS
+      ${fbgemm_sources_include_directories}
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_ampere
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_hopper
+    CPU_SRCS
+      ${hstu_cpp_source_files}
+    GPU_SRCS
+      ${hstu_cuda_source_files})
 
-################################################################################
-# Install Shared Library and Python Files
-################################################################################
+  ################################################################################
+  # Install Shared Library and Python Files
+  ################################################################################
 
-add_to_package(
-  DESTINATION fbgemm_gpu/experimental/hstu
-  TARGETS fbgemm_gpu_experimental_hstu)
+  add_to_package(
+    DESTINATION fbgemm_gpu/experimental/hstu
+    TARGETS fbgemm_gpu_experimental_hstu)
 
-install(
-  DIRECTORY hstu
-  DESTINATION fbgemm_gpu/experimental)
+  install(
+    DIRECTORY hstu
+    DESTINATION fbgemm_gpu/experimental)
+endif()
+
+if("10.0" IN_LIST TORCH_CUDA_ARCH_LIST)
+  install(
+    DIRECTORY hstu
+    DESTINATION fbgemm_gpu/experimental)
+
+  install(
+    DIRECTORY src/hstu_blackwell
+    DESTINATION fbgemm_gpu/experimental/hstu)
+endif()
