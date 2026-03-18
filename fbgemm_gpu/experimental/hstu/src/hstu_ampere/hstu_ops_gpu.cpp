@@ -1034,7 +1034,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hstu_varlen_bwd_80(
 } // namespace fbgemm_gpu::hstu
 
 TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
-  m.set_python_module("fbgemm_gpu.experimental.hstu.hstu_ops_gpu");
+  m.set_python_module("hstu.hstu_ops_gpu");
   m.def(
       "hstu_varlen_fwd_80("
       "    Tensor q, "
