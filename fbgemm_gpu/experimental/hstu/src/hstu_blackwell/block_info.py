@@ -7,7 +7,7 @@ import cutlass.cute as cute
 from cutlass import const_expr
 
 from .seqlen_info import SeqlenInfo
-import fbgemm_gpu.experimental.hstu.hstu_blackwell.utils as utils
+from . import utils
 from .named_barrier import NamedBarrierFwd
 
 

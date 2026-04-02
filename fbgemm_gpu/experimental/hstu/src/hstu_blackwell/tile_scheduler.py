@@ -7,7 +7,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
 
-import fbgemm_gpu.experimental.hstu.hstu_blackwell.utils as utils
+from . import utils
 from .fast_math import FastDivmod, clz
 
 

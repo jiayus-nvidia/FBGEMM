@@ -18,11 +18,11 @@ from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
-import fbgemm_gpu.experimental.hstu.hstu_blackwell.utils as utils
+from . import utils
 from .mask import AttentionMask
 from .seqlen_info import SeqlenInfo
 from .block_info import BlockInfo
-import fbgemm_gpu.experimental.hstu.hstu_blackwell.blackwell_helpers as sm100_utils
+from . import blackwell_helpers as sm100_utils
 from .fast_math import FastDivmod, FastSilU
 from .tile_scheduler import TileSchedulerArguments, SingleTileVarlenScheduler, SingleTileScheduler, ParamsBase
 from .named_barrier import NamedBarrierFwd
@@ -62,7 +62,8 @@ class HSTUAttentionForwardSm100:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.kBlockM = kBlockM
         self.kBlockN = kBlockN
-        self.q_stage = 2 # it will determine the tilesize
+        # q_stage=1 for head_dim>=256 (TMEM capacity 512 cols can only fit 1 O tile)
+        self.q_stage = 1 if self.head_dim_padded >= 256 else 2
         self.s_stage = 2 # score stage for intra-warp overlap
         self.debug = False
         assert self.q_stage in [1, 2]
@@ -90,7 +91,7 @@ class HSTUAttentionForwardSm100:
         # Does S1 need to wait for S0 to finish
         self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local) and self.q_stage == 2
         self.s0_s1_barrier = False  # Performance drop,
-        self.overlap_sO_sQ = (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or (self.is_arbitrary and self.q_stage == 2)
+        self.overlap_sO_sQ = (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or (self.head_dim_padded >= 256) or (self.is_arbitrary and self.q_stage == 2)
         if self.overlap_sO_sQ:
             assert self.head_dim_padded >= self.head_dim_v_padded  # We assume sQ is larger than sO
             self.is_persistent = False
@@ -101,10 +102,14 @@ class HSTUAttentionForwardSm100:
         self.load_warp_id = 9
         self.empty_warp_ids = (10, 11)
 
-        self.num_regs_silu = 224
+        # Register budget tuning: SiLU warps get the most registers to reduce spills.
+        if self.head_dim_padded >= 128:
+            self.num_regs_silu = 232
+            self.num_regs_other = 40
+        else:
+            self.num_regs_silu = 224
+            self.num_regs_other = 48
         self.num_regs_epilogue = 64
-        self.num_regs_other = 48
-
         self.num_regs_empty = 40
         self.threads_per_cta = cute.arch.WARP_SIZE * len(
             (
@@ -124,7 +129,12 @@ class HSTUAttentionForwardSm100:
         self.tmem_o_offset = [self.tmem_s_offset[-1] + self.kBlockN + i * self.head_dim_v_padded for i in range(self.q_stage)]  # e.g., 256, 384
         self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
         self.tmem_s_to_p_offset = self.kBlockN // 2
-        self.tmem_p_offset = [self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(self.s_stage)]  # I can not understand why need a offset here
+        self.tmem_p_offset = [self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(self.s_stage)]
+        # split_P_arrive: signal MMA to start PV when this many P columns are written.
+        # 75% (96/128) matches FA4's proven configuration, allowing PV MMA to overlap
+        # with the last 25% of P computation.
+        self.split_P_arrive = self.kBlockN // 4 * 3
+        self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
 
         assert self.tmem_total <= SM100_TMEM_CAPACITY_COLUMNS
 
@@ -140,7 +150,18 @@ class HSTUAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
-        self.kv_stage = 4 if self.q_dtype.width == 8 else 3
+        # Derive kv_stage from smem budget (224KB limit), matching FA4's approach
+        smem_size_q = self.q_stage * self.kBlockM * self.head_dim_padded * self.q_dtype.width // 8
+        smem_size_o = self.q_stage * self.kBlockM * self.head_dim_v_padded * self.q_dtype.width // 8
+        smem_size_q_o = max(smem_size_q, smem_size_o) if self.overlap_sO_sQ else (smem_size_q + smem_size_o)
+        smem_size_kv_per_stage = max(
+            self.kBlockN * self.head_dim_padded * self.q_dtype.width // 8,
+            self.kBlockN * self.head_dim_v_padded * self.q_dtype.width // 8,
+        )
+        if self.q_dtype.width == 8:
+            self.kv_stage = 4
+        else:
+            self.kv_stage = min((224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage, 3)
         assert self.kv_stage >= 2
         # self.acc_stage = 1  # question about it
         self.epi_stage = self.q_stage
@@ -816,8 +837,6 @@ class HSTUAttentionForwardSm100:
                 buffers=buffers,
                 fastdiv_mods=fastdiv_mods,
             )
-            # If there's s0_s1_barrier, it's faster to have 2 WGs having different code
-            # s0_s1_barrier = False, spill， otherwise = True no spill, this is related to compiler
             if warp_idx <= self.silu0_warp_ids[-1] and warp_idx >= self.silu0_warp_ids[0]:
                 tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
                 silu_loop(stage=0, tStSi=tStSi)
@@ -1266,7 +1285,8 @@ class HSTUAttentionForwardSm100:
             partial(
                 sm100_utils.gemm_ptx_partial,
                 pv_mma_op, self.tmem_o_offset[stage if self.q_stage == 2 else 0], tOrPs[stage],
-                sA=None, sA_swizzle=None, sB_swizzle=sV_swizzle
+                sA=None, sA_swizzle=None, sB_swizzle=sV_swizzle,
+                split_arrive=self.split_P_arrive,
             )
             for stage in range(2)
         ]
@@ -1464,7 +1484,8 @@ class HSTUAttentionForwardSm100:
             partial(
                 sm100_utils.gemm_ptx_partial,
                 pv_mma_op, self.tmem_o_offset[stage if self.q_stage == 2 else 0], tOrPs[stage],
-                sA=None, sA_swizzle=None, sB_swizzle=sV_swizzle
+                sA=None, sA_swizzle=None, sB_swizzle=sV_swizzle,
+                split_arrive=self.split_P_arrive,
             )
             for stage in range(self.s_stage)
         ]
@@ -1820,20 +1841,22 @@ class HSTUAttentionForwardSm100:
             # for stage 0, it does not need wait; for stage 1, it needs wait
             cute.arch.mbarrier_wait(mbar_ptr + mbar_s0_s1_sequence_offset + stage, s0_s1_sequence_phase)
         fastsilu.silu_x2(tSrS_t2r, tSrP_r2t, tSrS_preds, mask_fn=partial(mask_fn) if mask_fn is not None else None)
-        # Sequence barrier arrive
-        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 2):
+        # Write first portion of P (split_P_arrive columns), then signal MMA to start PV
+        split_P_arrive_idx = cute.size(tStP_r2t.shape[2]) * self.split_P_arrive // self.kBlockN
+        for i in cutlass.range_constexpr(split_P_arrive_idx):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
         cute.arch.fence_view_async_tmem_store()
 
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage))
-        # Notify mma warp that P is ready
+        # Notify mma warp that first portion of P is ready — MMA can start PV
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
-        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 2, cute.size(tStP_r2t.shape[2])):
+        # Write remaining P columns
+        for i in cutlass.range_constexpr(split_P_arrive_idx, cute.size(tStP_r2t.shape[2])):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
         cute.arch.fence_view_async_tmem_store()
-        # Notify mma warp that the 2nd half of P is ready
-        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage) # split P in kBlockN, issue two mma instructions in sm100
+        # Notify mma warp that all P is ready
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
         return mma_si_consumer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
 
