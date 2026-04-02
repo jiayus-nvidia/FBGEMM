@@ -51,7 +51,7 @@ def hstu_varlen_fwd_100(
     head_dim = q.shape[2]
     head_dim_v = v.shape[2]
     assert head_dim == head_dim_v, "head_dim and head_dim_v must be equal"
-    assert head_dim == 64 or head_dim == 128, "Only support head_dim 64 and 128"
+    assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
 
     assert rab is None, "rab is not supported in Blackwell forward kernel"
 
@@ -233,7 +233,7 @@ def hstu_varlen_bwd_100(
     dv = torch.empty_strided(v.shape, v.stride(), dtype=v.dtype, device=v.device)
 
     q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1).mark_compact_shape_dynamic(mode=1, stride_order=(4, 3, 2, 0, 1), divisibility=64)
+        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1).mark_compact_shape_dynamic(mode=1, stride_order=(2, 3, 0, 4, 1), divisibility=64)
         for t in (q, k, v, do, dq, dk, dv)
     ]
     cu_seqlens_q_tensor, cu_seqlens_k_tensor = [

@@ -14,6 +14,17 @@ from .library import *  # noqa: F401, F403
 import torch
 import torch.nn as nn
 
+
+def _import_sm100():
+    try:
+        from fbgemm_gpu.experimental.hstu.hstu_blackwell import hstu_ops_gpu
+    except ImportError:
+        try:
+            from hstu.hstu_blackwell import hstu_ops_gpu
+        except ImportError:
+            from hstu_blackwell import hstu_ops_gpu
+    return hstu_ops_gpu
+
 def quantize_for_two_directions(x, seq_offsets, fp8_type=torch.float8_e4m3fn):
     B = seq_offsets.size(0) - 1
     fp8_max = 448.0 if fp8_type == torch.float8_e4m3fn else 57344.0
@@ -281,7 +292,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         else:
             assert seqused_q is None and seqused_k is None, \
                 "HSTU-Blackwell does not support seqused_q and seqused_k"
-            from fbgemm_gpu.experimental.hstu.hstu_blackwell import hstu_ops_gpu as _sm100
+            _sm100 = _import_sm100()
             out, rab_padded = _sm100.hstu_varlen_fwd_100(
                 q,
                 k,
@@ -500,7 +511,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         else:
             assert seqused_q is None and seqused_k is None, \
                 "HSTU-Blackwell does not support seqused_q and seqused_k"
-            from fbgemm_gpu.experimental.hstu.hstu_blackwell import hstu_ops_gpu as _sm100
+            _sm100 = _import_sm100()
             dq, dk, dv, dRab = _sm100.hstu_varlen_bwd_100(
                 dout,
                 q,
@@ -728,7 +739,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         else:
             assert seqused_q is None and seqused_k is None, \
                 "HSTU-Blackwell does not support seqused_q and seqused_k"
-            from fbgemm_gpu.experimental.hstu.hstu_blackwell import hstu_ops_gpu as _sm100
+            _sm100 = _import_sm100()
             out, rab_padded = _sm100.hstu_varlen_fwd_100(
                 q,
                 k,
@@ -871,7 +882,7 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         else:
             assert seqused_q is None and seqused_k is None, \
                 "HSTU-Blackwell does not support seqused_q and seqused_k"
-            from fbgemm_gpu.experimental.hstu.hstu_blackwell import hstu_ops_gpu as _sm100
+            _sm100 = _import_sm100()
             _, _, _, dRab = _sm100.hstu_varlen_bwd_100(
                 dout,
                 q,

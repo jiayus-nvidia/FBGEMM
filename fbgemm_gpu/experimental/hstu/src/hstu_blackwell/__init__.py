@@ -7,7 +7,10 @@
 
 # Copyright (c) 2024, NVIDIA Corporation & AFFILIATES.
 
-import fbgemm_gpu.experimental.hstu.hstu_blackwell.hstu_ops_gpu as hstu_ops_gpu_sm100
+try:
+    import fbgemm_gpu.experimental.hstu.hstu_blackwell.hstu_ops_gpu as hstu_ops_gpu_sm100
+except ImportError:
+    from . import hstu_ops_gpu as hstu_ops_gpu_sm100
 
 from .hstu_ops_gpu import hstu_varlen_fwd_100, hstu_varlen_bwd_100
 
