@@ -92,6 +92,9 @@ endif()
 if (DEFINED ENV{HSTU_DISABLE_86OR89} AND "$ENV{HSTU_DISABLE_86OR89}" STREQUAL "TRUE")
   set(HSTU_CUDA_FLAGS "${HSTU_CUDA_FLAGS} -DHSTU_DISABLE_86OR89")
 endif()
+if (DEFINED ENV{HSTU_DISABLE_120} AND "$ENV{HSTU_DISABLE_120}" STREQUAL "TRUE")
+  set(HSTU_CUDA_FLAGS "${HSTU_CUDA_FLAGS} -DHSTU_DISABLE_120")
+endif()
 
 
 # Collect HSTU Ampere source files
@@ -133,8 +136,18 @@ if("9.0" IN_LIST TORCH_CUDA_ARCH_LIST OR "9.0a" IN_LIST TORCH_CUDA_ARCH_LIST)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_90a,code=sm_90a")
 endif()
 
+# Conditionally add SM120 sources (reuses Ampere sources with SM89 tuning)
+if("12.0" IN_LIST TORCH_CUDA_ARCH_LIST)
+  message(STATUS "HSTU: Selecting Ampere sources for arch 12.0 (SM120, reusing SM89 path)")
+  if(NOT "8.0" IN_LIST TORCH_CUDA_ARCH_LIST)
+    list(APPEND hstu_cpp_source_files ${hstu_ampere_cpp_source_files})
+    list(APPEND hstu_cuda_source_files ${hstu_ampere_cuda_source_files})
+  endif()
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_120,code=sm_120")
+endif()
+
 # Check if any sources were selected
-if(NOT hstu_cpp_source_files AND NOT hstu_cpp_source_files_gpu AND NOT "10.0" IN_LIST TORCH_CUDA_ARCH_LIST)
+if(NOT hstu_cpp_source_files AND NOT hstu_cpp_source_files_gpu AND NOT "10.0" IN_LIST TORCH_CUDA_ARCH_LIST AND NOT "12.0" IN_LIST TORCH_CUDA_ARCH_LIST)
   message(WARNING "HSTU: Neither Ampere (8.0) nor Hopper (9.0) architectures found in TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}, would compile both")
   list(APPEND hstu_cpp_source_files ${hstu_ampere_cpp_source_files} ${hstu_hopper_cpp_source_files})
   list(APPEND hstu_cuda_source_files ${hstu_ampere_cuda_source_files} ${hstu_hopper_cuda_source_files})
