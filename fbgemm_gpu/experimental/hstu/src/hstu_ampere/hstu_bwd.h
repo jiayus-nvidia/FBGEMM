@@ -1295,11 +1295,11 @@ void run_hstu_bwd_80(Hstu_bwd_params& params, cudaStream_t stream) {
     static constexpr int kBlockN = std::get<1>(tile_size);
     static constexpr int kNWarps = std::get<2>(tile_size);
     static constexpr int AtomLayoutMSdP =
-        (Arch == 89) ? (kHeadDim <= 128 ? 2 : 1) : 4;
+        (Arch == 89 || Arch == 120) ? (kHeadDim <= 128 ? 2 : 1) : 4;
     static constexpr int AtomLayoutNdKV =
-        (Arch == 89) ? (kHeadDim <= 128 ? 4 : 1) : (kHeadDim <= 64 ? 4 : 2);
+        (Arch == 89 || Arch == 120) ? (kHeadDim <= 128 ? 4 : 1) : (kHeadDim <= 64 ? 4 : 2);
     static constexpr int AtomLayoutMdQ =
-        (Arch == 89) ? (kHeadDim <= 128 ? 4 : 1)
+        (Arch == 89 || Arch == 120) ? (kHeadDim <= 128 ? 4 : 1)
                      : (kHeadDim <= 64 ? 4 : 2); // split DIM for 256
     run_hstu_bwd_impl_<
         elem_type,

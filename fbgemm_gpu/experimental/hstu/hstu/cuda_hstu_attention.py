@@ -197,8 +197,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         assert v.dim() == 3, "v shape should be (L, num_heads, hidden_dim)"
 
         major_version = torch.cuda.get_device_capability()[0]
-        assert major_version == 8 or major_version == 9 or major_version == 10, "Only support sm80 and sm90 and sm100"
-        if major_version == 8:
+        assert major_version in (8, 9, 10, 12), "Only support sm80, sm90, sm100, and sm120"
+        if major_version == 8 or major_version == 12:
             out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_80(
                 q,
                 k,
@@ -391,7 +391,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
         func = ctx.func
         quant_mode = ctx.quant_mode
 
-        if ctx.major_version == 8:
+        if ctx.major_version == 8 or ctx.major_version == 12:
             dq, dk, dv, dRab = torch.ops.fbgemm.hstu_varlen_bwd_80(
                 dout,
                 q,
@@ -691,8 +691,8 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         k = qkv[:, 1, :, :].detach()
         v = qkv[:, 2, :, :].detach()
         major_version = torch.cuda.get_device_capability()[0]
-        assert major_version == 8 or major_version == 9 or major_version == 10, "Only support sm8x and sm90 and sm100"
-        if major_version == 8:
+        assert major_version in (8, 9, 10, 12), "Only support sm80, sm90, sm100, and sm120"
+        if major_version == 8 or major_version == 12:
             out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_80(
                 q,
                 k,
@@ -808,8 +808,8 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
         qkv_shape = (q.shape[0], 3, q.shape[1], q.shape[2])
         dqkv = torch.empty(qkv_shape, device=q.device, dtype=q.dtype)
         major_version = torch.cuda.get_device_capability()[0]
-        assert major_version == 8 or major_version == 9 or major_version == 10, "Only support sm8x and sm90 and sm100"
-        if major_version == 8:
+        assert major_version in (8, 9, 10, 12), "Only support sm80, sm90, sm100, and sm120"
+        if major_version == 8 or major_version == 12:
             _, _, _, dRab = torch.ops.fbgemm.hstu_varlen_bwd_80(
                 dout,
                 q,
@@ -1039,8 +1039,8 @@ def cuda_hstu_attn_varlen(
 
     else:
         major_version = torch.cuda.get_device_capability()[0]
-        assert major_version == 8 or major_version == 9, "Only support sm80 and sm90"
-        if major_version == 8:
+        assert major_version in (8, 9, 12), "Only support sm80, sm90, and sm120"
+        if major_version == 8 or major_version == 12:
             out, _ = torch.ops.fbgemm.hstu_varlen_fwd_80(
                 q,
                 k,

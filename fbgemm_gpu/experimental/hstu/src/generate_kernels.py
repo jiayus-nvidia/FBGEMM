@@ -30,6 +30,7 @@ ARBITRARY_NFUNC = int(os.getenv("HSTU_ARBITRARY_NFUNC", "1"))
 DISABLE_RAB = os.getenv("HSTU_DISABLE_RAB", "FALSE") == "TRUE"
 DISABLE_DRAB = os.getenv("HSTU_DISABLE_DRAB", "FALSE") == "TRUE"
 DISABLE_86OR89 = os.getenv("HSTU_DISABLE_86OR89", "FALSE") == "TRUE"
+DISABLE_120 = os.getenv("HSTU_DISABLE_120", "TRUE") == "TRUE"
 
 def generate_kernels_ampere(install_dir: str):
     """
@@ -47,7 +48,7 @@ def generate_kernels_ampere(install_dir: str):
     if not DISABLE_ARBITRARY and ARBITRARY_NFUNC % 2 == 0:
         raise ValueError("ARBITRARY_NFUNC must be odd")
 
-    ARCH_SM = ["80"] + (["89"] if not DISABLE_86OR89 else [])
+    ARCH_SM = ["80"] + (["89"] if not DISABLE_86OR89 else []) + (["120"] if not DISABLE_120 else [])
     DTYPE_16 = (["bf16"] if not DISABLE_BF16 else []) + (["fp16"] if not DISABLE_FP16 else [])
     HEAD_DIMENSIONS = (
         []

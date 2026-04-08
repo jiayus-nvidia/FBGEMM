@@ -57,7 +57,8 @@ DISABLE_HDIM64 = os.getenv("HSTU_DISABLE_HDIM64", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("HSTU_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("HSTU_DISABLE_HDIM256", "FALSE") == "TRUE"
 DISABLE_86OR89 = os.getenv("HSTU_DISABLE_86OR89", "TRUE") == "TRUE"
-arch_list = os.getenv("HSTU_ARCH_LIST", "8.0 9.0 10.0")
+DISABLE_120 = os.getenv("HSTU_DISABLE_120", "TRUE") == "TRUE"
+arch_list = os.getenv("HSTU_ARCH_LIST", "8.0 9.0 10.0 12.0")
 
 ONLY_COMPILE_SO = os.getenv("HSTU_ONLY_COMPILE_SO", "FALSE") == "TRUE"
 
@@ -182,11 +183,11 @@ if not SKIP_CUDA_BUILD:
     if bare_metal_version < Version("12.3"):
         raise RuntimeError("HSTU is only supported on CUDA 12.3 and above")
 
-    if "8.0" not in arch_list and "9.0" not in arch_list and "10.0" not in arch_list:
-        raise ValueError("At least one of 8.0, 9.0, or 10.0 must be in arch_list")
+    if "8.0" not in arch_list and "9.0" not in arch_list and "10.0" not in arch_list and "12.0" not in arch_list:
+        raise ValueError("At least one of 8.0, 9.0, 10.0, or 12.0 must be in arch_list")
 
-    # sm100 (Blackwell) is pure Python/Triton, only sm80/sm90 need CUDA compilation
-    if "8.0" in arch_list or "9.0" in arch_list:
+    # sm100 (Blackwell) is pure Python/Triton, only sm80/sm90/sm120 need CUDA compilation
+    if "8.0" in arch_list or "9.0" in arch_list or "12.0" in arch_list:
         cc_flag = []
         if "9.0" in arch_list:
             cc_flag.append("-gencode")
@@ -194,6 +195,9 @@ if not SKIP_CUDA_BUILD:
         if "8.0" in arch_list:
             cc_flag.append("-gencode")
             cc_flag.append("arch=compute_80,code=sm_80")
+        if "12.0" in arch_list:
+            cc_flag.append("-gencode")
+            cc_flag.append("arch=compute_120,code=sm_120")
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -224,6 +228,7 @@ if not SKIP_CUDA_BUILD:
             + (["-DHSTU_DISABLE_HDIM128"] if DISABLE_HDIM128 else [])
             + (["-DHSTU_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
             + (["-DHSTU_DISABLE_86OR89"] if DISABLE_86OR89 else [])
+            + (["-DHSTU_DISABLE_120"] if DISABLE_120 else [])
         )
 
         if DISABLE_BF16 and DISABLE_FP16 and DISABLE_FP8:
@@ -246,13 +251,13 @@ if not SKIP_CUDA_BUILD:
         torch_cpp_sources = []
         subprocess.run(["rm", "-rf", "src/hstu_ampere/instantiations/*"])
         subprocess.run(["rm", "-rf", "src/hstu_hopper/instantiations/*"])
-        if "8.0" in arch_list:
+        if "8.0" in arch_list or "12.0" in arch_list:
             torch_cpp_sources.append("src/hstu_ampere/hstu_ops_gpu.cpp")
             generate_kernels_ampere("src/hstu_ampere/instantiations")
         if "9.0" in arch_list:
             torch_cpp_sources.append("src/hstu_hopper/hstu_ops_gpu.cpp")
             generate_kernels_hopper("src/hstu_hopper/instantiations")
-        cuda_sources = (glob.glob("src/hstu_ampere/instantiations/*.cu") if "8.0" in arch_list else []) + (glob.glob("src/hstu_hopper/instantiations/*.cu") if "9.0" in arch_list else [])
+        cuda_sources = (glob.glob("src/hstu_ampere/instantiations/*.cu") if ("8.0" in arch_list or "12.0" in arch_list) else []) + (glob.glob("src/hstu_hopper/instantiations/*.cu") if "9.0" in arch_list else [])
 
         nvcc_flags = [
             "-O3",
@@ -282,7 +287,7 @@ if not SKIP_CUDA_BUILD:
         include_dirs = [
             cutlass_dir / "include",
         ]
-        if "8.0" in arch_list:
+        if "8.0" in arch_list or "12.0" in arch_list:
             include_dirs.append(Path(this_dir) / "src" / "hstu_ampere")
         if "9.0" in arch_list:
             include_dirs.append(Path(this_dir) / "src" / "hstu_hopper")

@@ -334,6 +334,10 @@ __forceinline__ __device__ void copy(
 // {kBlockM, kBlockN, kNWarps}
 template <int Arch, int kHeadDim, bool Has_rab>
 constexpr std::tuple<int, int, int> get_tile_size_fwd() {
+  if constexpr (Arch == 120) {
+    // SM120: same as SM89 for forward
+    return {64, 64, 4};
+  }
   if constexpr (Arch == 89) {
     return {64, 64, 4};
   }
@@ -368,6 +372,27 @@ constexpr std::tuple<int, int, int> get_tile_size_fwd() {
 // {kBlockM, kBlockN, kNWarps}
 template <int Arch, int kHeadDim, bool Has_rab>
 constexpr std::tuple<int, int, int> get_tile_size_bwd() {
+  if constexpr (Arch == 120) {
+    // SM120: reduced tile sizes to fit within 99KB shared memory + register limits.
+    // SM120 has only 99KB optin shared memory (vs SM89's ~100KB).
+    if constexpr (Has_rab) {
+      if constexpr (kHeadDim <= 64) {
+        return {64, 64, 8};   // reduced kBlockM from 128 to 64 (smem: 96KB -> 57KB)
+      } else if constexpr (kHeadDim <= 128) {
+        return {64, 64, 8};   // same tile, 88KB fits within 99KB limit
+      } else {
+        return {16, 32, 2};   // reduced to fit SM120 constraints (51KB smem)
+      }
+    } else {
+      if constexpr (kHeadDim <= 64) {
+        return {128, 64, 8};  // same as SM89, 80KB fits
+      } else if constexpr (kHeadDim <= 128) {
+        return {64, 64, 8};   // same as SM89
+      } else {
+        return {16, 64, 4};   // same as SM89
+      }
+    }
+  }
   if constexpr (Arch == 89) {
     if constexpr (kHeadDim <= 64) {
       return {128, 64, 8};

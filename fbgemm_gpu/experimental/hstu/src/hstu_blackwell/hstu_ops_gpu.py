@@ -245,7 +245,10 @@ def hstu_varlen_bwd_100(
         for t in (num_contexts, num_targets, func)
     ]
     workspace_size = ((max_seqlen_q + 7) // 8 * 8) * num_heads * head_dim * batch_size * Float32.width // 8
-    workspace_torch = torch.zeros(workspace_size, dtype=torch.uint8).cuda()
+    # Use torch.empty on GPU + .zero_() instead of torch.zeros(...).cuda()
+    # torch.zeros().cuda() creates a CPU zero tensor then copies to GPU (~34ms for 128MB)
+    # torch.empty().zero_() allocates on GPU directly and zeros via GPU kernel (~0.1ms)
+    workspace_torch = torch.empty(workspace_size, dtype=torch.uint8, device=q.device).zero_()
     workspace = from_dlpack(workspace_torch, assumed_align=16).mark_layout_dynamic()
 
     current_stream = cutlass_torch.default_stream()
