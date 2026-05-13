@@ -1,5 +1,4 @@
 /*
- * Copyright (c) 2023, Tri Dao.
  * Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
@@ -8,117 +7,110 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+// Utility functions for Blackwell RTX HSTU kernels.
+// Includes tile size selection, type conversion helpers, and CUDA utilities.
+
 #pragma once
 
 #include <assert.h>
-#include <cuda_fp16.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <tuple>
 
+#include <cuda_fp16.h>
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #include <cuda_bf16.h>
 #endif
 
+#include <cute/tensor.hpp>
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
-#include <cute/tensor.hpp>
+#define CHECK_CUDA(call)                \
+  do {                                  \
+    cudaError_t status_ = call;         \
+    if (status_ != cudaSuccess) {       \
+      fprintf(                          \
+          stderr,                       \
+          "CUDA error (%s:%d): %s\n",   \
+          __FILE__,                     \
+          __LINE__,                     \
+          cudaGetErrorString(status_)); \
+      exit(1);                          \
+    }                                   \
+  } while (0)
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
 
-#ifndef HSTU_DEBUG_ENABLED
-#define HSTU_DEBUG_ENABLED 0
-#endif
-
-#if HSTU_DEBUG_ENABLED
-#define HSTU_DEBUG_INFO(cond, ...)                 \
- do {                                              \
-   if (cond) {                                     \
-     printf(__VA_ARGS__);                          \
-   }                                               \
- } while (0)
-#else
-#define HSTU_DEBUG_INFO(cond, ...) do {} while (0)
+#ifndef EPSILON
+#define EPSILON 1e-6
 #endif
 
 namespace flash {
 
+using namespace cute;
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static __device__ float tanh_fast(float x) {
-  float res;
-  asm volatile("{ tanh.approx.f32 %0, %1; }\n" : "=f"(res) : "f"(x));
-  return res;
-}
-
-static __device__ float sigmoid_fast(float x) {
-  return 0.5f * tanh_fast(0.5f * x) + 0.5f;
-}
-
-template <typename Engine, typename Layout>
-inline __device__ void silu(Tensor<Engine, Layout>& t) {
-  using ValT = typename Engine::value_type;
-#pragma unroll
-  for (int i = 0; i < size(t); ++i) {
-    float v = static_cast<float>(t(i));
-    float sigmoid_v = sigmoid_fast(v);
-    float out = v * sigmoid_v;
-    float silu_out = v > -10.0f ? out : 0.f;
-    t(i) = static_cast<ValT>(silu_out);
+// Tile sizes for Blackwell RTX forward pass.
+// {kBlockM, kBlockN, kNWarps}
+//
+// Blackwell RTX uses per-warp mma.sync (same model as Ampere).
+// For FP8: MMA shape is M16×N8×K32 (k=32 per step, 2× Ampere BF16's k=16).
+// We use larger tiles to amortize overheads since FP8 halves SMEM usage.
+template <int Headdim, bool Has_rab, bool Is_fp8, bool Is_arbitrary = false>
+constexpr std::tuple<int, int, int> get_tile_size_fwd_blackwell_rtx() {
+  if constexpr (Is_fp8) {
+    // FP8 WS path uses a fixed 8-math-warp shape.  Keep BN64 for all head
+    // dimensions so paged KV page_size == kBlockN and RAB/DRAB share the same
+    // specialization family.
+    if constexpr (Has_rab) {
+      if constexpr (Headdim <= 64) {
+        return {128, 64, 8};
+      } else if constexpr (Headdim == 128) {
+        // Use BN64 so non-paged RAB/DRAB can share the WS TMA path with paged
+        // KV and hdim256 RAB; V block-scale metadata must match this tile size.
+        return {128, 64, 8};
+      } else {
+        return {128, 64, 8};
+      }
+    } else {
+      if constexpr (Headdim <= 64) {
+        return {128, 64, 8};
+      } else if constexpr (Headdim == 128) {
+        return {128, 64, 8};
+      } else {
+        return {128, 64, 8};
+      }
+    }
+  } else {
+    // BF16: Same tile sizes as Ampere
+    if constexpr (Has_rab) {
+      if constexpr (Headdim <= 64) {
+        return {128, 64, 8};
+      } else {
+        // D256 + RAB with BN64 needs about 104KB dynamic SMEM
+        // (Q + K/V + RAB), which can exceed the Blackwell RTX opt-in limit.
+        return {64, 32, 4};
+      }
+    } else {
+      if constexpr (Headdim <= 64) {
+        return {128, 64, 8};
+      } else if constexpr (Headdim == 128) {
+        return {128, 128, 8};
+      } else {
+        if constexpr (Is_arbitrary) {
+          return {64, 32, 4};
+        }
+        return {64, 64, 4};
+      }
+    }
   }
 }
 
-template <typename Engine, typename Layout>
-CUTLASS_DEVICE void fast_silu(Tensor<Engine, Layout>& t) {
-  using ValT = typename Engine::value_type;
-  CUTLASS_PRAGMA_UNROLL
-  for (int i = 0; i < size(t); ++i) {
-    float v = static_cast<float>(t(i)) * 0.5f;
-    float tanh_v = tanh_fast(v);
-    t(i) = v > -10.0f ? __fmaf_rn(v, tanh_v, v) : 0.f;
-  }
-}
-
-template <
-    typename Engine0,
-    typename Layout0,
-    typename Engine1,
-    typename Layout1>
-inline __device__ void silu_bwd(
-    Tensor<Engine0, Layout0>& x,
-    Tensor<Engine1, Layout1>& y) {
-  static_assert(decltype(size(x))::value == decltype(size(y))::value);
-  using ValT0 = typename Engine0::value_type;
-  using ValT1 = typename Engine1::value_type;
-#pragma unroll
-  for (int i = 0; i < size(x); ++i) {
-    float v = static_cast<float>(x(i));
-    float sigmoid_v = sigmoid_fast(v);
-    float out = v * sigmoid_v;
-    float temp = sigmoid_v * (1 + v * (1 - sigmoid_v));
-    float dsilu_temp = v > -10.0f ? temp : 0.f;
-    float silu_out = v > -10.0f ? out : 0.f;
-    x(i) = static_cast<ValT0>(dsilu_temp);
-    y(i) = static_cast<ValT1>(silu_out);
-  }
-}
-
-template <typename Tensor0, typename Tensor1>
-inline __device__ void dsilu_bwd(Tensor0& dy, Tensor1& x) {
-  static_assert(decltype(size(dy))::value == decltype(size(x))::value);
-  using ValT = typename Tensor0::value_type;
-#pragma unroll
-  for (int i = 0; i < size(dy); ++i) {
-    float dsilu_temp = static_cast<float>(x(i));
-    float dyv = static_cast<float>(dy(i));
-    float out = dyv * dsilu_temp;
-    float dsilu_out = out;
-    dy(i) = static_cast<ValT>(dsilu_out);
-  }
-}
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename T>
 struct MaxOp {
@@ -136,9 +128,62 @@ struct MinOp {
 
 template<typename T, typename Op>
 __inline__ __device__ void warpReduce(T& val, Op op) {
-  #pragma unroll
+  CUTLASS_PRAGMA_UNROLL
   for (int mask = 16; mask > 0; mask >>= 1)
     val = op(val, __shfl_xor_sync(0xffffffff, val, mask, 32));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Type conversion helper
+template <typename To_type, typename Engine, typename Layout>
+CUTLASS_DEVICE auto convert_type(Tensor<Engine, Layout> const& tensor) {
+  using From_type = typename Engine::value_type;
+  constexpr int numel = decltype(size(tensor))::value;
+  cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
+  auto frag =
+      convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel>*>(
+          tensor.data()));
+  return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Fast approximate functions
+static __device__ float tanh_fast(float x) {
+  float res;
+  asm volatile("{ tanh.approx.f32 %0, %1; }\n" : "=f"(res) : "f"(x));
+  return res;
+}
+
+static __device__ float sigmoid_fast(float x) {
+  return 0.5f * tanh_fast(0.5f * x) + 0.5f;
+}
+
+template <typename Engine, typename Layout>
+CUTLASS_DEVICE void silu(Tensor<Engine, Layout>& t) {
+  using ValT = typename Engine::value_type;
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < size(t); ++i) {
+    float v = static_cast<float>(t(i));
+    float sigmoid_v = sigmoid_fast(v);
+    float out = v * sigmoid_v;
+    float silu_out = v > -10.0f ? out : 0.f;
+    t(i) = static_cast<ValT>(silu_out);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Engine, typename Layout>
+CUTLASS_DEVICE void fast_silu(Tensor<Engine, Layout>& t) {
+  using ValT = typename Engine::value_type;
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < size(t); ++i) {
+    float v = static_cast<float>(t(i)) * 0.5f;
+    float tanh_v = tanh_fast(v);
+    t(i) = v > -10.0f ? __fmaf_rn(v, tanh_v, v) : 0.f;
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -147,8 +192,6 @@ template <typename Engine, typename Layout, typename EngineOut>
 CUTLASS_DEVICE void convert_type_safe(
     Tensor<Engine, Layout> const& tensor,
     Tensor<EngineOut, Layout>& out) {
-  // Somehow if we allocate out inside this function and return it, e2e is
-  // slower and the output can be wrong.
   using From_type = typename Engine::value_type;
   using To_type = typename EngineOut::value_type;
   static constexpr int FragmentSize = std::max(
@@ -265,12 +308,18 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
   static_assert(decltype(size<0>(acc_layout))::value == 4);
   static_assert(decltype(rank(acc_layout))::value == 3);
   constexpr int mma_shape_K = get<2>(typename MMA_traits::Shape_MNK{});
-  static_assert(mma_shape_K == 8 || mma_shape_K == 16);
+  static_assert(mma_shape_K == 8 || mma_shape_K == 16 || mma_shape_K == 32);
   if constexpr (mma_shape_K == 8) {
     return acc_layout;
-  } else {
+  } else if constexpr (mma_shape_K == 16) {
     auto l = logical_divide(
         acc_layout, Shape<X, X, _2>{}); // (4, MMA_M, (2, MMA_N / 2)))
+    return make_layout(
+        make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
+  } else {
+    // mma_shape_K == 32 (FP8 m16n8k32 on Blackwell RTX)
+    auto l = logical_divide(
+        acc_layout, Shape<X, X, _4>{}); // (4, MMA_M, (4, MMA_N / 4)))
     return make_layout(
         make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
   }
@@ -279,10 +328,7 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Blocks until all but N previous cp.async.commit_group operations have
-// committed. This differs from cute::cp_async_wait in that when N = 0 we don't
-// call cp.async.wait_all (which is equivalent to commit_group then wait_group
-// 0). Instead we just call cp.async.wait_group 0, which is slightly faster.
-// https://github.com/NVIDIA/cutlass/blob/master/include/cute/arch/copy_sm80.hpp#L113
+// committed.
 template <int N>
 CUTE_HOST_DEVICE void cp_async_wait() {
 #if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
@@ -314,7 +360,6 @@ __forceinline__ __device__ void copy(
   CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D)); // MMA
   CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D)); // MMA_M
   CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D)); // MMA_K
-  // There's no case where !Clear_OOB_K && Clear_OOB_MN
   static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
 #pragma unroll
   for (int m = 0; m < size<1>(S); ++m) {
@@ -330,89 +375,5 @@ __forceinline__ __device__ void copy(
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// {kBlockM, kBlockN, kNWarps}
-template <int Arch, int kHeadDim, bool Has_rab, bool Is_arbitrary = false>
-constexpr std::tuple<int, int, int> get_tile_size_fwd() {
-  if constexpr (Arch == 120) {
-    if constexpr (kHeadDim > 128 && (Has_rab || Is_arbitrary)) {
-      return {64, 32, 4};
-    }
-    // SM120: same as SM89 for forward when dynamic shared memory fits.
-    return {64, 64, 4};
-  }
-  if constexpr (Arch == 89) {
-    return {64, 64, 4};
-  }
-  if constexpr (Arch == 80) {
-    if constexpr (Has_rab) {
-      return {128, 64, 8};
-    } else {
-      if constexpr (kHeadDim <= 64) {
-        return {128, 96, 4};
-      } else if constexpr (kHeadDim <= 128) {
-        return {128, 96, 8};
-      } else {
-        return {128, 96, 8};
-      }
-    }
-  }
-  if constexpr (Has_rab) {
-    if constexpr (kHeadDim <= 128) {
-      return {128, 64, 4};
-    } else {
-      return {64, 32, 4};
-    }
-  } else {
-    if constexpr (kHeadDim <= 128) {
-      return {128, 96, 4};
-    } else {
-      return {64, 64, 4};
-    }
-  }
-}
-
-// {kBlockM, kBlockN, kNWarps}
-template <int Arch, int kHeadDim, bool Has_rab, bool Is_arbitrary = false>
-constexpr std::tuple<int, int, int> get_tile_size_bwd() {
-  if constexpr (Arch == 120) {
-    // SM120: reduced tile sizes to fit within 99KB shared memory + register limits.
-    // SM120 has only 99KB optin shared memory (vs SM89's ~100KB).
-    if constexpr (Is_arbitrary && kHeadDim > 128) {
-      return {32, 32, 2};
-    }
-    if constexpr (Has_rab) {
-      if constexpr (kHeadDim <= 64) {
-        return {64, 64, 8};   // reduced kBlockM from 128 to 64 (smem: 96KB -> 57KB)
-      } else if constexpr (kHeadDim <= 128) {
-        return {64, 64, 8};   // same tile, 88KB fits within 99KB limit
-      } else {
-        return {16, 64, 4};   // same tile as no-RAB D256; still fits SM120
-      }
-    } else {
-      if constexpr (kHeadDim <= 64) {
-        return {128, 64, 8};  // same as SM89, 80KB fits
-      } else if constexpr (kHeadDim <= 128) {
-        return {64, 64, 8};   // same as SM89
-      } else {
-        return {16, 64, 4};   // same as SM89
-      }
-    }
-  }
-  if constexpr (Arch == 89) {
-    if constexpr (kHeadDim <= 64) {
-      return {128, 64, 8};
-    } else if constexpr (kHeadDim <= 128) {
-      return {64, 64, 8};
-    } else {
-      return {16, 64, 4};
-    }
-  }
-  if constexpr (kHeadDim <= 128) {
-    return {64, 128, 8};
-  } else {
-    return {64, 64, 8};
-  }
-}
 
 } // namespace flash

@@ -21,7 +21,7 @@ import subprocess
 import urllib.request
 import urllib.error
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
-from src.generate_kernels import generate_kernels_ampere, generate_kernels_hopper
+from src.generate_kernels import generate_kernels_ampere, generate_kernels_hopper, generate_kernels_blackwell
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -197,7 +197,7 @@ if not SKIP_CUDA_BUILD:
             cc_flag.append("arch=compute_80,code=sm_80")
         if "12.0" in arch_list:
             cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_120,code=sm_120")
+            cc_flag.append("arch=compute_120a,code=sm_120a")
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -257,7 +257,14 @@ if not SKIP_CUDA_BUILD:
         if "9.0" in arch_list:
             torch_cpp_sources.append("src/hstu_hopper/hstu_ops_gpu.cpp")
             generate_kernels_hopper("src/hstu_hopper/instantiations")
-        cuda_sources = (glob.glob("src/hstu_ampere/instantiations/*.cu") if ("8.0" in arch_list or "12.0" in arch_list) else []) + (glob.glob("src/hstu_hopper/instantiations/*.cu") if "9.0" in arch_list else [])
+        if "12.0" in arch_list:
+            torch_cpp_sources.append("src/hstu_blackwell_rtx/hstu_ops_gpu.cpp")
+            generate_kernels_blackwell("src/hstu_blackwell_rtx/instantiations")
+        cuda_sources = (
+            (glob.glob("src/hstu_ampere/instantiations/*.cu") if ("8.0" in arch_list or "12.0" in arch_list) else [])
+            + (glob.glob("src/hstu_hopper/instantiations/*.cu") if "9.0" in arch_list else [])
+            + (glob.glob("src/hstu_blackwell_rtx/instantiations/hstu_fwd_hdim*_e4m3*_sm120*.cu") if "12.0" in arch_list else [])
+        )
 
         nvcc_flags = [
             "-O3",
@@ -291,6 +298,8 @@ if not SKIP_CUDA_BUILD:
             include_dirs.append(Path(this_dir) / "src" / "hstu_ampere")
         if "9.0" in arch_list:
             include_dirs.append(Path(this_dir) / "src" / "hstu_hopper")
+        if "12.0" in arch_list:
+            include_dirs.append(Path(this_dir) / "src" / "hstu_blackwell_rtx")
 
         sources = None
         if ONLY_COMPILE_SO:
@@ -362,6 +371,9 @@ package_dir = {}
 if "10.0" in arch_list:
     packages.append("hstu.hstu_blackwell")
     package_dir["hstu.hstu_blackwell"] = "src/hstu_blackwell"
+
+packages.append("hstu.hstu_blackwell_rtx")
+package_dir["hstu.hstu_blackwell_rtx"] = "src/hstu_blackwell_rtx"
 
 setup(
     name=PACKAGE_NAME,

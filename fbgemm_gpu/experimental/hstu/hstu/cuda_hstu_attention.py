@@ -9,8 +9,37 @@
 
 # pyre-strict
 
+from pathlib import Path
 from typing import Any, Optional, Tuple
+import importlib.util
+
 from .library import *  # noqa: F401, F403
+try:
+    from .hstu_blackwell_rtx.blackwell_rtx_fp8_attention import (
+        pack_descale_to_e8m0x4_int32,
+        quantize_paged_kv_cache_for_block_scale,
+        run_blackwell_rtx_fp8_varlen_fwd,
+    )
+except ModuleNotFoundError:
+    _blackwell_rtx_helper_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "hstu_blackwell_rtx"
+        / "blackwell_rtx_fp8_attention.py"
+    )
+    _blackwell_rtx_spec = importlib.util.spec_from_file_location(
+        "hstu_blackwell_rtx_fp8_attention",
+        _blackwell_rtx_helper_path,
+    )
+    if _blackwell_rtx_spec is None or _blackwell_rtx_spec.loader is None:
+        raise
+    _blackwell_rtx_module = importlib.util.module_from_spec(_blackwell_rtx_spec)
+    _blackwell_rtx_spec.loader.exec_module(_blackwell_rtx_module)
+    pack_descale_to_e8m0x4_int32 = _blackwell_rtx_module.pack_descale_to_e8m0x4_int32
+    quantize_paged_kv_cache_for_block_scale = (
+        _blackwell_rtx_module.quantize_paged_kv_cache_for_block_scale
+    )
+    run_blackwell_rtx_fp8_varlen_fwd = _blackwell_rtx_module.run_blackwell_rtx_fp8_varlen_fwd
 import torch
 import torch.nn as nn
 
@@ -61,7 +90,16 @@ def quantize_for_two_directions(x, seq_offsets, fp8_type=torch.float8_e4m3fn):
 
     return x_quantized, x_descale, xt_quantized, xt_descale, cu_seqlens_xt_descale
 
-def quantize_for_block_scale(x, seq_offsets, block_size=128, fp8_type=torch.float8_e4m3fn):
+def quantize_for_block_scale(
+    x,
+    seq_offsets,
+    block_size=128,
+    fp8_type=torch.float8_e4m3fn,
+    *,
+    scale_mode="seq_block",
+    d_chunk_size=128,
+    round_to_e8m0=False,
+):
     # x: (total_seq, head, dim)
     # q and kv might have diffrent block_size
     if x.dim() != 3:
@@ -71,7 +109,50 @@ def quantize_for_block_scale(x, seq_offsets, block_size=128, fp8_type=torch.floa
     dim = x.size(2)
     fp8_max = 448.0 if fp8_type == torch.float8_e4m3fn else 57344.0
 
-    cu_seqlens_x_descale = torch.zeros(B + 1, dtype=torch.int32, device='cuda')
+    cu_seqlens_x_descale = torch.zeros(B + 1, dtype=torch.int32, device=x.device)
+
+    def prepare_scale(scale):
+        scale = torch.max(
+            scale.to(torch.float32),
+            torch.tensor([1e-6], dtype=torch.float32, device=x.device),
+        )
+        if round_to_e8m0:
+            scale = torch.exp2(torch.ceil(torch.log2(scale)))
+        return scale
+
+    if scale_mode == "token_dchunk":
+        d_chunks = (dim + d_chunk_size - 1) // d_chunk_size
+        x_quantized = torch.empty_like(x, dtype=fp8_type)
+        x_descale_list = []
+
+        with torch.no_grad():
+            for i in range(B):
+                start = int(seq_offsets[i].item())
+                end = int(seq_offsets[i + 1].item())
+                cur_scale_chunks = []
+                for d_chunk in range(d_chunks):
+                    d0 = d_chunk * d_chunk_size
+                    d1 = min(dim, d0 + d_chunk_size)
+                    cur = x[start:end, :, d0:d1]
+                    cur_scale = prepare_scale(
+                        torch.amax(cur.abs(), dim=2).to(torch.float32) / fp8_max
+                    )
+                    x_quantized[start:end, :, d0:d1] = (
+                        cur / cur_scale.unsqueeze(-1)
+                    ).to(fp8_type)
+                    cur_scale_chunks.append(cur_scale)
+                x_descale_list.append(torch.stack(cur_scale_chunks, dim=2))
+                cu_seqlens_x_descale[i + 1] = cu_seqlens_x_descale[i] + (end - start)
+
+        x_descale = torch.cat(x_descale_list, dim=0).permute(1, 0, 2).contiguous()
+        if d_chunks == 1:
+            x_descale = x_descale.squeeze(-1).contiguous()
+        assert x_quantized.shape == x.shape, "assert x_quantized shape must equal to x shape"
+        return x_quantized, x_descale, cu_seqlens_x_descale
+
+    if scale_mode != "seq_block":
+        raise ValueError(f"unsupported quantize_for_block_scale scale_mode: {scale_mode}")
+
     x_quantized_list = []
     x_descale_list = []
 
@@ -90,7 +171,7 @@ def quantize_for_block_scale(x, seq_offsets, block_size=128, fp8_type=torch.floa
                 cur_bs_tensor = cur_bs_tensor
             cur_bs_tensor = cur_bs_tensor.view(actual_len_padding_block_num, block_size, head, dim)
             cur_bs_scale_tensor = torch.amax(cur_bs_tensor.abs(), dim=(1, 3), keepdim=True).to(torch.float32) / fp8_max
-            cur_bs_scale_tensor = torch.max(cur_bs_scale_tensor, torch.tensor([1e-6], dtype=torch.float32, device='cuda'))
+            cur_bs_scale_tensor = prepare_scale(cur_bs_scale_tensor)
             x_descale_list.append(cur_bs_scale_tensor)
             cur_bs_tensor_quantized = (cur_bs_tensor / cur_bs_scale_tensor).to(fp8_type).view(actual_len_padding_block_num * block_size, head, dim)[0:actual_len] #[actual_len_padding_block_num * cur_block_size, head, dim] - > [actual_len, head, dim]
             x_quantized_list.append(cur_bs_tensor_quantized)
@@ -198,7 +279,33 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
 
         major_version = torch.cuda.get_device_capability()[0]
         assert major_version in (8, 9, 10, 12), "Only support sm80, sm90, sm100, and sm120"
-        if major_version == 8 or major_version == 12:
+        if major_version == 12 and quant_mode == 2:
+            out, rab_padded = run_blackwell_rtx_fp8_varlen_fwd(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                scaling_seqlen,
+                num_contexts,
+                num_targets,
+                target_group_size,
+                window_size,
+                alpha,
+                rab,
+                func,
+                kv_cache,
+                page_offsets,
+                page_ids,
+                last_page_lens,
+                quant_mode,
+                quantize_for_block_scale,
+            )
+        elif major_version == 8 or major_version == 12:
             out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_80(
                 q,
                 k,
@@ -508,7 +615,7 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 output_dtype,
                 False,  # deterministic
             )
-        else:
+        elif ctx.major_version == 10:
             assert seqused_q is None and seqused_k is None, \
                 "HSTU-Blackwell does not support seqused_q and seqused_k"
             _sm100 = _import_sm100()
@@ -535,6 +642,8 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 func,
                 False,  # deterministic
             )
+        else:
+            raise RuntimeError("Blackwell RTX FP8 path is forward-only")
 
         # q & k grad shape
         return (

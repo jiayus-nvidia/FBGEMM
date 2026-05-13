@@ -850,7 +850,7 @@ void run_hstu_fwd_8x(Hstu_fwd_params& params, cudaStream_t stream) {
   INT_SWITCH(params.page_size, Page_Size, [&] {
     static constexpr bool Paged_KV = Page_Size > 0;
     static constexpr auto tile_size =
-        flash::get_tile_size_fwd<Arch, kHeadDim, Has_rab>();
+        flash::get_tile_size_fwd<Arch, kHeadDim, Has_rab, Is_arbitrary>();
     static constexpr int kBlockM = std::get<0>(tile_size);
     static constexpr int kBlockN = Paged_KV? Page_Size : std::get<1>(tile_size);
     static constexpr int kNWarps = std::get<2>(tile_size);
