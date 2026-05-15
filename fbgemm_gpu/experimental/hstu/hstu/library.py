@@ -12,6 +12,7 @@
 import logging
 import os
 
+no_fbgemm_gpu: bool = False
 try:
     import fbgemm_gpu  # noqa: F401
 except ImportError:
@@ -54,6 +55,11 @@ if (
             if cap >= (9, 0) and cap < (10, 0):
                 torch.ops.load_library(
                     "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm90"
+                )
+
+            if cap >= (12, 0):
+                torch.ops.load_library(
+                    "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm120"
                 )
 
 else:

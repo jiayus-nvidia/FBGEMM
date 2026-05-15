@@ -716,6 +716,15 @@ class HSTU16Test(unittest.TestCase):
         has_target = max_target_len > 0
         is_causal = window_size[0] == -1 and window_size[1] == 0
         is_delta_q = max_seq_len_q < max_seq_len_k
+        if (
+            torch.cuda.get_device_capability()[0] >= 12
+            and dtype == torch.bfloat16
+            and attn_dim == 256
+            and is_arbitrary
+            and has_rab
+        ):
+            logger.info("Skipping SM120 BF16 D256 arbitrary RAB/DRAB")
+            return
         if is_delta_q and has_target:
             logger.info("Skipping test for is_delta_q and has_target")
             return
@@ -960,7 +969,68 @@ def generate_paged_kv_input(
     page_size: int,
     dtype: torch.dtype,
     full_batch: bool,
+    max_context_len: int = 0,
+    target_group_size: int = 1,
+    window_size: tuple[int, int] = (-1, 0),
+    heads_rab: Optional[int] = None,
+    has_drab: bool = False,
+    is_arbitrary: bool = False,
+    return_extra: bool = False,
 ):
+    if return_extra:
+        L_q, L_k, num_contexts, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, num_targets, _, q, k, v, rab, mask, func = (
+            generate_input(
+                batch_size=batch_size,
+                heads=heads,
+                heads_rab=heads_rab,
+                max_seq_len_q=max_seq_len_q,
+                max_seq_len_k=max_seq_len_k,
+                max_context_len=max_context_len,
+                max_target_len=max_target_len,
+                target_group_size=target_group_size,
+                attn_dim=attn_dim,
+                hidden_dim=hidden_dim,
+                window_size=window_size,
+                dtype=dtype,
+                full_batch=full_batch,
+                has_drab=has_drab,
+                is_delta_q=max_seq_len_q < max_seq_len_k,
+                is_arbitrary=is_arbitrary,
+            )
+        )
+        target_lens = (
+            num_targets
+            if num_targets is not None
+            else torch.zeros((batch_size,), dtype=torch.int32, device=torch.device("cuda"))
+        )
+        lengths_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        lengths_k_cache = (lengths_k - target_lens).to(torch.int32)
+        lengths_page = (lengths_k_cache + page_size - 1) // page_size
+        page_offsets = torch.zeros((batch_size + 1,), dtype=torch.int32, device=torch.device("cuda"))
+        page_offsets[1:] = torch.cumsum(lengths_page, dim=0)
+
+        total_page = int(page_offsets[-1].item())
+        page_ids = torch.randperm(total_page, device=torch.device("cuda"), dtype=torch.int32)
+        last_page_lens = ((lengths_k_cache - 1) % page_size + 1).to(torch.int32)
+        kv_cache = torch.zeros((total_page, 2, page_size, heads, attn_dim), dtype=k.dtype, device=torch.device("cuda"))
+        for i in range(batch_size):
+            k_start = int(cu_seqlens_k[i].item())
+            cache_len = int(lengths_k_cache[i].item())
+            page_begin = int(page_offsets[i].item())
+            for j in range(int(lengths_page[i].item())):
+                valid = min(page_size, cache_len - j * page_size)
+                page_id = int(page_ids[page_begin + j].item())
+                src_begin = k_start + j * page_size
+                src_end = src_begin + valid
+                kv_cache[page_id, 0, :valid] = k[src_begin:src_end]
+                kv_cache[page_id, 1, :valid] = v[src_begin:src_end]
+
+        return (
+            L_q, L_k, num_contexts, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
+            num_targets, page_offsets, page_ids, last_page_lens, q, k, v, kv_cache, mask,
+            rab, func,
+        )
+
     # Generate lengths for new history qkv
     if full_batch:
         lengths_q = (
@@ -1721,8 +1791,11 @@ def _bwd_reference_fp8(
 @unittest.skipIf(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() < (9, 0)
-    or torch.cuda.get_device_capability() >= (10, 0),
-    "Skip when no Hopper GPU is available. This test is only for Hopper GPU.",
+    or (
+        torch.cuda.get_device_capability() >= (10, 0)
+        and torch.cuda.get_device_capability()[0] < 12
+    ),
+    "Skip when no Hopper or Blackwell RTX+ GPU is available.",
 )
 class HSTU8Test(unittest.TestCase):
     """Test HSTU attention with float8_e4m3 inputs."""
@@ -1759,6 +1832,7 @@ class HSTU8Test(unittest.TestCase):
         ),
         attn_hidden_dims=st.sampled_from(
             [
+                (32, 32),
                 (64, 64),
                 (128, 128),
                 (256, 256),
@@ -1801,6 +1875,14 @@ class HSTU8Test(unittest.TestCase):
         attn_dim, hidden_dim = attn_hidden_dims
         has_rab, has_drab, heads_rab = rab_params
         quant_mode, full_batch = quant_mode_full_batch
+        is_sm120_or_newer = torch.cuda.get_device_capability()[0] >= 12
+
+        if attn_dim == 32 and not is_sm120_or_newer:
+            logger.info("Skipping D32 FP8 test outside Blackwell RTX")
+            return
+        if is_sm120_or_newer and quant_mode != 2:
+            logger.info("Skipping non-blockscale FP8 test on Blackwell RTX")
+            return
 
         total_q = max_context_len + max_seq_len_q + max_target_len
         total_k = max_context_len + max_seq_len_k + max_target_len
@@ -1811,7 +1893,11 @@ class HSTU8Test(unittest.TestCase):
         if quant_mode == 0 and alpha < 0.5:
             logger.info("Skipping test for quant_mode == 0 and alpha < 0.5, might cause dQ accuracy issue")
             return
-        if quant_mode > 0 and (total_q % 16 != 0 or total_k % 16 != 0 or full_batch == False):
+        if (
+            quant_mode > 0
+            and not (is_sm120_or_newer and quant_mode == 2)
+            and (total_q % 16 != 0 or total_k % 16 != 0 or full_batch == False)
+        ):
             logger.info("Skipping test for quant_mode > 0 and (total_q % 16 != 0 or total_k % 16 != 0 or full_batch == False), not supported")
             return
         if is_delta_q and has_target:
@@ -1931,6 +2017,11 @@ class HSTU8Test(unittest.TestCase):
 
         assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
 
+        if is_sm120_or_newer:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            return
+
         g = torch.rand_like(torch_out)
         if not has_drab:
             (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
@@ -2021,6 +2112,177 @@ class HSTU8Test(unittest.TestCase):
             ).abs().max().item()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 12,
+    "FP8 paged KV test is only for Blackwell RTX.",
+)
+class HSTU8PagedKVTest(unittest.TestCase):
+    """Test Blackwell RTX FP8 paged KV attention."""
+
+    @given(
+        batch_size=st.sampled_from([4]),
+        heads=st.sampled_from([1, 2]),
+        seq_len_params=st.sampled_from([(99, 99), (128, 128), (256, 256)]),
+        max_context_len=st.sampled_from([0, 99, 128]),
+        target_params=st.sampled_from(
+            [
+                (0, (-1, -1), 1, False),
+                (0, (-1, -1), 1, True),
+                (0, (64, 16), 1, False),
+                (0, (-1, 0), 1, False),
+                (64, (-1, 0), 1, False),
+                (128, (-1, 0), 1, False),
+            ]
+        ),
+        attn_hidden_dims=st.sampled_from(
+            [(32, 32), (64, 64), (128, 128), (256, 256)]
+        ),
+        alpha=st.sampled_from([1.0]),
+        rab_params=st.sampled_from(
+            [
+                (False, False, None),
+                (True, False, None),
+                (True, True, None),
+            ]
+        ),
+        full_batch=st.just(True),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
+    def test_paged_kv_attn_fp8(
+        self,
+        batch_size: int,
+        heads: int,
+        seq_len_params: Tuple[int, int],
+        max_context_len: int,
+        target_params: Tuple[int, Tuple[int, int], int, bool],
+        attn_hidden_dims: Tuple[int, int],
+        alpha: float,
+        rab_params: Tuple[bool, bool, Optional[int]],
+        full_batch: bool,
+    ) -> None:
+        max_seq_len_q, max_seq_len_k = seq_len_params
+        max_target_len, window_size, target_group_size, is_arbitrary = target_params
+        attn_dim, hidden_dim = attn_hidden_dims
+        has_rab, has_drab, heads_rab = rab_params
+        has_context = max_context_len > 0
+        is_causal = window_size[0] == -1 and window_size[1] == 0
+        if not is_causal and has_context:
+            logger.info("Skipping test for not is_causal and has_context")
+            return
+        if is_arbitrary and (has_context or max_target_len > 0):
+            logger.info("Skipping test for arbitrary with context or target")
+            return
+        if max_target_len > 0 and not is_causal:
+            logger.info("Skipping test for target and not is_causal")
+            return
+
+        page_size = 64
+        (
+            L_q,
+            L_k,
+            num_contexts,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            num_targets,
+            page_offsets,
+            page_ids,
+            last_page_lens,
+            q,
+            k,
+            v,
+            kv_cache,
+            mask,
+            rab,
+            func,
+        ) = generate_paged_kv_input(
+            batch_size=batch_size,
+            heads=heads,
+            max_seq_len_q=max_seq_len_q,
+            max_seq_len_k=max_seq_len_k,
+            max_target_len=max_target_len,
+            attn_dim=attn_dim,
+            hidden_dim=hidden_dim,
+            page_size=page_size,
+            dtype=torch.float8_e4m3fn,
+            full_batch=full_batch,
+            max_context_len=max_context_len,
+            target_group_size=target_group_size,
+            window_size=window_size,
+            heads_rab=heads_rab,
+            has_drab=has_drab,
+            is_arbitrary=is_arbitrary,
+            return_extra=True,
+        )
+        out_ref = _hstu_attention_maybe_from_cache(
+            num_heads=heads,
+            attention_dim=attn_dim,
+            linear_dim=hidden_dim,
+            seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+            seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+            q=q,
+            k=k,
+            v=v,
+            q_offsets=cu_seqlens_q,
+            k_offsets=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            rab=rab if has_rab else None,
+            invalid_attn_mask=mask,
+            alpha=alpha,
+            upcast=True,
+            is_delta_q=max_seq_len_q < max_seq_len_k,
+        )
+        torch_out = _hstu_attention_maybe_from_cache_fp8(
+            num_heads=heads,
+            attention_dim=attn_dim,
+            linear_dim=hidden_dim,
+            seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+            seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+            q=q,
+            k=k,
+            v=v,
+            q_offsets=cu_seqlens_q,
+            k_offsets=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            rab=rab if has_rab else None,
+            invalid_attn_mask=mask,
+            alpha=alpha,
+            quant_mode=2,
+            is_delta_q=max_seq_len_q < max_seq_len_k,
+        )
+        hstu_out = hstu_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=max_context_len + max_seq_len_q + max_target_len,
+            max_seqlen_k=max_context_len + max_seq_len_k + max_target_len,
+            scaling_seqlen=-1,
+            num_contexts=num_contexts,
+            num_targets=num_targets,
+            target_group_size=target_group_size,
+            window_size=window_size,
+            alpha=alpha,
+            rab=rab if has_rab else None,
+            has_drab=has_drab,
+            kv_cache=kv_cache,
+            page_offsets=page_offsets,
+            page_ids=page_ids,
+            last_page_lens=last_page_lens,
+            func=func,
+            quant_mode=2,
+        )
+        torch.cuda.synchronize()
+        assert (hstu_out - out_ref).abs().max().item() <= 2 * (
+            torch_out - out_ref
+        ).abs().max().item()
 
 
 if __name__ == "__main__":

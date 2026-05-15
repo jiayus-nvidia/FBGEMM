@@ -1290,7 +1290,7 @@ void run_hstu_bwd_80(Hstu_bwd_params& params, cudaStream_t stream) {
   const bool rab_one_head = params.h_rab != params.h && params.h_rab == 1;
   BOOL_SWITCH(rab_one_head, Rab_one_head, [&] {
     static constexpr auto tile_size =
-        flash::get_tile_size_bwd<Arch, kHeadDim, Has_rab>();
+        flash::get_tile_size_bwd<Arch, kHeadDim, Has_rab, Is_arbitrary>();
     static constexpr int kBlockM = std::get<0>(tile_size);
     static constexpr int kBlockN = std::get<1>(tile_size);
     static constexpr int kNWarps = std::get<2>(tile_size);

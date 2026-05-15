@@ -115,6 +115,15 @@ file(GLOB hstu_hopper_cpp_source_files
 file(GLOB hstu_hopper_cuda_source_files
   src/hstu_hopper/instantiations/*.cu)
 
+# Collect HSTU Blackwell RTX source files
+file(GLOB hstu_blackwell_rtx_cpp_source_files
+  src/hstu_blackwell_rtx/*.cpp
+  src/hstu_blackwell_rtx/*.h)
+
+# Collect HSTU Blackwell RTX GPU source files
+file(GLOB hstu_blackwell_rtx_cuda_source_files
+  src/hstu_blackwell_rtx/instantiations/hstu_fwd_hdim*_e4m3*_sm120*.cu)
+
 # Initialize the combined source file lists
 set(hstu_cpp_source_files "")
 set(hstu_cpp_source_files_gpu "")
@@ -136,19 +145,21 @@ if("9.0" IN_LIST TORCH_CUDA_ARCH_LIST OR "9.0a" IN_LIST TORCH_CUDA_ARCH_LIST)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_90a,code=sm_90a")
 endif()
 
-# Conditionally add SM120 sources (reuses Ampere sources with SM89 tuning)
+# Conditionally add SM120 sources (Blackwell RTX FP8 sources and Ampere BF16/FP16 sources)
 if("12.0" IN_LIST TORCH_CUDA_ARCH_LIST)
-  message(STATUS "HSTU: Selecting Ampere sources for arch 12.0 (SM120, reusing SM89 path)")
+  message(STATUS "HSTU: Selecting Ampere BF16/FP16 and Blackwell RTX FP8 sources for arch 12.0")
   if(NOT "8.0" IN_LIST TORCH_CUDA_ARCH_LIST)
     list(APPEND hstu_cpp_source_files ${hstu_ampere_cpp_source_files})
     list(APPEND hstu_cuda_source_files ${hstu_ampere_cuda_source_files})
   endif()
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_120,code=sm_120")
+  list(APPEND hstu_cpp_source_files ${hstu_blackwell_rtx_cpp_source_files})
+  list(APPEND hstu_cuda_source_files ${hstu_blackwell_rtx_cuda_source_files})
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_120a,code=[sm_120a,compute_120a]")
 endif()
 
 # Check if any sources were selected
-if(NOT hstu_cpp_source_files AND NOT hstu_cpp_source_files_gpu AND NOT "10.0" IN_LIST TORCH_CUDA_ARCH_LIST AND NOT "12.0" IN_LIST TORCH_CUDA_ARCH_LIST)
-  message(WARNING "HSTU: Neither Ampere (8.0) nor Hopper (9.0) architectures found in TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}, would compile both")
+if(NOT hstu_cpp_source_files AND NOT hstu_cpp_source_files_gpu AND NOT "10.0" IN_LIST TORCH_CUDA_ARCH_LIST)
+  message(WARNING "HSTU: No recognized architectures found in TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}, would compile Ampere+Hopper")
   list(APPEND hstu_cpp_source_files ${hstu_ampere_cpp_source_files} ${hstu_hopper_cpp_source_files})
   list(APPEND hstu_cuda_source_files ${hstu_ampere_cuda_source_files} ${hstu_hopper_cuda_source_files})
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_80,code=sm_80 -gencode arch=compute_90a,code=sm_90a")
@@ -172,6 +183,7 @@ if(hstu_cpp_source_files OR hstu_cpp_source_files_gpu)
       ${fbgemm_sources_include_directories}
       ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_ampere
       ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_hopper
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_blackwell_rtx
     CPU_SRCS
       ${hstu_cpp_source_files}
     GPU_SRCS

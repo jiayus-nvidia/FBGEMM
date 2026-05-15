@@ -352,6 +352,73 @@ template void run_hstu_bwd_<90, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>
                     )
 
 
+def generate_kernels_blackwell(install_dir: str):
+    """
+    Generate HSTU forward kernels for Blackwell RTX architecture.
+    This upstream branch only builds the FP8 e4m3 forward path.
+    """
+
+    HEAD_DIMENSIONS_FP8 = (
+        []
+        + ([32] if not DISABLE_HDIM32 else [])
+        + ([64] if not DISABLE_HDIM64 else [])
+        + ([128] if not DISABLE_HDIM128 else [])
+        + ([256] if not DISABLE_HDIM256 else [])
+    )
+    RAB = [""] + (["_rab"] if not DISABLE_RAB else [])
+    MASK = [""]
+    if not DISABLE_LOCAL:
+        MASK += ["_local"]
+    if not DISABLE_CAUSAL:
+        CAUSAL_MASK = ["_causal"]
+        CONTEXT_MASK = [""] + (["_context"] if not DISABLE_CONTEXT else [])
+        TARGET_MASK = [""] + (["_target"] if not DISABLE_TARGET else [])
+        MASK += [f"{c}{x}{t}" for c, x, t in itertools.product(CAUSAL_MASK, CONTEXT_MASK, TARGET_MASK)]
+    if not DISABLE_ARBITRARY:
+        MASK += ["_arbitrary"]
+
+    os.makedirs(install_dir, exist_ok=True)
+
+    blackwell_fwd_file_head = """
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+// Splitting different head dimensions, data types and masks to different files to speed up
+// compilation. This file is auto-generated. See generate_kernels.py
+
+#include "hstu_fwd_launch_template.h"
+
+template void run_hstu_fwd_<120, {}, {}, {}, {}, {}, {}, {}, {}, {}>
+                           (Hstu_fwd_params& params, cudaStream_t stream);
+
+    """
+
+    # FP8 (e4m3) kernels
+    if not DISABLE_FP8:
+        for hdim, rab, mask in itertools.product(HEAD_DIMENSIONS_FP8, RAB, MASK):
+            file_name = f"{install_dir}/hstu_fwd_hdim{hdim}_e4m3{rab}{mask}_fn{ARBITRARY_NFUNC}_sm120.cu" if "arbitrary" in mask else f"{install_dir}/hstu_fwd_hdim{hdim}_e4m3{rab}{mask}_sm120.cu"
+            if not os.path.exists(file_name):
+                with open(file_name, "w") as f:
+                    f.write(
+                        blackwell_fwd_file_head.format(
+                            "cutlass::float_e4m3_t",
+                            hdim,
+                            "true" if "_rab" in rab else "false",
+                            "true" if "local" in mask else "false",
+                            "true" if "causal" in mask else "false",
+                            "true" if "context" in mask else "false",
+                            "true" if "target" in mask else "false",
+                            "true" if "arbitrary" in mask else "false",
+                            str(ARBITRARY_NFUNC) if "arbitrary" in mask else "0",
+                        )
+                    )
+
+
 def main() -> None:
     import argparse
 
@@ -377,6 +444,10 @@ def main() -> None:
     if "9.0" in args.arch_list:
         # In OSS, the generated files will be written to hstu_hopper/instantiations
         generate_kernels_hopper(args.install_dir or "hstu_hopper/instantiations")
+
+    if "12.0" in args.arch_list:
+        # In OSS, the generated files will be written to hstu_blackwell_rtx/instantiations
+        generate_kernels_blackwell(args.install_dir or "hstu_blackwell_rtx/instantiations")
 
 
 if __name__ == "__main__":
