@@ -33,34 +33,32 @@ if (
     and torch.version.cuda is not None
     and torch.version.cuda >= "12.4"
 ):
-    cap = torch.cuda.get_device_capability()
-    # SM80/SM89 (cap < 10.0) and SM120 (cap >= 12.0) use compiled CUDA C++ kernels
-    _needs_ampere_lib = cap < (10, 0) or cap >= (12, 0)
+    # Always load the bundled hstu ops .so so torch.export's register_fake hooks
+    # in hstu/hstu_ops_gpu.py can find their target ops (fbgemm::hstu_varlen_fwd_{80,90}),
+    # even on Blackwell where the actual sm100 path is served via hstu.hstu_blackwell.
     if open_source or no_fbgemm_gpu:
-        if _needs_ampere_lib:
-            torch.ops.load_library(
-                os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
-            )
-            torch.classes.load_library(
-                os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
-            )
+        torch.ops.load_library(
+            os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
+        )
+        torch.classes.load_library(
+            os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
+        )
     else:
-        if _needs_ampere_lib:
-            torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_gpu")
+        torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_gpu")
 
+        torch.ops.load_library(
+            "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm80"
+        )
+
+        if torch.cuda.get_device_capability() >= (9, 0):
             torch.ops.load_library(
-                "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm80"
+                "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm90"
             )
 
-            if cap >= (9, 0) and cap < (10, 0):
-                torch.ops.load_library(
-                    "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm90"
-                )
-
-            if cap >= (12, 0):
-                torch.ops.load_library(
-                    "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm120"
-                )
+        if torch.cuda.get_device_capability() >= (12, 0):
+            torch.ops.load_library(
+                "//deeplearning/fbgemm/fbgemm_gpu/experimental/hstu/src:hstu_ops_gpu_sm120"
+            )
 
 else:
     logging.warning("CUDA is not available for FBGEMM HSTU")
