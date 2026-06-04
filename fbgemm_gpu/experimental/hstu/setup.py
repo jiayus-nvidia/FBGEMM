@@ -124,6 +124,19 @@ else:
     import torch
     from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
 
+    _TorchCUDAExtension = CUDAExtension
+
+    def CUDAExtension(*args, **kwargs):
+        extension = _TorchCUDAExtension(*args, **kwargs)
+        # HSTU registers dispatcher ops and does not use pybind11/Python C API.
+        # Drop PyTorch's default libtorch_python dependency so C++-only loaders
+        # can dlopen the op library without resolving Python symbols.
+        if extension.libraries:
+            extension.libraries = [
+                library for library in extension.libraries if library != "torch_python"
+            ]
+        return extension
+
 
 def get_platform():
     """
