@@ -6,8 +6,6 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 
-import utils
-
 from cutlass.cute.typing import Int32, Tuple
 from .utils import split_wg
 

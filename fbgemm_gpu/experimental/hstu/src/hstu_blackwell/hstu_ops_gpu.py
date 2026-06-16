@@ -19,6 +19,44 @@ from cutlass.cute.typing import Float32, Int32, Float16, BFloat16
 from .hstu_fwd import HSTUAttentionForwardSm100
 from .hstu_bwd import HSTUAttentionBackwardSm100
 
+
+def _is_head_major_compact(t: torch.Tensor) -> bool:
+    if t.dim() != 3:
+        return False
+    total_tokens, _, head_dim = t.shape
+    return t.stride() == (head_dim, total_tokens * head_dim, 1)
+
+
+def _as_bwd_compact_layout(t: torch.Tensor) -> torch.Tensor:
+    if _is_head_major_compact(t):
+        head_major = t.permute(1, 0, 2)
+    else:
+        head_major = t.permute(1, 0, 2).clone(memory_format=torch.contiguous_format)
+    return head_major.permute(1, 2, 0).unsqueeze(3).unsqueeze(2)
+
+
+def _empty_bwd_compact_layout_like(t: torch.Tensor) -> torch.Tensor:
+    total_tokens, num_heads, head_dim = t.shape
+    head_major = torch.empty(
+        (num_heads, total_tokens, head_dim),
+        dtype=t.dtype,
+        device=t.device,
+    )
+    return head_major.permute(1, 2, 0).unsqueeze(3).unsqueeze(2)
+
+
+def _as_bwd_original_qkv_layout(t: torch.Tensor) -> torch.Tensor:
+    return t.permute(0, 2, 1).unsqueeze(2).unsqueeze(4)
+
+
+def _supports_bwd_original_qkv_layout(t: torch.Tensor) -> bool:
+    if t.dim() != 3 or t.stride(2) != 1:
+        return False
+    # The backward kernel uses 128-bit global copy/TMA paths. For bf16/fp16,
+    # token and head offsets must stay 8-element aligned.
+    return t.stride(0) % 8 == 0 and t.stride(1) % 8 == 0
+
+
 def hstu_varlen_fwd_100(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -39,9 +77,20 @@ def hstu_varlen_fwd_100(
     page_ids: Optional[torch.Tensor] = None,
     page_indptrs: Optional[torch.Tensor] = None,
 ):
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
+    # The forward kernel only needs a contiguous last dim (q/k/v are passed via
+    # mark_layout_dynamic(leading_dim=ndim-1)); full contiguity is not required.
+    # When the (T,H,D) inputs already have a unit-stride last dim and 128-bit
+    # aligned token/head strides, feed them in their original layout and skip the
+    # contiguous() copy (which forces a full copy for packed/sliced qkv views).
+    # Non-aligned inputs fall back to the previous contiguous() path.
+    if not (
+        _supports_bwd_original_qkv_layout(q)
+        and _supports_bwd_original_qkv_layout(k)
+        and _supports_bwd_original_qkv_layout(v)
+    ):
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
 
     q_dtype = q.dtype
     assert q_dtype == torch.bfloat16 or q_dtype == torch.float16, "Only support bf16 and fp16"
@@ -75,7 +124,11 @@ def hstu_varlen_fwd_100(
         assert page_ids is not None and page_indptrs is not None, "Paged KV is True, but page metadata is missing."
         assert paged_kv.dim() == 5 and paged_kv.shape[2] == 128, "Only accept 5-D paged KV table with page_size=512"
 
-    out = torch.empty_like(q)
+    out = torch.empty(
+        (q.shape[1], q.shape[0], q.shape[2]),
+        dtype=q.dtype,
+        device=q.device,
+    ).permute(1, 0, 2)
     # out = torch.zeros_like(q)  # for test
     q_tensor, k_tensor, v_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
@@ -222,20 +275,56 @@ def hstu_varlen_bwd_100(
     assert not has_drab, "drab is not supported in Blackwell backward kernel"
     drab = None
 
-    q = q.permute(1, 0, 2).contiguous().permute(1, 2, 0).unsqueeze(3).unsqueeze(2)
-    k = k.permute(1, 0, 2).contiguous().permute(1, 2, 0).unsqueeze(3).unsqueeze(2)
-    v = v.permute(1, 0, 2).contiguous().permute(1, 2, 0).unsqueeze(3).unsqueeze(2)
-    do = do.permute(1, 0, 2).contiguous().permute(1, 2, 0).unsqueeze(3).unsqueeze(2)
+    use_original_qkv_layout = (
+        _supports_bwd_original_qkv_layout(q)
+        and _supports_bwd_original_qkv_layout(k)
+        and _supports_bwd_original_qkv_layout(v)
+    )
+    q_orig, k_orig, v_orig = q, k, v
+    if use_original_qkv_layout:
+        q = _as_bwd_original_qkv_layout(q)
+        k = _as_bwd_original_qkv_layout(k)
+        v = _as_bwd_original_qkv_layout(v)
+    else:
+        q = _as_bwd_compact_layout(q)
+        k = _as_bwd_compact_layout(k)
+        v = _as_bwd_compact_layout(v)
+
+    # `do` shares the same original-layout fast path as q/k/v: when its layout is
+    # 128-bit aligned, hand it to the kernel directly (a permute/view) instead of
+    # cloning into the head-major compact layout. The kernel reads do as a K-major
+    # TMA-B operand and adapts to the strides, exactly as it already does for q.
+    # A non-head-major `do` (the common autograd grad layout) otherwise pays a real
+    # ~90us (D128) / ~34us (D64) clone per backward call.
+    use_original_do_layout = _supports_bwd_original_qkv_layout(do)
+    if use_original_do_layout:
+        do = _as_bwd_original_qkv_layout(do)
+    else:
+        do = _as_bwd_compact_layout(do)
 
     dq_orig, dk_orig, dv_orig = dq, dk, dv
-    dq = torch.empty_strided(q.shape, q.stride(), dtype=q.dtype, device=q.device)
-    dk = torch.empty_strided(k.shape, k.stride(), dtype=k.dtype, device=k.device)
-    dv = torch.empty_strided(v.shape, v.stride(), dtype=v.dtype, device=v.device)
+    if use_original_qkv_layout:
+        dq = _empty_bwd_compact_layout_like(q_orig)
+        dk = _empty_bwd_compact_layout_like(k_orig)
+        dv = _empty_bwd_compact_layout_like(v_orig)
+    else:
+        dq = torch.empty_strided(q.shape, q.stride(), dtype=q.dtype, device=q.device)
+        dk = torch.empty_strided(k.shape, k.stride(), dtype=k.dtype, device=k.device)
+        dv = torch.empty_strided(v.shape, v.stride(), dtype=v.dtype, device=v.device)
 
-    q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1).mark_compact_shape_dynamic(mode=1, stride_order=(2, 3, 0, 4, 1), divisibility=64)
-        for t in (q, k, v, do, dq, dk, dv)
-    ]
+    def _mark_plain(t):
+        return from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+
+    def _mark_compact(t):
+        return from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1).mark_compact_shape_dynamic(mode=1, stride_order=(2, 3, 0, 4, 1), divisibility=64)
+
+    if use_original_qkv_layout:
+        q_tensor, k_tensor, v_tensor = [_mark_plain(t) for t in (q, k, v)]
+    else:
+        q_tensor, k_tensor, v_tensor = [_mark_compact(t) for t in (q, k, v)]
+    do_tensor = _mark_plain(do) if use_original_do_layout else _mark_compact(do)
+    # dq/dk/dv are always produced in the compact layout
+    dq_tensor, dk_tensor, dv_tensor = [_mark_compact(t) for t in (dq, dk, dv)]
     cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (cu_seqlens_q, cu_seqlens_k)
@@ -253,7 +342,7 @@ def hstu_varlen_bwd_100(
 
     current_stream = cutlass_torch.default_stream()
     problem_shape = (Int32(max_seqlen_q), Int32(max_seqlen_k), Int32(head_dim), ((Int32(1), Int32(num_heads)), Int32(batch_size)))
-    compile_key = (head_dim, kBlockM, kBlockN, is_causal, is_local, is_context, is_target, target_group_size, is_arbitrary, func_num)
+    compile_key = (head_dim, kBlockM, kBlockN, use_original_qkv_layout, use_original_do_layout, is_causal, is_local, is_context, is_target, target_group_size, is_arbitrary, func_num)
 
     if compile_key not in hstu_varlen_bwd_100.compile_cache:
         hstu_bwd_sm100 = HSTUAttentionBackwardSm100(

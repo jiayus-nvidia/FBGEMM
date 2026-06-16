@@ -15,7 +15,7 @@ SHELL := /bin/bash
 # Add src/ to PYTHONPATH so hstu_blackwell is importable without pip install
 export PYTHONPATH := $(CURDIR)/src:$(PYTHONPATH)
 PYTHON := python
-PYTEST := python -m pytest
+PYTEST := $(PYTHON) -m pytest
 TEST_DIR := test
 TEST_FILE := $(TEST_DIR)/hstu_test.py
 PROFILE_FILE := $(TEST_DIR)/profile_blackwell.py
@@ -45,7 +45,18 @@ TARGET_LEN ?= 0
 # TARGET_GROUP_SIZE: target group size (must be >= 1, 0 causes compile-time div-by-zero)
 TARGET_GROUP_SIZE ?= 1
 
-.PHONY: setup tt vt bb profile bm bm-cli clean help
+# Benchmark matrix used by `make bb`. `make bb-one` runs one exact config.
+BB_BATCHES ?= $(BATCH)
+BB_HEADS_LIST ?= $(HEADS)
+BB_SEQLENS ?= $(SEQLEN)
+BB_HDIMS ?= 64 128
+BB_DTYPES ?= bf16 fp16
+BB_MASKS ?= causal local target
+BB_TARGET_LENS ?= 128
+BB_TARGET_GROUP_SIZES ?= $(TARGET_GROUP_SIZE)
+BB_MODES ?= $(MODE)
+
+.PHONY: setup tt vt bb bb-one profile bm bm-cli clean help
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -140,8 +151,9 @@ def run_fwd():
             alpha=1.0, rab=None, func=None,
         )
 
-def run_bwd(out):
-    do = torch.randn_like(out)
+def run_bwd(out, do=None):
+    if do is None:
+        do = torch.randn_like(out)
     with torch.cuda.nvtx.range("hstu_blackwell_bwd"):
         return hstu_varlen_bwd_100(
             do, q, k, v,
@@ -196,12 +208,13 @@ elif is_benchmark:
     # bwd benchmark
     if mode in ("bwd", "both"):
         out, _ = run_fwd()
+        do_bench = torch.randn_like(out)
         torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         for _ in range(n_iter):
-            run_bwd(out)
+            run_bwd(out, do_bench)
         end.record()
         torch.cuda.synchronize()
         bwd_ms = start.elapsed_time(end) / n_iter
@@ -223,9 +236,54 @@ _gen_profile_script:
 	@echo "$$PROFILE_SCRIPT" > $(PROFILE_FILE)
 
 # ---------------------------------------------------------------------------
-# Benchmark
+# Benchmark matrix
 # ---------------------------------------------------------------------------
-bb: _gen_profile_script
+bb:
+	@echo "=== HSTU Blackwell Benchmark Matrix ==="
+	@set -e; \
+	for batch in $(BB_BATCHES); do \
+	  for heads in $(BB_HEADS_LIST); do \
+	    for seqlen in $(BB_SEQLENS); do \
+	      for hdim in $(BB_HDIMS); do \
+	        for dtype in $(BB_DTYPES); do \
+	          for mode in $(BB_MODES); do \
+	            for mask in $(BB_MASKS); do \
+	              if [ "$$mask" = "target" ]; then \
+	                target_lens="$(BB_TARGET_LENS)"; \
+	              else \
+	                target_lens="0"; \
+	              fi; \
+	              for target_len in $$target_lens; do \
+	                for target_group_size in $(BB_TARGET_GROUP_SIZES); do \
+	                  echo ""; \
+	                  echo ">>> B=$$batch H=$$heads S=$$seqlen D=$$hdim dtype=$$dtype mode=$$mode mask=$$mask target_len=$$target_len target_group_size=$$target_group_size"; \
+	                  $(MAKE) --no-print-directory bb-one \
+	                    PYTHON="$(PYTHON)" \
+	                    MODE="$$mode" \
+	                    BATCH="$$batch" \
+	                    HEADS="$$heads" \
+	                    SEQLEN="$$seqlen" \
+	                    HDIM="$$hdim" \
+	                    DTYPE="$$dtype" \
+	                    MASK="$$mask" \
+	                    TARGET_LEN="$$target_len" \
+	                    TARGET_GROUP_SIZE="$$target_group_size" \
+	                    NWARMUP="$(NWARMUP)" \
+	                    NITER="$(NITER)"; \
+	                done; \
+	              done; \
+	            done; \
+	          done; \
+	        done; \
+	      done; \
+	    done; \
+	  done; \
+	done
+
+# ---------------------------------------------------------------------------
+# Single benchmark
+# ---------------------------------------------------------------------------
+bb-one: _gen_profile_script
 	@echo "=== HSTU Blackwell Benchmark ==="
 	$(PYTHON) -u $(PROFILE_FILE) benchmark
 
@@ -291,7 +349,8 @@ help:
 	@echo "  make setup                          Install HSTU package (Blackwell-only)"
 	@echo "  make tt   [BATCH= HEADS= HDIM= SEQLEN=]  Quick single-case correctness test"
 	@echo "  make vt   [MAX_EXAMPLES=200]        Full hypothesis test suite"
-	@echo "  make bb   [BATCH= HEADS= HDIM= SEQLEN= MODE=fwd|bwd|both]  Benchmark"
+	@echo "  make bb                             Benchmark matrix"
+	@echo "  make bb-one [BATCH= HEADS= HDIM= SEQLEN= MODE=fwd|bwd|both]  Single benchmark"
 	@echo "  make profile                        Single run for ncu profiling"
 	@echo "  make bm                             ncu full profile (NVTX-filtered, saves .ncu-rep)"
 	@echo "  make bm-cli                         ncu register/spill/smem analysis"
@@ -299,13 +358,21 @@ help:
 	@echo ""
 	@echo "Variables (override on command line):"
 	@echo "  HDIM=64|128       Head dimension       (default: 128)"
-	@echo "  BATCH=N           Batch size            (default: 32)"
-	@echo "  HEADS=N           Number of heads       (default: 2)"
-	@echo "  SEQLEN=N          Sequence length       (default: 1024)"
+	@echo "  BATCH=N           Batch size            (default: 8)"
+	@echo "  HEADS=N           Number of heads       (default: 4)"
+	@echo "  SEQLEN=N          Sequence length       (default: 8192)"
 	@echo "  DTYPE=bf16|fp16   Data type             (default: bf16)"
 	@echo "  MODE=fwd|bwd|both Forward/backward      (default: both)"
-	@echo "  MASK=causal|local Mask type             (default: causal)"
+	@echo "  MASK=causal|local|target Mask type      (default: causal)"
 	@echo "  TARGET_LEN=N      Target length         (default: 0)"
-	@echo "  NWARMUP=N         Warmup iterations     (default: 10)"
-	@echo "  NITER=N           Benchmark iterations  (default: 100)"
-	@echo "  MAX_EXAMPLES=N    Hypothesis examples   (default: 200)"
+	@echo "  NWARMUP=N         Warmup iterations     (default: 5)"
+	@echo "  NITER=N           Benchmark iterations  (default: 20)"
+	@echo "  MAX_EXAMPLES=N    Hypothesis examples   (default: 100)"
+	@echo "  BB_BATCHES='...'       Matrix batches       (default: BATCH)"
+	@echo "  BB_HEADS_LIST='...'    Matrix heads         (default: HEADS)"
+	@echo "  BB_SEQLENS='...'       Matrix sequence lens (default: SEQLEN)"
+	@echo "  BB_HDIMS='64 128'      Matrix head dims"
+	@echo "  BB_DTYPES='bf16 fp16'  Matrix dtypes"
+	@echo "  BB_MASKS='causal local target'  Matrix masks"
+	@echo "  BB_TARGET_LENS='128'   Target lengths for MASK=target"
+	@echo "  BB_MODES='both'        Matrix modes"
