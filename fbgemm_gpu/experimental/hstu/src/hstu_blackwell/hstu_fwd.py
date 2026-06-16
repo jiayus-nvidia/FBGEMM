@@ -2,6 +2,8 @@
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
+from __future__ import annotations
+
 import enum
 import math
 from typing import Type, Tuple, Callable, Optional
@@ -134,7 +136,7 @@ class HSTUAttentionForwardSm100:
         # 75% (96/128) matches FA4's proven configuration, allowing PV MMA to overlap
         # with the last 25% of P computation.
         self.split_P_arrive = self.kBlockN // 4 * 3
-        self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
+        self.split_P_arrive = int(self.split_P_arrive / 32) * 32
 
         assert self.tmem_total <= SM100_TMEM_CAPACITY_COLUMNS
 

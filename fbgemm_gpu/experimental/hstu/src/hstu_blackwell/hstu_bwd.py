@@ -256,62 +256,53 @@ class HSTUAttentionBackwardSm100:
         q_seq_max, k_seq_max, d, hb = problem_shape
         h, b = hb
         h_r, h_k = h
-        # (s, d, h_r, h_k, b) -> (s, d, ((h_r, h_k), b))
-        Q = cute.make_tensor(
-            Q.iterator,
-            cute.make_layout(
-                (Q.shape[0], Q.shape[1], hb),
-                stride=(
-                    Q.stride[0],
-                    Q.stride[1],
-                    (
-                        (Q.shape[0] * Q.shape[1], Q.shape[0] * Q.shape[1] * Q.shape[2]),
+        def make_q_like_tensor(tensor: cute.Tensor) -> cute.Tensor:
+            return cute.make_tensor(
+                tensor.iterator,
+                cute.make_layout(
+                    (tensor.shape[0], tensor.shape[1], hb),
+                    stride=(
+                        tensor.stride[0],
+                        tensor.stride[1],
                         (
-                            0
+                            (tensor.stride[2], tensor.stride[3]),
+                            (
+                                0
+                            ),
                         ),
                     ),
                 ),
-            ),
-        )
-        # (s, d, 1, h_k, b) -> (s, d, ((1, h_k), b))
-        K = cute.make_tensor(
-            K.iterator,
-            cute.make_layout(
-                (K.shape[0], K.shape[1], hb),
-                stride=(
-                    K.stride[0],
-                    K.stride[1],
-                    (
-                        (0, K.shape[0] * K.shape[1]),
-                        (
-                            0
-                        ),
-                    ),
-                ),
-            ),
-        )
-        # (s, d, 1, h_k, b) -> (s, d, (（1, h_k), b))
-        V = cute.make_tensor(
-            V.iterator,
-            cute.make_layout(
-                (V.shape[0], V.shape[1], hb),
-                stride=(
-                    V.stride[0],
-                    V.stride[1],
-                    (
-                        (0, V.shape[0] * V.shape[1]),
-                        (
-                            0
-                        ),
-                    ),
-                ),
-            ),
-        )
+            )
 
-        dQ = cute.make_tensor(dQ.iterator, Q.layout)
-        dK = cute.make_tensor(dK.iterator, K.layout)
-        dV = cute.make_tensor(dV.iterator, V.layout)
-        dO = cute.make_tensor(dO.iterator, Q.layout)
+        def make_kv_like_tensor(tensor: cute.Tensor) -> cute.Tensor:
+            return cute.make_tensor(
+                tensor.iterator,
+                cute.make_layout(
+                    (tensor.shape[0], tensor.shape[1], hb),
+                    stride=(
+                        tensor.stride[0],
+                        tensor.stride[1],
+                        (
+                            (0, tensor.stride[3]),
+                            (
+                                0
+                            ),
+                        ),
+                    ),
+                ),
+            )
+
+        # (s, d, h_r, h_k, b) -> (s, d, ((h_r, h_k), b))
+        Q = make_q_like_tensor(Q)
+        # (s, d, 1, h_k, b) -> (s, d, ((1, h_k), b))
+        K = make_kv_like_tensor(K)
+        # (s, d, 1, h_k, b) -> (s, d, ((1, h_k), b))
+        V = make_kv_like_tensor(V)
+
+        dQ = make_q_like_tensor(dQ)
+        dK = make_kv_like_tensor(dK)
+        dV = make_kv_like_tensor(dV)
+        dO = make_q_like_tensor(dO)
 
         self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
         self.dQ_major_mode = utils.LayoutEnum.from_tensor(dQ).mma_major_mode()
@@ -1815,14 +1806,14 @@ class HSTUAttentionBackwardSm100:
 
         tTR_cST = thr_t2r.partition_D(cST)
         tTR_cST = split_wg(tTR_cST, num_warp_groups, wg_idx)
-        tTR_rST = cute.make_fragment(tTR_cST.shape, self.acc_dtype)
+        tTR_rST = cute.make_fragment_like(cute.make_layout(tTR_cST.shape), self.acc_dtype)
 
         tTR_tST = thr_t2r.partition_S(tSTtST)
         tTR_tST = split_wg(tTR_tST, num_warp_groups, wg_idx)
 
         tTR_cdPT_p = thr_t2r.partition_D(cdPT)
         tTR_cdPT = split_wg(tTR_cdPT_p, num_warp_groups, wg_idx)
-        tTR_rdPT = cute.make_fragment(tTR_cdPT.shape, self.acc_dtype)
+        tTR_rdPT = cute.make_fragment_like(cute.make_layout(tTR_cdPT.shape), self.acc_dtype)
 
         tTR_tdPT = thr_t2r.partition_S(tdPTtdPT)
         tTR_tdPT = split_wg(tTR_tdPT, num_warp_groups, wg_idx)
@@ -2069,8 +2060,8 @@ class HSTUAttentionBackwardSm100:
 
         # Notify for dS
         cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
+            "async.shared",
+            space="cta",
         )
         compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
         compute_mma_dS_producer_state.advance()
@@ -2204,7 +2195,7 @@ class HSTUAttentionBackwardSm100:
         (mma_reduce_dQ_pipeline, reduce_tma_store_pipeline) = pipeline_args
         mma_reduce_dQ_pipeline.consumer_wait(mma_reduce_dQ_consumer_state)
 
-        tTR_rdQ = cute.make_fragment(tTR_cdQ.shape, self.acc_dtype)
+        tTR_rdQ = cute.make_fragment_like(cute.make_layout(tTR_cdQ.shape), self.acc_dtype)
 
         # Load dQ from tmem to rmem
         cute.copy(tiled_t2r, tTR_tdQ, tTR_rdQ)
@@ -2231,8 +2222,8 @@ class HSTUAttentionBackwardSm100:
 
             # Wait for the stores to all be visible to the TMA
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             self.reduce_sync_barrier.arrive_and_wait()
 
@@ -2256,7 +2247,7 @@ class HSTUAttentionBackwardSm100:
         frg_cnt: Int32,
     ) -> cute.Tensor:
         tidx, tidy, tidz = cute.arch.thread_idx()
-        output = cute.make_fragment(input.shape, self.element_dtype)
+        output = cute.make_fragment_like(cute.make_layout(input.shape), self.element_dtype)
         frg_tile = cute.size(input) // frg_cnt
         t_frg = cute.logical_divide(input, cute.make_layout(frg_cnt))
         output_frg = cute.make_tensor(output.iterator, t_frg.layout)
@@ -2290,7 +2281,7 @@ class HSTUAttentionBackwardSm100:
         tPc = thr_copy.partition_D(coord)
 
         preds_shape = (tPc.shape[0][1], tPc.shape[1], tPc.shape[2], tPc.shape[3])
-        preds = cute.make_fragment(preds_shape, Boolean)
+        preds = cute.make_fragment_like(cute.make_layout(preds_shape), Boolean)
 
         tPc_fake = cute.group_modes(tPc, 1, 4)
         preds_shape_fake = (tPc_fake.shape[0][1], cute.size(tPc_fake, mode=[1]))
@@ -2405,7 +2396,7 @@ class HSTUAttentionBackwardSm100:
         tTR_cdK = split_wg(tTR_cdK, num_warp_groups, wg_idx)
         tTR_gdK = thread_t2r_dK.partition_D(gdK)
         tTR_gdK = split_wg(tTR_gdK, num_warp_groups, wg_idx)
-        tTR_rdK = cute.make_fragment(tTR_cdK.shape, self.acc_dtype)
+        tTR_rdK = cute.make_fragment_like(cute.make_layout(tTR_cdK.shape), self.acc_dtype)
         tTR_tdK = thread_t2r_dK.partition_S(tdKtdK)
         tTR_tdK = split_wg(tTR_tdK, num_warp_groups, wg_idx)
 
@@ -2435,7 +2426,7 @@ class HSTUAttentionBackwardSm100:
         tTR_cdV = split_wg(tTR_cdV, num_warp_groups, wg_idx)
         tTR_gdV = thread_t2r_dV.partition_D(gdV)
         tTR_gdV = split_wg(tTR_gdV, num_warp_groups, wg_idx)
-        tTR_rdV = cute.make_fragment(tTR_cdV.shape, self.acc_dtype)
+        tTR_rdV = cute.make_fragment_like(cute.make_layout(tTR_cdV.shape), self.acc_dtype)
         tTR_tdV = thread_t2r_dV.partition_S(tdVtdV)
         tTR_tdV = split_wg(tTR_tdV, num_warp_groups, wg_idx)
 
@@ -2671,4 +2662,3 @@ class HSTUAttentionBackwardSm100:
             num_stages=self.reduce_tma_store_stage,
             producer_group=reduce_tma_store_producer_group,
         )
-

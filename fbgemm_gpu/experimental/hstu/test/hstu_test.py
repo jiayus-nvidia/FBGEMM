@@ -28,7 +28,7 @@ running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 logger: logging.Logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-_MAX_SAMPLES: int = 200
+_MAX_SAMPLES: int = int(os.getenv("HSTU_MAX_EXAMPLES", "200"))
 example = False
 e4m3_max = 448.0
 
@@ -716,8 +716,19 @@ class HSTU16Test(unittest.TestCase):
         has_target = max_target_len > 0
         is_causal = window_size[0] == -1 and window_size[1] == 0
         is_delta_q = max_seq_len_q < max_seq_len_k
+        major_version = torch.cuda.get_device_capability()[0]
+        if major_version == 10:
+            if attn_dim not in (64, 128) or hidden_dim != attn_dim:
+                logger.info("Skipping sm100 unsupported HSTU16 dimension")
+                return
+            if has_rab or has_drab:
+                logger.info("Skipping sm100 unsupported RAB/DRAB")
+                return
+            if has_context:
+                logger.info("Skipping sm100 unsupported context mask")
+                return
         if (
-            torch.cuda.get_device_capability()[0] >= 12
+            major_version >= 12
             and dtype == torch.bfloat16
             and attn_dim == 256
             and is_arbitrary
