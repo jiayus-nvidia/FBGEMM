@@ -244,12 +244,19 @@ def hstu_varlen_bwd_100(
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1) if t is not None else None
         for t in (num_contexts, num_targets, func)
     ]
-    workspace_size = ((max_seqlen_q + 7) // 8 * 8) * num_heads * head_dim * batch_size * Float32.width // 8
+    workspace_seqlen = (max_seqlen_q + 7) // 8 * 8
+    workspace_head_dim = (head_dim + 7) // 8 * 8
     # Use torch.empty on GPU + .zero_() instead of torch.zeros(...).cuda()
     # torch.zeros().cuda() creates a CPU zero tensor then copies to GPU (~34ms for 128MB)
     # torch.empty().zero_() allocates on GPU directly and zeros via GPU kernel (~0.1ms)
-    workspace_torch = torch.empty(workspace_size, dtype=torch.uint8, device=q.device).zero_()
-    workspace = from_dlpack(workspace_torch, assumed_align=16).mark_layout_dynamic()
+    workspace_torch = torch.empty(
+        (batch_size, num_heads, workspace_seqlen, workspace_head_dim),
+        dtype=torch.float32,
+        device=q.device,
+    ).zero_()
+    workspace = from_dlpack(workspace_torch.detach(), assumed_align=16).mark_layout_dynamic(
+        leading_dim=workspace_torch.ndim - 1
+    )
 
     current_stream = cutlass_torch.default_stream()
     problem_shape = (Int32(max_seqlen_q), Int32(max_seqlen_k), Int32(head_dim), ((Int32(1), Int32(num_heads)), Int32(batch_size)))
