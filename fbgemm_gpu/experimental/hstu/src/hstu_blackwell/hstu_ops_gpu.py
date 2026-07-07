@@ -25,6 +25,7 @@ def _mark_dynamic_tensor(
     leading_dim: int,
     *,
     compact: bool = False,
+    stride_order=(2, 3, 0, 4, 1),
 ):
     cute_tensor = from_dlpack(
         tensor.detach(), assumed_align=16, enable_tvm_ffi=True
@@ -32,7 +33,7 @@ def _mark_dynamic_tensor(
     if compact:
         cute_tensor = cute_tensor.mark_compact_shape_dynamic(
             mode=1,
-            stride_order=(2, 3, 0, 4, 1),
+            stride_order=stride_order,
             divisibility=64,
         )
     return cute_tensor
@@ -340,7 +341,27 @@ def hstu_varlen_bwd_100(
         do = _as_bwd_compact_layout(do)
 
     dq_orig, dk_orig, dv_orig = dq, dk, dv
-    if use_original_qkv_layout:
+    use_original_grad_layout = (
+        use_original_qkv_layout
+        and dq is None
+        and dk is None
+        and dv is None
+    )
+    if use_original_grad_layout:
+        dq_orig, dk_orig, dv_orig = [
+            torch.empty_strided(
+                tensor.shape,
+                tensor.stride(),
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            for tensor in (q_orig, k_orig, v_orig)
+        ]
+        dq, dk, dv = [
+            _as_bwd_original_qkv_layout(tensor)
+            for tensor in (dq_orig, dk_orig, dv_orig)
+        ]
+    elif use_original_qkv_layout:
         dq = _empty_bwd_compact_layout_like(q_orig)
         dk = _empty_bwd_compact_layout_like(k_orig)
         dv = _empty_bwd_compact_layout_like(v_orig)
@@ -367,6 +388,7 @@ def hstu_varlen_bwd_100(
         kBlockN,
         use_original_qkv_layout,
         use_original_do_layout,
+        use_original_grad_layout,
         is_causal,
         is_local,
         is_context,
@@ -395,6 +417,9 @@ def hstu_varlen_bwd_100(
                 tensor,
                 1,
                 compact=True,
+                stride_order=(0, 2, 3, 4, 1)
+                if use_original_grad_layout
+                else (2, 3, 0, 4, 1),
             )
             for tensor in (dq, dk, dv)
         ]
@@ -469,6 +494,9 @@ def hstu_varlen_bwd_100(
             alpha,
             workspace_torch,
         )
+
+    if use_original_grad_layout:
+        return dq_orig, dk_orig, dv_orig, drab
 
     dq = dq.squeeze(4).squeeze(2).permute(0, 2, 1)
     dk = dk.squeeze(4).squeeze(2).permute(0, 2, 1)
