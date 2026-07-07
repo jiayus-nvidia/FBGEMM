@@ -102,3 +102,16 @@ def test_contiguous_qkv_unchanged(hdim):
         "causal",
     )
     torch.testing.assert_close(out_fast, out_ref, rtol=0, atol=0)
+
+
+def test_output_is_contiguous_and_viewable():
+    """The public output must support the common (T, H * D) view directly."""
+    hdim = 64
+    q = torch.randn(B * S, H, hdim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    out = _fwd(q, k, v, "causal")
+
+    assert out.is_contiguous()
+    assert out.view(B * S, H * hdim).shape == (B * S, H * hdim)

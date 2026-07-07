@@ -75,7 +75,10 @@ def test_do_layout_compact_vs_original_agree(hdim, layout):
     if layout == "token_major":
         do = torch.randn(B * S, H, hdim, dtype=torch.bfloat16, device="cuda").contiguous()
     elif layout == "head_major":
-        do = torch.randn_like(out)
+        do = torch.randn(
+            H, B * S, hdim, dtype=torch.bfloat16, device="cuda"
+        ).permute(1, 0, 2)
+        assert do.stride() == (hdim, B * S * hdim, 1)
     else:  # genuinely non-contiguous (head_dim stride != 1) -> ineligible, must clone
         do = torch.randn(B * S, hdim, H, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
         assert not _supports_bwd_original_qkv_layout(do)

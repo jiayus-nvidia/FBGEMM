@@ -7,17 +7,41 @@
 
 # Copyright (c) 2024, NVIDIA Corporation & AFFILIATES.
 
-import torch
 from typing import Optional
+
+import torch
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32, Float16, BFloat16
 
 from .hstu_fwd import HSTUAttentionForwardSm100
 from .hstu_bwd import HSTUAttentionBackwardSm100
+
+
+def _mark_dynamic_tensor(
+    tensor: torch.Tensor,
+    leading_dim: int,
+    *,
+    compact: bool = False,
+):
+    cute_tensor = from_dlpack(
+        tensor.detach(), assumed_align=16, enable_tvm_ffi=True
+    ).mark_layout_dynamic(leading_dim=leading_dim)
+    if compact:
+        cute_tensor = cute_tensor.mark_compact_shape_dynamic(
+            mode=1,
+            stride_order=(2, 3, 0, 4, 1),
+            divisibility=64,
+        )
+    return cute_tensor
+
+
+def _mark_optional_tensor(tensor: Optional[torch.Tensor]):
+    if tensor is None:
+        return None
+    return _mark_dynamic_tensor(tensor, tensor.ndim - 1)
 
 
 def _is_head_major_compact(t: torch.Tensor) -> bool:
@@ -124,35 +148,47 @@ def hstu_varlen_fwd_100(
         assert page_ids is not None and page_indptrs is not None, "Paged KV is True, but page metadata is missing."
         assert paged_kv.dim() == 5 and paged_kv.shape[2] == 128, "Only accept 5-D paged KV table with page_size=512"
 
-    out = torch.empty(
-        (q.shape[1], q.shape[0], q.shape[2]),
-        dtype=q.dtype,
-        device=q.device,
-    ).permute(1, 0, 2)
-    # out = torch.zeros_like(q)  # for test
-    q_tensor, k_tensor, v_tensor, o_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (q, k, v, out)
-    ]
-    cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (cu_seqlens_q, cu_seqlens_k)
-    ]
-    num_contexts_tensor, num_targets_tensor, func_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1) if t is not None else None
-        for t in (num_contexts, num_targets, func)
-    ]
-    paged_kv_tensor, page_ids_tensor, page_indptrs_tensor = None, None, None
+    # Keep the public output in the standard contiguous (T, H, D) layout so
+    # downstream callers can flatten it with view() without an extra copy.
+    out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    paged_kv_flat = None
     if is_paged:
-        pagedkv = paged_kv.view(-1, paged_kv.shape[-2], paged_kv.shape[-1])
-        paged_kv_tensor, page_ids_tensor, page_indptrs_tensor = [
-            from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-            for t in (pagedkv, page_ids, page_indptrs)
-        ]
-    current_stream = cutlass_torch.default_stream()
-    compile_key = (head_dim, kBlockM, kBlockN, is_causal, is_local, is_context, is_target, target_group_size, is_arbitrary, is_paged, func_num)
+        paged_kv_flat = paged_kv.view(
+            -1, paged_kv.shape[-2], paged_kv.shape[-1]
+        )
+    compile_key = (
+        q_dtype,
+        head_dim,
+        kBlockM,
+        kBlockN,
+        is_causal,
+        is_local,
+        is_context,
+        is_target,
+        target_group_size,
+        is_arbitrary,
+        is_paged,
+        func_num,
+    )
 
     if compile_key not in hstu_varlen_fwd_100.compile_cache:
+        q_tensor, k_tensor, v_tensor, o_tensor = [
+            _mark_dynamic_tensor(tensor, tensor.ndim - 1)
+            for tensor in (q, k, v, out)
+        ]
+        cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
+            _mark_dynamic_tensor(tensor, tensor.ndim - 1)
+            for tensor in (cu_seqlens_q, cu_seqlens_k)
+        ]
+        num_contexts_tensor, num_targets_tensor, func_tensor = [
+            _mark_optional_tensor(tensor)
+            for tensor in (num_contexts, num_targets, func)
+        ]
+        paged_kv_tensor, page_ids_tensor, page_indptrs_tensor = [
+            _mark_optional_tensor(tensor)
+            for tensor in (paged_kv_flat, page_ids, page_indptrs)
+        ]
+        compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         hstu_fwd_sm100 = HSTUAttentionForwardSm100(
             head_dim=head_dim,
             is_causal=is_causal,
@@ -180,35 +216,36 @@ def hstu_varlen_fwd_100(
                 num_contexts_tensor,
                 num_targets_tensor,
                 alpha,
-                current_stream,
+                compile_stream,
                 window_size_left,
                 window_size_right,
                 func_tensor,
                 paged_kv_tensor,
                 page_ids_tensor,
                 page_indptrs_tensor,
+                options="--enable-tvm-ffi",
             )
 
     with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
-        hstu_varlen_fwd_100.compile_cache[compile_key](
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
+        compiled_fwd = hstu_varlen_fwd_100.compile_cache[compile_key]
+        compiled_fwd(
+            q,
+            k,
+            v,
+            out,
             max_seqlen_q,
             max_seqlen_k,
-            cu_seqlens_q_tensor,
-            cu_seqlens_k_tensor,
-            num_contexts_tensor,
-            num_targets_tensor,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            num_contexts,
+            num_targets,
             alpha,
-            current_stream,
             window_size_left,
             window_size_right,
-            func_tensor,
-            paged_kv_tensor,
-            page_ids_tensor,
-            page_indptrs_tensor,
+            func,
+            paged_kv_flat,
+            page_ids,
+            page_indptrs,
         )
 
     return out, None
@@ -312,27 +349,6 @@ def hstu_varlen_bwd_100(
         dk = torch.empty_strided(k.shape, k.stride(), dtype=k.dtype, device=k.device)
         dv = torch.empty_strided(v.shape, v.stride(), dtype=v.dtype, device=v.device)
 
-    def _mark_plain(t):
-        return from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
-
-    def _mark_compact(t):
-        return from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1).mark_compact_shape_dynamic(mode=1, stride_order=(2, 3, 0, 4, 1), divisibility=64)
-
-    if use_original_qkv_layout:
-        q_tensor, k_tensor, v_tensor = [_mark_plain(t) for t in (q, k, v)]
-    else:
-        q_tensor, k_tensor, v_tensor = [_mark_compact(t) for t in (q, k, v)]
-    do_tensor = _mark_plain(do) if use_original_do_layout else _mark_compact(do)
-    # dq/dk/dv are always produced in the compact layout
-    dq_tensor, dk_tensor, dv_tensor = [_mark_compact(t) for t in (dq, dk, dv)]
-    cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (cu_seqlens_q, cu_seqlens_k)
-    ]
-    num_contexts_tensor, num_targets_tensor, func_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1) if t is not None else None
-        for t in (num_contexts, num_targets, func)
-    ]
     workspace_seqlen = (max_seqlen_q + 7) // 8 * 8
     workspace_head_dim = (head_dim + 7) // 8 * 8
     # Use torch.empty on GPU + .zero_() instead of torch.zeros(...).cuda()
@@ -343,15 +359,58 @@ def hstu_varlen_bwd_100(
         dtype=torch.float32,
         device=q.device,
     ).zero_()
-    workspace = from_dlpack(workspace_torch.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=workspace_torch.ndim - 1
+    problem_shape = (Int32(max_seqlen_q), Int32(max_seqlen_k), Int32(head_dim), ((Int32(1), Int32(num_heads)), Int32(batch_size)))
+    compile_key = (
+        q_dtype,
+        head_dim,
+        kBlockM,
+        kBlockN,
+        use_original_qkv_layout,
+        use_original_do_layout,
+        is_causal,
+        is_local,
+        is_context,
+        is_target,
+        target_group_size,
+        is_arbitrary,
+        func_num,
     )
 
-    current_stream = cutlass_torch.default_stream()
-    problem_shape = (Int32(max_seqlen_q), Int32(max_seqlen_k), Int32(head_dim), ((Int32(1), Int32(num_heads)), Int32(batch_size)))
-    compile_key = (head_dim, kBlockM, kBlockN, use_original_qkv_layout, use_original_do_layout, is_causal, is_local, is_context, is_target, target_group_size, is_arbitrary, func_num)
-
     if compile_key not in hstu_varlen_bwd_100.compile_cache:
+        q_tensor, k_tensor, v_tensor = [
+            _mark_dynamic_tensor(
+                tensor,
+                1,
+                compact=not use_original_qkv_layout,
+            )
+            for tensor in (q, k, v)
+        ]
+        do_tensor = _mark_dynamic_tensor(
+            do,
+            1,
+            compact=not use_original_do_layout,
+        )
+        dq_tensor, dk_tensor, dv_tensor = [
+            _mark_dynamic_tensor(
+                tensor,
+                1,
+                compact=True,
+            )
+            for tensor in (dq, dk, dv)
+        ]
+        cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
+            _mark_dynamic_tensor(tensor, tensor.ndim - 1)
+            for tensor in (cu_seqlens_q, cu_seqlens_k)
+        ]
+        num_contexts_tensor, num_targets_tensor, func_tensor = [
+            _mark_optional_tensor(tensor)
+            for tensor in (num_contexts, num_targets, func)
+        ]
+        workspace = _mark_dynamic_tensor(
+            workspace_torch,
+            workspace_torch.ndim - 1,
+        )
+        compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         hstu_bwd_sm100 = HSTUAttentionBackwardSm100(
             element_dtype=Float16 if q_dtype == torch.float16 else BFloat16,
             head_dim=head_dim,
@@ -385,29 +444,30 @@ def hstu_varlen_bwd_100(
                 func_tensor,
                 alpha,
                 workspace,
-                current_stream,
+                compile_stream,
+                options="--enable-tvm-ffi",
             )
 
     with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
-        hstu_varlen_bwd_100.compile_cache[compile_key](
+        compiled_bwd = hstu_varlen_bwd_100.compile_cache[compile_key]
+        compiled_bwd(
             problem_shape,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            dq_tensor,
-            dk_tensor,
-            dv_tensor,
-            do_tensor,
-            cu_seqlens_q_tensor,
-            cu_seqlens_k_tensor,
+            q,
+            k,
+            v,
+            dq,
+            dk,
+            dv,
+            do,
+            cu_seqlens_q,
+            cu_seqlens_k,
             Int32(window_size_left),
             Int32(window_size_right),
-            num_contexts_tensor,
-            num_targets_tensor,
-            func_tensor,
+            num_contexts,
+            num_targets,
+            func,
             alpha,
-            workspace,
-            current_stream,
+            workspace_torch,
         )
 
     dq = dq.squeeze(4).squeeze(2).permute(0, 2, 1)

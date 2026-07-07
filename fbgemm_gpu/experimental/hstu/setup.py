@@ -170,7 +170,10 @@ cmdclass = {}
 ext_modules = []
 
 cmdclass = []
-install_requires = []
+install_requires = [
+    "apache-tvm-ffi>=0.1.12,<0.2",
+    "torch-c-dlpack-ext",
+]
 
 if not SKIP_CUDA_BUILD:
     if not ONLY_COMPILE_SO:
@@ -393,5 +396,5 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
-    install_requires=[],
+    install_requires=install_requires,
 )
