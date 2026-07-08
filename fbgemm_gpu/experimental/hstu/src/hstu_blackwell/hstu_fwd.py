@@ -1336,7 +1336,7 @@ class HSTUAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
             )
             if warp_idx <= self.silu0_warp_ids[-1] and warp_idx >= self.silu0_warp_ids[0]:
-                if const_expr(not self.debug):
+                if const_expr(not self.debug or self.is_mxfp8):
                     silu_loop(stage=0, tStSi=silu_tStSs[0])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
@@ -2755,6 +2755,8 @@ class HSTUAttentionForwardSm100:
 
         # Wait for Si
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
+        if const_expr(self.debug):
+            return mma_si_consumer_phase ^ 1, s0_s1_sequence_phase ^ 1
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)  # copy from tmem to rmem
         cute.arch.fence_view_async_tmem_load()
 
