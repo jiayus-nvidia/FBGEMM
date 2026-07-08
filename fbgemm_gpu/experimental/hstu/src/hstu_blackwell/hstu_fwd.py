@@ -1449,22 +1449,6 @@ class HSTUAttentionForwardSm100:
         cute.arch.mbarrier_wait(
             mbar_ptr + self.mbar_O_full_offset, Int32(0)
         )
-        output_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)),
-            Float32,
-        )
-        output_tmem_load = tcgen05.make_tmem_copy(
-            output_load_atom, tStS
-        ).get_slice(tidx)
-        output_tmem = output_tmem_load.partition_S(tStS)
-        output_tmem_chunk = output_tmem[None, 0, None, None]
-        output_values = cute.make_rmem_tensor(output_tmem_chunk.shape, Float32)
-        cute.copy(output_tmem_load, output_tmem_chunk, output_values)
-        cute.arch.fence_view_async_tmem_load()
-        if tidx == 0:
-            mO[0, 0, 0] = self.o_dtype(
-                output_values[0] * Float32(1.0 / 128.0)
-            )
 
     @cute.jit
     def load(
@@ -2410,6 +2394,49 @@ class HSTUAttentionForwardSm100:
                     tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
                 with cute.arch.elect_one():
                     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + self.mbar_O_full_offset, Int32(0)
+                )
+                lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
+                cO = cute.make_identity_tensor(
+                    (self.mma_tiler_pv[0], self.mma_tiler_pv[1])
+                )
+                tCcO = thr_mma_pv.partition_C(cO)
+                output_load_atom = cute.make_copy_atom(
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)),
+                    Float32,
+                )
+                output_tmem_load = tcgen05.make_tmem_copy(
+                    output_load_atom, debug_tOtO
+                ).get_slice(lane)
+                output_tmem = output_tmem_load.partition_S(debug_tOtO)
+                output_coords = output_tmem_load.partition_D(tCcO)
+                inv_seqlen = Float32(1.0 / 128.0)
+                for chunk_idx in cutlass.range_constexpr(
+                    cute.size(output_tmem.shape[1])
+                ):
+                    output_tmem_chunk = output_tmem[
+                        None, chunk_idx, None, None
+                    ]
+                    output_coord_chunk = output_coords[
+                        None, chunk_idx, None, None
+                    ]
+                    output_values = cute.make_rmem_tensor(
+                        output_tmem_chunk.shape, Float32
+                    )
+                    cute.copy(
+                        output_tmem_load,
+                        output_tmem_chunk,
+                        output_values,
+                    )
+                    cute.arch.fence_view_async_tmem_load()
+                    for value_idx in cutlass.range_constexpr(
+                        cute.size(output_values)
+                    ):
+                        coord = output_coord_chunk[value_idx]
+                        mO[coord[0], coord[1], 0] = self.o_dtype(
+                            output_values[value_idx] * inv_seqlen
+                        )
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
