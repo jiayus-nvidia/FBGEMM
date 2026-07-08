@@ -3063,7 +3063,7 @@ class HSTUAttentionForwardSm100:
             if stage == 0:
                 cute.arch.mbarrier_wait(mbar_empty_ptr + 1, phase)
         if const_expr(self.is_mxfp8 and self.debug and K_or_V == "V"):
-            g_linear = cute.group_modes(raw_data, 0, 2)
+            g_linear = cute.group_modes(raw_data, 0, 3)
             s_linear = cute.group_modes(sData, 0, 3)
             lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
             for i in cutlass.range(
