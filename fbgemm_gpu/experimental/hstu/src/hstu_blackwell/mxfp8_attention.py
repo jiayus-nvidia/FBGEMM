@@ -35,7 +35,8 @@ class VarlenPackSm100:
         num_heads: Int32,
         stream: cuda.CUstream,
     ):
-        seqlen, head_dim, batch_heads = dense.shape
+        tile_count, tile_size, head_dim, batch_heads = dense.shape
+        seqlen = tile_count * tile_size
         self.kernel(source, cu_seqlens, dense, num_heads).launch(
             grid=(cute.ceil_div(seqlen * head_dim, 256), batch_heads, 1),
             block=(256, 1, 1),
@@ -52,11 +53,14 @@ class VarlenPackSm100:
     ):
         thread, _, _ = cute.arch.thread_idx()
         block, batch_head, _ = cute.arch.block_idx()
-        seqlen, head_dim, _ = dense.shape
+        tile_count, tile_size, head_dim, _ = dense.shape
+        seqlen = tile_count * tile_size
         linear_idx = block * 256 + thread
         if linear_idx < seqlen * head_dim:
             row = linear_idx // head_dim
             dim = linear_idx - row * head_dim
+            tile_idx = row // tile_size
+            row_in_tile = row - tile_idx * tile_size
             batch = batch_head // num_heads
             head = batch_head - batch * num_heads
             offset = Int32(cu_seqlens[batch])
@@ -64,7 +68,7 @@ class VarlenPackSm100:
             value = dense.element_type(0)
             if row < length:
                 value = source[offset + row, head, dim]
-            dense[row, dim, batch_head] = value
+            dense[tile_idx, row_in_tile, dim, batch_head] = value
 
 
 class VarlenUnpackSm100:
@@ -499,8 +503,9 @@ def _pack(
 ) -> torch.Tensor:
     batches = cu_seqlens.numel() - 1
     num_heads, head_dim = source.shape[1:]
-    dense = _matrix(
-        padded_seqlen,
+    dense = _tiled_matrix(
+        padded_seqlen // 128,
+        128,
         head_dim,
         batches * num_heads,
         source.dtype,
@@ -695,6 +700,41 @@ def _quantize_pair(
     return outputs[0], outputs[1]
 
 
+def _quantize_tiles(
+    tiled_matrix: torch.Tensor, *, transpose: bool = False
+) -> list[_MxMatrix]:
+    if tiled_matrix.ndim != 4 or tiled_matrix.shape[1] != 128:
+        raise ValueError(
+            f"tile collection must have shape (tiles, 128, columns, batches), "
+            f"got {tiled_matrix.shape}"
+        )
+    tile_count, tile_size, columns, batches = tiled_matrix.shape
+    if transpose:
+        matrix = tiled_matrix.permute(2, 1, 0, 3).reshape(
+            columns, tile_size, tile_count * batches
+        )
+    else:
+        matrix = tiled_matrix.permute(1, 2, 0, 3).reshape(
+            tile_size, columns, tile_count * batches
+        )
+
+    combined = _quantize(matrix)
+    scale_count = scale_factor_storage_size(
+        matrix.shape[0], matrix.shape[1], batches
+    )
+    if combined.scales.numel() != tile_count * scale_count:
+        raise RuntimeError("batched quantization produced an invalid scale layout")
+    return [
+        _MxMatrix(
+            combined.values[:, :, tile_idx * batches : (tile_idx + 1) * batches],
+            combined.scales[
+                tile_idx * scale_count : (tile_idx + 1) * scale_count
+            ],
+        )
+        for tile_idx in range(tile_count)
+    ]
+
+
 def _gemm(
     a: _MxMatrix,
     b: _MxMatrix,
@@ -783,6 +823,12 @@ def _gemm(
 
 
 def _tiles(matrix: torch.Tensor, tile_size: int = 128):
+    if matrix.ndim == 4:
+        if matrix.shape[1] != tile_size:
+            raise ValueError(
+                f"tile size {matrix.shape[1]} does not match expected {tile_size}"
+            )
+        return list(matrix.unbind(0))
     if matrix.shape[0] % tile_size != 0:
         raise ValueError(
             f"row count {matrix.shape[0]} must be divisible by {tile_size}"
@@ -1029,16 +1075,16 @@ def hstu_varlen_fwd_mxfp8_100(
     dense_output = _tiled_matrix(
         len(q_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
     )
-    k_mx_tiles = [_quantize(tile) for tile in k_tiles]
-    v_mx_tiles = [_quantize(_transpose(tile)) for tile in v_tiles]
+    q_mx_tiles = _quantize_tiles(dense_q)
+    k_mx_tiles = _quantize_tiles(dense_k)
+    v_mx_tiles = _quantize_tiles(dense_v, transpose=True)
 
-    for query_tile_idx, query_tile in enumerate(q_tiles):
+    for query_tile_idx, query_mx in enumerate(q_mx_tiles):
         output_accumulator = (
             _matrix(128, head_dim, batch_heads, torch.float32, q.device)
             if len(k_mx_tiles) > 1
             else None
         )
-        query_mx = _quantize(query_tile)
         query_start = query_tile_idx * 128
         for key_tile_idx, (key_mx, value_mx) in enumerate(zip(k_mx_tiles, v_mx_tiles)):
             key_start = key_tile_idx * 128
@@ -1120,13 +1166,13 @@ def hstu_varlen_bwd_mxfp8_100(
     v_tiles = _tiles(dense_v)
     dout_tiles = _tiles(dense_dout)
 
-    q_mx_tiles = [_quantize(tile) for tile in q_tiles]
-    qt_mx_tiles = [_quantize(_transpose(tile)) for tile in q_tiles]
-    k_mx_tiles = [_quantize(tile) for tile in k_tiles]
-    kt_mx_tiles = [_quantize(_transpose(tile)) for tile in k_tiles]
-    v_mx_tiles = [_quantize(tile) for tile in v_tiles]
-    dout_mx_tiles = [_quantize(tile) for tile in dout_tiles]
-    doutt_mx_tiles = [_quantize(_transpose(tile)) for tile in dout_tiles]
+    q_mx_tiles = _quantize_tiles(dense_q)
+    qt_mx_tiles = _quantize_tiles(dense_q, transpose=True)
+    k_mx_tiles = _quantize_tiles(dense_k)
+    kt_mx_tiles = _quantize_tiles(dense_k, transpose=True)
+    v_mx_tiles = _quantize_tiles(dense_v)
+    dout_mx_tiles = _quantize_tiles(dense_dout)
+    doutt_mx_tiles = _quantize_tiles(dense_dout, transpose=True)
 
     dq_accumulators = (
         [
