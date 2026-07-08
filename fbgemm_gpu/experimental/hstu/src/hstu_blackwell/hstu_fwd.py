@@ -1363,8 +1363,13 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
                 if const_expr(self.debug and self.is_mxfp8):
-                    cute.arch.mbarrier_wait(
-                        mbar_ptr + self.mbar_O_full_offset, Int32(0)
+                    store_O(
+                        seqlen=SeqlenInfoCls(Int32(0)),
+                        scale=cute.arch.rcp_approx(Float32(128.0)),
+                        m_block=Int32(0),
+                        head_idx=Int32(0),
+                        stage=0,
+                        epi_consumer_phase=Int32(0),
                     )
                 elif const_expr(not self.debug):
                     silu_loop(stage=1, tStSi=silu_tStSs[1])
@@ -3025,6 +3030,9 @@ class HSTUAttentionForwardSm100:
             tOrO_frg_cvt = cute.make_rmem_tensor(tOrO_frg.shape, self.o_dtype)
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
             cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
+
+        if const_expr(self.debug):
+            return
 
         cute.arch.barrier(barrier_id=NamedBarrierFwd.Epilogue + stage, number_of_threads=cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
 
