@@ -3059,14 +3059,21 @@ class HSTUAttentionForwardSm100:
             thr_tmem_load = tiled_tmem_load.get_slice(tidx)
             tOtO_t2r = thr_tmem_load.partition_S(tOtO_epi)
             tOcO_t2r = thr_tmem_load.partition_D(cO_epi)
+            tOtO_t2r = tOtO_t2r[
+                None, None, None, None, None, 0
+            ]
+            tOtO_t2r = cute.group_modes(
+                tOtO_t2r, 3, cute.rank(tOtO_t2r)
+            )
+            tOcO_t2r = cute.group_modes(
+                tOcO_t2r, 3, cute.rank(tOcO_t2r)
+            )
             inv_seqlen = Float32(1.0 / 128.0)
             for subtile in cutlass.range_constexpr(
-                cute.size(tOtO_t2r, mode=[4])
+                cute.size(tOtO_t2r, mode=[3])
             ):
-                output_source = tOtO_t2r[
-                    None, None, None, 0, subtile, 0
-                ]
-                output_coord = tOcO_t2r[None, None, None, 0, subtile]
+                output_source = tOtO_t2r[None, None, None, subtile]
+                output_coord = tOcO_t2r[None, None, None, subtile]
                 output_values = cute.make_rmem_tensor(
                     output_source.shape, self.pv_acc_dtype
                 )
