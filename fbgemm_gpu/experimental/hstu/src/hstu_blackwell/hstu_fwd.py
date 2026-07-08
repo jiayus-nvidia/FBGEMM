@@ -569,7 +569,7 @@ class HSTUAttentionForwardSm100:
                 ) * cute.size(tiled_mma_qk.thr_id.shape) + cute.size_in_bytes(
                     self.sf_dtype,
                     cute.slice_(sKScale_layout, (None, None, None, 0)),
-                ) // 2
+                ) * 8
 
         TileScheduler = SingleTileVarlenScheduler
         # TileScheduler = SingleTileScheduler
