@@ -481,3 +481,7 @@ def test_hstu_mxfp8_has_no_quadratic_fp32_workspace(monkeypatch):
     assert not any(
         rows > 128 and columns > 128 for rows, columns, _, _ in fp32_allocations
     )
+    score_workspaces = [
+        shape for shape in fp32_allocations if shape[0] == shape[1] == 128
+    ]
+    assert len(score_workspaces) == 3

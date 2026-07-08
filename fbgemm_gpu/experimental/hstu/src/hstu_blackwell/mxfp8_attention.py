@@ -638,6 +638,26 @@ def _matrix_with_major(
     return storage.permute(2, 1, 0)
 
 
+def _mx_workspace(shape: tuple[int, int, int], device) -> _MxMatrix:
+    values = _matrix(*shape, torch.uint8, device)
+    scales = torch.empty(
+        scale_factor_storage_size(*shape), dtype=torch.uint8, device=device
+    )
+    return _MxMatrix(values, scales)
+
+
+def _validate_mx_workspace(workspace: _MxMatrix, shape, device) -> None:
+    if (
+        workspace.values.shape != shape
+        or workspace.values.dtype != torch.uint8
+        or workspace.values.device != device
+        or workspace.scales.shape != (scale_factor_storage_size(*shape),)
+        or workspace.scales.dtype != torch.uint8
+        or workspace.scales.device != device
+    ):
+        raise ValueError(f"invalid MXFP8 workspace for shape {shape}")
+
+
 def _transpose(matrix: torch.Tensor) -> torch.Tensor:
     return matrix.permute(1, 0, 2)
 
@@ -954,15 +974,18 @@ def _run_silu(
     window_right: int,
     query_start: int = 0,
     key_start: int = 0,
+    output: Optional[_MxMatrix] = None,
 ) -> _MxMatrix:
     if scores.shape[:2] != (128, 128) or scores.dtype != torch.float32:
         raise ValueError("fused SiLU quantization requires a 128x128 FP32 score tile")
-    values = _matrix(*scores.shape, torch.uint8, scores.device)
-    scales = torch.empty(
-        scale_factor_storage_size(*scores.shape),
-        dtype=torch.uint8,
-        device=scores.device,
+    output = (
+        _mx_workspace(tuple(scores.shape), scores.device)
+        if output is None
+        else output
     )
+    _validate_mx_workspace(output, scores.shape, scores.device)
+    values = output.values
+    scales = output.scales
     scores_tensor = _cute_tensor(scores)
     values_tensor = _mark_matrix(
         _cute_tensor(values, element_type=cutlass.Float8E4M3FN), 1
@@ -1008,7 +1031,7 @@ def _run_silu(
         Int32(key_start),
         stream,
     )
-    return _MxMatrix(values, scales)
+    return output
 
 
 def _run_silu_backward(
@@ -1023,25 +1046,24 @@ def _run_silu_backward(
     window_right: int,
     query_start: int = 0,
     key_start: int = 0,
+    outputs: Optional[tuple[_MxMatrix, _MxMatrix, _MxMatrix]] = None,
 ):
     if scores.shape[:2] != (128, 128):
         raise ValueError("fused SiLU backward quantization requires 128x128 tiles")
-    outputs = []
+    shape = tuple(scores.shape)
+    if outputs is None:
+        outputs = tuple(_mx_workspace(shape, scores.device) for _ in range(3))
+    elif len(outputs) != 3:
+        raise ValueError("SiLU backward requires three MXFP8 workspaces")
     output_tensors = []
-    for _ in range(3):
-        values = _matrix(*scores.shape, torch.uint8, scores.device)
-        scales = torch.empty(
-            scale_factor_storage_size(*scores.shape),
-            dtype=torch.uint8,
-            device=scores.device,
-        )
-        outputs.append(_MxMatrix(values, scales))
+    for output in outputs:
+        _validate_mx_workspace(output, scores.shape, scores.device)
         output_tensors.extend(
             (
                 _mark_matrix(
-                    _cute_tensor(values, element_type=cutlass.Float8E4M3FN), 1
+                    _cute_tensor(output.values, element_type=cutlass.Float8E4M3FN), 1
                 ),
-                _cute_tensor(scales, element_type=cutlass.Float8E8M0FNU),
+                _cute_tensor(output.scales, element_type=cutlass.Float8E8M0FNU),
             )
         )
     score_tensor = _cute_tensor(scores)
@@ -1156,17 +1178,19 @@ def hstu_varlen_fwd_mxfp8_100(
     q_mx_tiles = _quantize_tiles(dense_q)
     k_mx_tiles = _quantize_tiles(dense_k)
     v_mx_tiles = _quantize_tiles(dense_v, transpose=True)
+    score_workspace = _matrix(128, 128, batch_heads, torch.float32, q.device)
+    probability_workspace = _mx_workspace((128, 128, batch_heads), q.device)
+    output_accumulator = (
+        _matrix(128, head_dim, batch_heads, torch.float32, q.device)
+        if len(k_mx_tiles) > 1
+        else None
+    )
 
     for query_tile_idx, query_mx in enumerate(q_mx_tiles):
-        output_accumulator = (
-            _matrix(128, head_dim, batch_heads, torch.float32, q.device)
-            if len(k_mx_tiles) > 1
-            else None
-        )
         query_start = query_tile_idx * 128
         for key_tile_idx, (key_mx, value_mx) in enumerate(zip(k_mx_tiles, v_mx_tiles)):
             key_start = key_tile_idx * 128
-            scores = _gemm(query_mx, key_mx, torch.float32)
+            scores = _gemm(query_mx, key_mx, torch.float32, output=score_workspace)
             probabilities_mx = _run_silu(
                 scores,
                 cu_seqlens_q,
@@ -1178,6 +1202,7 @@ def hstu_varlen_fwd_mxfp8_100(
                 window_size_right,
                 query_start=query_start,
                 key_start=key_start,
+                output=probability_workspace,
             )
             is_last_key_tile = key_tile_idx + 1 == len(k_mx_tiles)
             output = (
@@ -1269,20 +1294,27 @@ def hstu_varlen_bwd_mxfp8_100(
     dense_dv = _tiled_matrix(
         len(k_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
     )
+    score_workspace = _matrix(128, 128, batch_heads, torch.float32, q.device)
+    dprobability_workspace = _matrix(
+        128, 128, batch_heads, torch.float32, q.device
+    )
+    silu_workspaces = tuple(
+        _mx_workspace((128, 128, batch_heads), q.device) for _ in range(3)
+    )
+    dk_accumulator = (
+        _matrix(128, head_dim, batch_heads, torch.float32, q.device)
+        if len(q_mx_tiles) > 1
+        else None
+    )
+    dv_accumulator = (
+        _matrix(128, head_dim, batch_heads, torch.float32, q.device)
+        if len(q_mx_tiles) > 1
+        else None
+    )
 
     for key_tile_idx, (key_mx, keyt_mx, value_mx) in enumerate(
         zip(k_mx_tiles, kt_mx_tiles, v_mx_tiles)
     ):
-        dk_accumulator = (
-            _matrix(128, head_dim, batch_heads, torch.float32, q.device)
-            if len(q_mx_tiles) > 1
-            else None
-        )
-        dv_accumulator = (
-            _matrix(128, head_dim, batch_heads, torch.float32, q.device)
-            if len(q_mx_tiles) > 1
-            else None
-        )
         key_start = key_tile_idx * 128
 
         for query_tile_idx, (
@@ -1292,8 +1324,13 @@ def hstu_varlen_bwd_mxfp8_100(
             doutt_mx,
         ) in enumerate(zip(q_mx_tiles, qt_mx_tiles, dout_mx_tiles, doutt_mx_tiles)):
             query_start = query_tile_idx * 128
-            scores = _gemm(query_mx, key_mx, torch.float32)
-            dprobabilities = _gemm(dout_mx, value_mx, torch.float32)
+            scores = _gemm(query_mx, key_mx, torch.float32, output=score_workspace)
+            dprobabilities = _gemm(
+                dout_mx,
+                value_mx,
+                torch.float32,
+                output=dprobability_workspace,
+            )
             dscores_mx, probabilities_t_mx, dscores_t_mx = _run_silu_backward(
                 scores,
                 dprobabilities,
@@ -1306,6 +1343,7 @@ def hstu_varlen_bwd_mxfp8_100(
                 window_size_right,
                 query_start=query_start,
                 key_start=key_start,
+                outputs=silu_workspaces,
             )
 
             is_last_query_tile = query_tile_idx + 1 == len(q_mx_tiles)
