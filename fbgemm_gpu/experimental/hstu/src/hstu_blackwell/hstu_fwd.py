@@ -454,7 +454,7 @@ class HSTUAttentionForwardSm100:
         tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
             mQ,
-            cute.select(sQ_layout, mode=[0, 1, 2]),
+            cute.slice_(sQ_layout, (None, None, None, 0)),
             self.mma_tiler_qk,
             tiled_mma_qk,
             self.cluster_layout_vmnk.shape,
@@ -464,7 +464,7 @@ class HSTUAttentionForwardSm100:
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_B(
             tma_load_op,
             mK,
-            cute.select(sK_layout, mode=[0, 1, 2]),
+            cute.slice_(sK_layout, (None, None, None, 0)),
             self.mma_tiler_qk,
             tiled_mma_qk,
             self.cluster_layout_vmnk.shape,
@@ -473,7 +473,7 @@ class HSTUAttentionForwardSm100:
         tma_atom_V, tma_tensor_V = cute.nvgpu.make_tiled_tma_atom_B(
             tma_load_op,
             mV,
-            cute.select(sV_layout, mode=[0, 1, 2]),
+            cute.slice_(sV_layout, (None, None, None, 0)),
             self.mma_tiler_pv,
             tiled_mma_pv,
             self.cluster_layout_vmnk.shape,
@@ -548,9 +548,15 @@ class HSTUAttentionForwardSm100:
         vO_layout = cute.make_layout((1, async_copy_elems))
         gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
-        self.tma_copy_q_bytes = cute.size_in_bytes(self.q_dtype, cute.select(sQ_layout, mode=[0, 1, 2]))
-        self.tma_copy_k_bytes = cute.size_in_bytes(self.k_dtype, cute.select(sK_layout, mode=[0, 1, 2]))
-        self.tma_copy_v_bytes = cute.size_in_bytes(self.v_dtype, cute.select(sV_layout, mode=[0, 1, 2]))
+        self.tma_copy_q_bytes = cute.size_in_bytes(
+            self.q_dtype, cute.slice_(sQ_layout, (None, None, None, 0))
+        )
+        self.tma_copy_k_bytes = cute.size_in_bytes(
+            self.k_dtype, cute.slice_(sK_layout, (None, None, None, 0))
+        )
+        self.tma_copy_v_bytes = cute.size_in_bytes(
+            self.v_dtype, cute.slice_(sV_layout, (None, None, None, 0))
+        )
         if const_expr(self.debug):
             self.tma_copy_q_bytes = (
                 self.mma_tiler_qk[0]
