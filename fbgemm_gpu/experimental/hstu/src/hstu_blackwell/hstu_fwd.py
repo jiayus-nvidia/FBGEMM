@@ -3069,7 +3069,9 @@ class HSTUAttentionForwardSm100:
             for i in cutlass.range(
                 lane, self.kBlockN * self.head_dim_v_padded, cute.arch.WARP_SIZE
             ):
-                s_linear[i, stage] = g_linear[i, block]
+                s_linear[i, stage] = g_linear[
+                    block * self.kBlockN * self.head_dim_v_padded + i
+                ]
             cute.arch.sync_warp()
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(mbar_full_ptr + stage)
