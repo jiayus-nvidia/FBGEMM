@@ -1312,7 +1312,7 @@ class HSTUAttentionForwardSm100:
                 )
                 gKScale = cute.local_tile(
                     mKScale_cur,
-                    cute.select(self.mma_tiler_qk, mode=[1, 2]),
+                    cute.select(self.mma_tiler_qk, mode=[0, 2]),
                     (None, 0),
                 )
                 gVScale = cute.local_tile(
@@ -1347,7 +1347,7 @@ class HSTUAttentionForwardSm100:
             )
             if const_expr(self.is_mxfp8):
                 tSgQScale = thr_mma_qk.partition_A(gQScale)
-                tSgKScale = thr_mma_qk.partition_B(gKScale)
+                tSgKScale = thr_mma_qk.partition_A(gKScale)
                 tOgVScale = thr_mma_pv.partition_B(gVScale)
                 tQsQScale, tQgQScale = cpasync.tma_partition(
                     tma_atom_QScale,
