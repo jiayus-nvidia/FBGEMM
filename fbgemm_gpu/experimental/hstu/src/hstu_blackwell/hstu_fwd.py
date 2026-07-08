@@ -244,15 +244,15 @@ class HSTUAttentionForwardSm100:
             ):
                 raise TypeError("MXFP8 forward requires E8M0 scale factors")
             self.sf_vec_size = 32
-        # Assume all strides are divisible by 128 bits except the last stride
+        # Assume every dynamic stride is divisible by 128 bits. The compact
+        # leading stride remains the static value 1.
         new_stride = lambda t: (
             *(
                 s
                 if isinstance(s, int)
                 else cute.assume(s, divby=128 // t.element_type.width)
-                for s in t.stride[:-1]
+                for s in t.stride
             ),
-            t.stride[-1],
         )
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [0, 2, 1]
@@ -487,10 +487,6 @@ class HSTUAttentionForwardSm100:
             tiled_mma_pv,
             self.cluster_layout_vmnk.shape,
         )
-        if self.debug:
-            print("MXFP8 V GMEM", mV.shape, mV.stride, mV.layout)
-            print("MXFP8 V SMEM", sV_layout)
-            print("MXFP8 V TMA", tma_atom_V, tma_tensor_V.shape, tma_tensor_V.stride)
         tma_atom_QScale = tma_tensor_QScale = None
         tma_atom_KScale = tma_tensor_KScale = None
         tma_atom_VScale = tma_tensor_VScale = None
@@ -2338,6 +2334,7 @@ class HSTUAttentionForwardSm100:
                 )
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
+                pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
