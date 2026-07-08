@@ -2372,12 +2372,24 @@ class HSTUAttentionForwardSm100:
                     v_scale_s[(None, None, None, None, Vi_index)],
                     v_scale_t,
                 )
+                debug_tOrP = tiled_mma_pv.make_fragment_A(sP)[
+                    None, None, None, 0
+                ]
+                debug_tOrV = tiled_mma_pv.make_fragment_B(sV)[
+                    None, None, None, Vi_index
+                ]
+                debug_acc_shape = tiled_mma_pv.partition_shape_C(
+                    (self.mma_tiler_pv[0], self.mma_tiler_pv[1])
+                )
+                debug_tOtO_fake = tiled_mma_pv.make_fragment_C(
+                    debug_acc_shape
+                )
                 debug_tOtO = cute.make_tensor(
-                    tStSs[0].iterator + 192, tOtOs[0].layout
+                    tStSs[0].iterator, debug_tOtO_fake.layout
                 )
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
                 for kblock_idx in cutlass.range_constexpr(
-                    cute.size(tOrPs[0], mode=[2])
+                    cute.size(debug_tOrP, mode=[2])
                 ):
                     sf_coord = (None, None, kblock_idx)
                     tiled_mma_pv.set(
@@ -2389,8 +2401,8 @@ class HSTUAttentionForwardSm100:
                     cute.gemm(
                         tiled_mma_pv,
                         debug_tOtO,
-                        tOrPs[0][sf_coord],
-                        tOrVi[sf_coord],
+                        debug_tOrP[sf_coord],
+                        debug_tOrV[sf_coord],
                         debug_tOtO,
                     )
                     tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
@@ -2400,26 +2412,33 @@ class HSTUAttentionForwardSm100:
                     mbar_ptr + self.mbar_O_full_offset, Int32(0)
                 )
                 lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
-                output_load_atom = cute.make_copy_atom(
-                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)),
-                    Float32,
-                )
-                output_tmem_load = tcgen05.make_tmem_copy(
-                    output_load_atom,
-                    cute.make_tensor(
-                        tStSs[0].iterator + 192, tStSs[0].layout
+                async_copy_elems = 128 // self.o_dtype.width
+                tOtO_i = cute.logical_divide(
+                    debug_tOtO,
+                    cute.make_layout(
+                        (self.kBlockM, async_copy_elems)
                     ),
-                ).get_slice(lane)
-                output_tmem = output_tmem_load.partition_S(
-                    cute.make_tensor(
-                        tStSs[0].iterator + 192, tStSs[0].layout
-                    )
                 )
-                output_source = output_tmem[None, 0, None, None]
+                tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
+                    self.mma_tiler_pv,
+                    self.o_layout,
+                    self.o_dtype,
+                    self.pv_acc_dtype,
+                    (self.epi_tile[0], async_copy_elems),
+                    use_2cta_instrs=False,
+                )
+                tiled_tmem_load = tcgen05.make_tmem_copy(
+                    tmem_copy_atom, tOtO_i[(None, None), 0]
+                )
+                thr_tmem_load = tiled_tmem_load.get_slice(lane)
+                tOtO_t2r = thr_tmem_load.partition_S(
+                    tOtO_i[(None, None), None]
+                )
+                output_source = tOtO_t2r[None, 0, 0, 0]
                 output_values = cute.make_rmem_tensor(
-                    output_source.shape, Float32
+                    output_source.shape, self.pv_acc_dtype
                 )
-                cute.copy(output_tmem_load, output_source, output_values)
+                cute.copy(tiled_tmem_load, output_source, output_values)
                 cute.arch.fence_view_async_tmem_load()
                 if lane == 0:
                     mO[0, 0, 0] = self.o_dtype(
