@@ -2406,6 +2406,11 @@ class HSTUAttentionForwardSm100:
                     output_load_atom, debug_tOtO
                 ).get_slice(lane)
                 output_tmem = output_tmem_load.partition_S(debug_tOtO)
+                print(
+                    "MXFP8 MMA output partition",
+                    output_tmem.shape,
+                    output_tmem.layout,
+                )
                 output_tmem_chunk = output_tmem[None, 0, None, None]
                 output_values = cute.make_rmem_tensor(
                     output_tmem_chunk.shape, Float32
