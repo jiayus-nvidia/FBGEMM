@@ -224,43 +224,29 @@ class SiluMaskQuantizeSm100:
         key_length = Int32(cu_seqlens_k[batch + 1]) - Int32(cu_seqlens_k[batch])
 
         for reduction_block in cutlass.range(blocks_per_row, unroll=1):
-            first_key_idx_local = (
-                reduction_block * MXFP8_BLOCK_SIZE + lane * 4
-            )
-            values = cute.make_rmem_tensor((4,), Float32)
-            local_amax = Float32(0.0)
-            for value_idx in cutlass.range_constexpr(4):
-                key_idx_local = first_key_idx_local + value_idx
-                key_idx = key_start + key_idx_local
-                value = Float32(0.0)
-                if (
-                    lane < 8
-                    and key_idx_local < key_len
-                    and _valid_attention_position(
-                        query_idx,
-                        key_idx,
-                        query_length,
-                        key_length,
-                        window_left,
-                        window_right,
+            key_idx_local = reduction_block * MXFP8_BLOCK_SIZE + lane
+            key_idx = key_start + key_idx_local
+            value = Float32(0.0)
+            if key_idx_local < key_len and _valid_attention_position(
+                query_idx,
+                key_idx,
+                query_length,
+                key_length,
+                window_left,
+                window_right,
+            ):
+                scaled_score = (
+                    Float32(
+                        scores[query_idx_local, key_idx_local, output_batch]
                     )
-                ):
-                    scaled_score = (
-                        Float32(
-                            scores[
-                                query_idx_local, key_idx_local, output_batch
-                            ]
-                        )
-                        * alpha
-                    )
-                    sigmoid = 1.0 / (1.0 + cute.math.exp(-scaled_score))
-                    value = scaled_score * sigmoid / Float32(normalization)
-                values[value_idx] = value
-                local_amax = cute.arch.fmax(
-                    local_amax, cute.arch.fmax(value, -value)
+                    * alpha
                 )
+                sigmoid = 1.0 / (1.0 + cute.math.exp(-scaled_score))
+                value = scaled_score * sigmoid / Float32(normalization)
 
-            block_amax = cute.arch.warp_reduction_max(local_amax)
+            block_amax = cute.arch.warp_reduction_max(
+                cute.arch.fmax(value, -value)
+            )
             ratio = (
                 cute.arch.fmax(block_amax, 2.0**-126 * E4M3_MAX) / E4M3_MAX
             )
@@ -279,18 +265,30 @@ class SiluMaskQuantizeSm100:
                     reduction_block * MXFP8_BLOCK_SIZE,
                     output_batch,
                 ] = cutlass.Uint8(scale_exponent + 127)
-            quantized_values = cute.make_rmem_tensor(
-                (4,), cutlass.Float8E4M3FN
-            )
-            quantized_values.store(
-                (values.load() / scale).to(cutlass.Float8E4M3FN)
-            )
-            if lane < 8:
+            first_lane = (lane // 4) * 4
+            packed_value_0 = cute.arch.shuffle_sync(value, first_lane)
+            packed_value_1 = cute.arch.shuffle_sync(value, first_lane + 1)
+            packed_value_2 = cute.arch.shuffle_sync(value, first_lane + 2)
+            packed_value_3 = cute.arch.shuffle_sync(value, first_lane + 3)
+            if lane % 4 == 0:
+                packed_values = cute.make_rmem_tensor((4,), Float32)
+                packed_values[0] = packed_value_0
+                packed_values[1] = packed_value_1
+                packed_values[2] = packed_value_2
+                packed_values[3] = packed_value_3
+                quantized_values = cute.make_rmem_tensor(
+                    (4,), cutlass.Float8E4M3FN
+                )
+                quantized_values.store(
+                    (packed_values.load() / scale).to(cutlass.Float8E4M3FN)
+                )
                 for value_idx in cutlass.range_constexpr(4):
-                    key_idx_local = first_key_idx_local + value_idx
-                    if key_idx_local < key_len:
+                    output_key_idx_local = key_idx_local + value_idx
+                    if output_key_idx_local < key_len:
                         quantized[
-                            query_idx_local, key_idx_local, output_batch
+                            query_idx_local,
+                            output_key_idx_local,
+                            output_batch,
                         ] = quantized_values[value_idx]
 
 
