@@ -962,31 +962,20 @@ def _slice_mx_batches(matrix: _MxMatrix, start: int, end: int) -> _MxMatrix:
     )
 
 
-def _repeat_mx_batches(matrix: _MxMatrix, repeats: int) -> _MxMatrix:
-    if repeats <= 0:
-        raise ValueError("MXFP8 batch repeat count must be positive")
-    if repeats == 1:
-        return matrix
-    leading_dim = _leading_dim(matrix.values)
-    if leading_dim == 1:
-        storage = matrix.values.permute(2, 0, 1).repeat(repeats, 1, 1)
-        values = storage.permute(1, 2, 0)
-    else:
-        storage = matrix.values.permute(2, 1, 0).repeat(repeats, 1, 1)
-        values = storage.permute(2, 1, 0)
-    return _MxMatrix(values, matrix.scales.repeat(repeats))
-
-
 def _gemm(
     a: _MxMatrix,
     b: _MxMatrix,
     output_dtype: torch.dtype,
     output: Optional[torch.Tensor] = None,
     addend: Optional[torch.Tensor] = None,
+    broadcast_b_batches: bool = False,
 ) -> torch.Tensor:
     m, k, batches = a.values.shape
     n, b_k, b_batches = b.values.shape
-    if k != b_k or batches != b_batches:
+    compatible_batches = (
+        batches % b_batches == 0 if broadcast_b_batches else batches == b_batches
+    )
+    if k != b_k or not compatible_batches:
         raise ValueError(
             f"incompatible MXFP8 GEMM shapes {a.values.shape} and {b.values.shape}"
         )
@@ -1023,6 +1012,7 @@ def _gemm(
         addend.dtype,
         tuple(addend.stride()),
         accumulate_output,
+        broadcast_b_batches,
         mma_n,
     )
     if key not in _compile_cache["gemm"]:
@@ -1031,6 +1021,7 @@ def _gemm(
             (128, mma_n),
             (1, 1),
             accumulate_output=accumulate_output,
+            broadcast_b_batches=broadcast_b_batches,
         )
         max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
         _compile_cache["gemm"][key] = cute.compile(
@@ -1463,8 +1454,6 @@ def hstu_varlen_fwd_mxfp8_100(
     workspaces = {}
 
     for key_tile_idx, (key_mx, value_mx) in enumerate(zip(k_mx_tiles, v_mx_tiles)):
-        repeated_key = _repeat_mx_batches(key_mx, q_tile_count)
-        repeated_value = _repeat_mx_batches(value_mx, q_tile_count)
         for query_tile_idx in range(0, q_tile_count, chunk_size):
             query_tile_end = min(query_tile_idx + chunk_size, q_tile_count)
             pair_count = query_tile_end - query_tile_idx
@@ -1486,13 +1475,13 @@ def hstu_varlen_fwd_mxfp8_100(
             query_mx = _slice_mx_batches(
                 q_mx_collection, batch_start, batch_end
             )
-            key_chunk = _slice_mx_batches(repeated_key, batch_start, batch_end)
-            value_chunk = _slice_mx_batches(
-                repeated_value, batch_start, batch_end
-            )
             key_start = key_tile_idx * 128
             scores = _gemm(
-                query_mx, key_chunk, torch.float32, output=score_workspace
+                query_mx,
+                key_mx,
+                torch.float32,
+                output=score_workspace,
+                broadcast_b_batches=pair_count > 1,
             )
             probabilities_mx = _run_silu(
                 scores,
@@ -1523,10 +1512,11 @@ def hstu_varlen_fwd_mxfp8_100(
             )
             _gemm(
                 probabilities_mx,
-                value_chunk,
+                value_mx,
                 torch.bfloat16 if is_last_key_tile else torch.float32,
                 output=output,
                 addend=addend,
+                broadcast_b_batches=pair_count > 1,
             )
 
     return _unpack(dense_output, cu_seqlens_q, q.shape[0], num_heads), None
@@ -1639,9 +1629,6 @@ def hstu_varlen_bwd_mxfp8_100(
         zip(k_mx_tiles, kt_mx_tiles, v_mx_tiles)
     ):
         key_start = key_tile_idx * 128
-        repeated_key = _repeat_mx_batches(key_mx, q_tile_count)
-        repeated_keyt = _repeat_mx_batches(keyt_mx, q_tile_count)
-        repeated_value = _repeat_mx_batches(value_mx, q_tile_count)
 
         for query_tile_idx in range(0, q_tile_count, chunk_size):
             query_tile_end = min(query_tile_idx + chunk_size, q_tile_count)
@@ -1705,23 +1692,19 @@ def hstu_varlen_bwd_mxfp8_100(
             dout_mx = _slice_mx_batches(
                 dout_mx_collection, batch_start, batch_end
             )
-            key_chunk = _slice_mx_batches(
-                repeated_key, batch_start, batch_end
-            )
-            keyt_chunk = _slice_mx_batches(
-                repeated_keyt, batch_start, batch_end
-            )
-            value_chunk = _slice_mx_batches(
-                repeated_value, batch_start, batch_end
-            )
             scores = _gemm(
-                query_mx, key_chunk, torch.float32, output=score_workspace
+                query_mx,
+                key_mx,
+                torch.float32,
+                output=score_workspace,
+                broadcast_b_batches=pair_count > 1,
             )
             dprobabilities = _gemm(
                 dout_mx,
-                value_chunk,
+                value_mx,
                 torch.float32,
                 output=dprobability_workspace,
+                broadcast_b_batches=pair_count > 1,
             )
             dscores_mx, probabilities_t_mx, dscores_t_mx = _run_silu_backward(
                 scores,
@@ -1746,7 +1729,7 @@ def hstu_varlen_bwd_mxfp8_100(
             is_last_key_tile = key_tile_idx + 1 == len(k_mx_tiles)
             _gemm(
                 dscores_mx,
-                keyt_chunk,
+                keyt_mx,
                 torch.bfloat16 if is_last_key_tile else torch.float32,
                 output=(
                     dense_dq_matrix[:, :, batch_start:batch_end]
@@ -1758,6 +1741,7 @@ def hstu_varlen_bwd_mxfp8_100(
                     if key_tile_idx > 0
                     else None
                 ),
+                broadcast_b_batches=pair_count > 1,
             )
 
             if q_tile_count == 1:

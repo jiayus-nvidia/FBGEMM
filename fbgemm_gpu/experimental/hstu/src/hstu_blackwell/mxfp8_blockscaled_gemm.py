@@ -167,6 +167,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         accumulate_output: bool = False,
+        broadcast_b_batches: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -191,6 +192,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.accumulate_output = accumulate_output
+        self.broadcast_b_batches = broadcast_b_batches
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
@@ -975,8 +977,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
                 ]
                 # ((atom_v, rest_v), RestK)
+                b_batch_coord = mma_tile_coord_mnl[2]
+                if cutlass.const_expr(self.broadcast_b_batches):
+                    b_batch_coord = b_batch_coord % cute.size(tBgB.shape[3])
                 tBgB_slice = tBgB[
-                    (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
+                    (None, mma_tile_coord_mnl[1], None, b_batch_coord)
                 ]
 
                 # ((atom_v, rest_v), RestK)
@@ -989,7 +994,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     slice_n = mma_tile_coord_mnl[1] // 2
                 # ((atom_v, rest_v), RestK)
                 tBgSFB_slice = tBgSFB[
-                    (None, slice_n, None, mma_tile_coord_mnl[2])
+                    (None, slice_n, None, b_batch_coord)
                 ]
 
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
