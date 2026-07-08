@@ -487,6 +487,10 @@ class HSTUAttentionForwardSm100:
             tiled_mma_pv,
             self.cluster_layout_vmnk.shape,
         )
+        if self.debug:
+            print("MXFP8 V GMEM", mV.shape, mV.stride, mV.layout)
+            print("MXFP8 V SMEM", sV_layout)
+            print("MXFP8 V TMA", tma_atom_V, tma_tensor_V.shape, tma_tensor_V.stride)
         tma_atom_QScale = tma_tensor_QScale = None
         tma_atom_KScale = tma_tensor_KScale = None
         tma_atom_VScale = tma_tensor_VScale = None
