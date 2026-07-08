@@ -2837,10 +2837,10 @@ class HSTUAttentionForwardSm100:
         stage: Int32,
     ):
         g_compact = cute.filter_zeros(
-            g_scale[(None, None, None, None, block)]
+            g_scale[(None, None, block)]
         )
         s_compact = cute.filter_zeros(
-            s_scale[(None, None, None, None, stage)]
+            s_scale[(None, None, stage)]
         )
         lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
         for i in cutlass.range(lane, cute.size(s_compact), cute.arch.WARP_SIZE):
