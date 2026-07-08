@@ -68,7 +68,7 @@ class HSTUAttentionForwardSm100:
         self.is_mxfp8 = is_mxfp8
         self.q_stage = 1 if self.head_dim_padded >= 256 or is_mxfp8 else 2
         self.s_stage = 2 # score stage for intra-warp overlap
-        self.debug = False
+        self.debug = True
         assert self.q_stage in [1, 2]
         assert self.s_stage in [2]
 
@@ -1128,7 +1128,7 @@ class HSTUAttentionForwardSm100:
                 cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
                 cute.arch.sync_warp()
 
-            if const_expr(self.is_mxfp8 and not self.debug):
+            if const_expr(self.is_mxfp8):
                 cute.arch.barrier(
                     barrier_id=self.tmem_alloc_sync_bar_id,
                     number_of_threads=cute.arch.WARP_SIZE
@@ -1279,7 +1279,7 @@ class HSTUAttentionForwardSm100:
         if warp_idx >= self.silu0_warp_ids[0] and warp_idx <= self.silu1_warp_ids[-1]:
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.num_regs_silu)
-            if const_expr(self.is_mxfp8 and not self.debug):
+            if const_expr(self.is_mxfp8):
                 cute.arch.barrier(
                     barrier_id=self.tmem_alloc_sync_bar_id,
                     number_of_threads=cute.arch.WARP_SIZE
@@ -1336,7 +1336,7 @@ class HSTUAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
             )
             if warp_idx <= self.silu0_warp_ids[-1] and warp_idx >= self.silu0_warp_ids[0]:
-                if const_expr(not self.debug):
+                if const_expr(not self.debug or self.is_mxfp8):
                     silu_loop(stage=0, tStSi=silu_tStSs[0])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
