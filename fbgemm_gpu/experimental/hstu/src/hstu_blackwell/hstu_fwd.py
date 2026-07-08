@@ -1374,9 +1374,10 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
                 if const_expr(self.debug and self.is_mxfp8):
-                    cute.arch.mbarrier_wait(
-                        mbar_ptr + self.mbar_O_full_offset + 1,
-                        Int32(0),
+                    cute.arch.barrier(
+                        barrier_id=NamedBarrierFwd.PEmpty,
+                        number_of_threads=cute.arch.WARP_SIZE
+                        * (1 + len(self.silu1_warp_ids)),
                     )
                 elif const_expr(not self.debug):
                     silu_loop(stage=1, tStSi=silu_tStSs[1])
@@ -2423,10 +2424,11 @@ class HSTUAttentionForwardSm100:
                     mbar_ptr + self.mbar_O_full_offset, Int32(0)
                 )
                 if const_expr(self.debug):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(
-                            mbar_ptr + self.mbar_O_full_offset + 1
-                        )
+                    cute.arch.barrier(
+                        barrier_id=NamedBarrierFwd.PEmpty,
+                        number_of_threads=cute.arch.WARP_SIZE
+                        * (1 + len(self.silu1_warp_ids)),
+                    )
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
@@ -3048,11 +3050,7 @@ class HSTUAttentionForwardSm100:
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_r2s = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
 
-        ready_stage = 1 if const_expr(self.debug) else stage
-        cute.arch.mbarrier_wait(
-            mbar_ptr + self.mbar_O_full_offset + ready_stage,
-            epi_consumer_phase,
-        )
+        cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, epi_consumer_phase)
         if const_expr(self.debug):
             return
         for i in cutlass.range_constexpr(self.head_dim_v_padded // async_copy_elems):
