@@ -68,7 +68,7 @@ class HSTUAttentionForwardSm100:
         self.is_mxfp8 = is_mxfp8
         self.q_stage = 1 if self.head_dim_padded >= 256 or is_mxfp8 else 2
         self.s_stage = 2 # score stage for intra-warp overlap
-        self.debug = False
+        self.debug = True
         assert self.q_stage in [1, 2]
         assert self.s_stage in [2]
 
@@ -2109,6 +2109,14 @@ class HSTUAttentionForwardSm100:
             pipeline_kv.consumer_release(mma_kv_consumer_state)
             mma_kv_consumer_state.advance()
 
+            if const_expr(self.debug):
+                with cute.arch.elect_one():
+                    tcgen05.commit(mbar_ptr + self.mbar_load_q_empty_offset)
+                pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                pipeline_kv.consumer_release(mma_kv_consumer_state)
+                mma_kv_consumer_state.advance()
+                return
+
             if n_block_nums > 1: # GEMM_QK1 (Q1 * K1 -> S1)
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
@@ -2519,7 +2527,7 @@ class HSTUAttentionForwardSm100:
                 n_block_valid -= wg_stride
 
             # epilogue step
-            if self.q_stage == 2 or stage == 1:
+            if (self.q_stage == 2 or stage == 1) and not self.debug:
                 store_O(seqlen=seqlen, scale=cute.arch.rcp_approx(seqlen.max_seqlen_q), m_block=m_block, head_idx=head_idx, stage=stage if self.q_stage == 2 else 0, epi_consumer_phase=epi_consumer_phase)
 
             # Advance to next tile
