@@ -303,8 +303,12 @@ class HSTUAttentionForwardSm100:
         self._setup_attributes()
 
         cta_group = tcgen05.CtaGroup.ONE
-        # the intermediate tensor p is from tmem & mK-major
-        p_source = tcgen05.OperandSource.TMEM
+        # MXFP8 block-scaled MMA only supports P from shared memory.
+        p_source = (
+            tcgen05.OperandSource.SMEM
+            if self.is_mxfp8
+            else tcgen05.OperandSource.TMEM
+        )
         p_major_mode = tcgen05.OperandMajorMode.K
         if const_expr(self.is_mxfp8):
             tiled_mma_qk = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
@@ -382,6 +386,16 @@ class HSTUAttentionForwardSm100:
         )
         tP_layout = sm100_utils_basic.make_smem_layout_a(
             tiled_mma_pv, self.mma_tiler_pv, self.q_dtype, 1,
+        )
+        sP_layout = (
+            sm100_utils_basic.make_smem_layout_a(
+                tiled_mma_pv,
+                self.mma_tiler_pv,
+                self.q_dtype,
+                self.s_stage,
+            )
+            if self.is_mxfp8
+            else None
         )
         sV_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_pv, self.mma_tiler_pv, self.v_dtype, self.kv_stage,
@@ -592,6 +606,7 @@ class HSTUAttentionForwardSm100:
         sPScale_size = (
             cute.cosize(sPScale_layout) if const_expr(self.is_mxfp8) else 0
         )
+        sP_size = cute.cosize(sP_layout) if const_expr(self.is_mxfp8) else 0
 
         @cute.struct
         class SharedStorage:
@@ -613,6 +628,13 @@ class HSTUAttentionForwardSm100:
             ]
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, sO_size],
+                self.buffer_align_bytes,
+            ]
+            sP: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.q_dtype if self.is_mxfp8 else cutlass.Uint8,
+                    sP_size,
+                ],
                 self.buffer_align_bytes,
             ]
             sQScale: cute.struct.Align[
@@ -682,6 +704,7 @@ class HSTUAttentionForwardSm100:
             sQ_layout,
             sK_layout,
             tP_layout,
+            sP_layout,
             sV_layout,
             sO_layout,
             gmem_tiled_copy_O,
@@ -741,6 +764,7 @@ class HSTUAttentionForwardSm100:
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
+        sP_layout: Optional[cute.ComposedLayout],
         sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
         gmem_tiled_copy_O: cute.TiledCopy,
@@ -840,6 +864,11 @@ class HSTUAttentionForwardSm100:
         # (MMA, MMA_K, MMA_D, PIPE)
         # Strip swizzle info to reuse smem
         sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+        sP = (
+            storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
+            if const_expr(self.is_mxfp8)
+            else None
+        )
 
         if const_expr(self.is_mxfp8):
             sQScale = storage.sQScale.get_tensor(sQScale_layout)
@@ -892,14 +921,24 @@ class HSTUAttentionForwardSm100:
         tOtOs = tuple(cute.make_tensor(tStSs[0].iterator + self.tmem_o_offset[stage], tOtO.layout)
                       for stage in range(self.q_stage))
 
-        tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
-        tOrP = thr_mma_pv.make_fragment_A(tP)[None, None, None, 0]
-
-        tOrPs = [cute.make_tensor(
-            tOrP.iterator
-            + self.qk_acc_dtype.width // self.q_dtype.width * self.tmem_p_offset[stage],
-            tOrP.layout,
-        ) for stage in range(self.s_stage)]
+        if const_expr(self.is_mxfp8):
+            tOrP = thr_mma_pv.make_fragment_A(sP)
+            tOrPs = tuple(
+                tOrP[None, None, None, stage] for stage in range(self.s_stage)
+            )
+        else:
+            tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
+            tOrP = thr_mma_pv.make_fragment_A(tP)[None, None, None, 0]
+            tOrPs = [
+                cute.make_tensor(
+                    tOrP.iterator
+                    + self.qk_acc_dtype.width
+                    // self.q_dtype.width
+                    * self.tmem_p_offset[stage],
+                    tOrP.layout,
+                )
+                for stage in range(self.s_stage)
+            ]
 
         if const_expr(self.is_mxfp8):
             tQScale_layout = blockscaled_utils.make_tmem_layout_sfa(
@@ -1099,9 +1138,11 @@ class HSTUAttentionForwardSm100:
                         sQ,
                         sK,
                         sV,
+                        sP,
                         sQ_layout.inner,
                         sK_layout.inner,
                         sV_layout.inner,
+                        sP_layout.inner,
                         tStSs,
                         tOtOs,
                         tOrPs,
@@ -1127,9 +1168,11 @@ class HSTUAttentionForwardSm100:
                         sQ,
                         sK,
                         sV,
+                        None,
                         sQ_layout.inner,
                         sK_layout.inner,
                         sV_layout.inner,
+                        None,
                         tStSs,
                         tOtOs,
                         tOrPs,
@@ -1178,6 +1221,7 @@ class HSTUAttentionForwardSm100:
                 AttentionMaskCls=AttentionMaskCls,
                 TileSchedulerCls=TileSchedulerCls,
                 store_O=store_O,
+                sP=sP,
                 func=func,
                 buffers=buffers,
                 fastdiv_mods=fastdiv_mods,
@@ -1669,9 +1713,11 @@ class HSTUAttentionForwardSm100:
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
+        sP: Optional[cute.Tensor],
         sQ_swizzle: cute.Swizzle,
         sK_swizzle: cute.Swizzle,
         sV_swizzle: cute.Swizzle,
+        sP_swizzle: Optional[cute.Swizzle],
         tStSs: Tuple[cute.Tensor, cute.Tensor],
         tOtOs: tuple[cute.Tensor],
         tOrPs: Tuple[cute.Tensor, cute.Tensor],
@@ -1915,9 +1961,11 @@ class HSTUAttentionForwardSm100:
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
+        sP: Optional[cute.Tensor],
         sQ_swizzle: cute.Swizzle,
         sK_swizzle: cute.Swizzle,
         sV_swizzle: cute.Swizzle,
+        sP_swizzle: Optional[cute.Swizzle],
         tStSs: Tuple[cute.Tensor, cute.Tensor],
         tOtOs: tuple[cute.Tensor],
         tOrPs: Tuple[cute.Tensor, cute.Tensor],
@@ -1946,9 +1994,6 @@ class HSTUAttentionForwardSm100:
         tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 0])
 
         if const_expr(is_mxfp8):
-            tiled_mma_pv = cute.make_tiled_mma(
-                cute.make_mma_atom(tiled_mma_pv.op)
-            )
             q_scale_copy, q_scale_s, q_scale_t = self.scale_s2t_copy_and_partition(
                 sQScale, tQScale
             )
@@ -1960,11 +2005,6 @@ class HSTUAttentionForwardSm100:
             )
             v_scale_copy, v_scale_s, v_scale_t = self.scale_s2t_copy_and_partition(
                 sVScale, tVScale
-            )
-            cute.copy(
-                p_scale_copy,
-                p_scale_s[(None, None, None, None, 0)],
-                p_scale_t,
             )
             gemm_Si = [
                 partial(
@@ -1981,7 +2021,20 @@ class HSTUAttentionForwardSm100:
                 )
                 for stage in range(self.s_stage)
             ]
-            gemm_Pi = None
+            gemm_Pi = [
+                partial(
+                    sm100_utils.gemm_ptx_blockscaled_ss,
+                    tiled_mma_pv.op,
+                    self.tmem_o_offset[0],
+                    tOrPs[stage],
+                    sA=sP[None, None, None, stage],
+                    sA_swizzle=sP_swizzle,
+                    sB_swizzle=sV_swizzle,
+                    tSFA=tPScale,
+                    tSFB=tVScale,
+                )
+                for stage in range(self.s_stage)
+            ]
         else:
             qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
             gemm_Si = [
@@ -2098,18 +2151,19 @@ class HSTUAttentionForwardSm100:
                     # 3. gemm PiVi=Pi*Vi
                     if const_expr(is_mxfp8):
                         cute.copy(
+                            p_scale_copy,
+                            p_scale_s[(None, None, None, None, 0)],
+                            p_scale_t,
+                        )
+                        cute.copy(
                             v_scale_copy,
                             v_scale_s[(None, None, None, None, Vi_index)],
                             v_scale_t,
                         )
-                        tiled_mma_pv = self.blockscaled_gemm(
-                            tiled_mma_pv,
-                            tOtOs[0],
-                            tOrPs[0],
-                            tOrVi,
-                            tPScale,
-                            tVScale,
-                            O_should_accumulate,
+                        gemm_Pi[0](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            zero_init=not O_should_accumulate,
                         )
                     else:
                         gemm_Pi[0](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 0, mbar_phase= P_full_O_rescaled_phase[0])
@@ -2123,18 +2177,19 @@ class HSTUAttentionForwardSm100:
                     cute.arch.mbarrier_wait(mbar_ptr + p_barrier_offset + 1, P_full_O_rescaled_phase[1])
                     if const_expr(is_mxfp8):
                         cute.copy(
+                            p_scale_copy,
+                            p_scale_s[(None, None, None, None, 1)],
+                            p_scale_t,
+                        )
+                        cute.copy(
                             v_scale_copy,
                             v_scale_s[(None, None, None, None, Vi_index)],
                             v_scale_t,
                         )
-                        tiled_mma_pv = self.blockscaled_gemm(
-                            tiled_mma_pv,
-                            tOtOs[0],
-                            tOrPs[1],
-                            tOrVi,
-                            tPScale,
-                            tVScale,
-                            O_should_accumulate,
+                        gemm_Pi[1](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            zero_init=not O_should_accumulate,
                         )
                     else:
                         gemm_Pi[1](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 1, mbar_phase= P_full_O_rescaled_phase[1])
@@ -2195,18 +2250,19 @@ class HSTUAttentionForwardSm100:
                     cute.arch.mbarrier_wait(mbar_ptr + p_barrier_offset + 0, P_full_O_rescaled_phase[0])
                     if const_expr(is_mxfp8):
                         cute.copy(
+                            p_scale_copy,
+                            p_scale_s[(None, None, None, None, 0)],
+                            p_scale_t,
+                        )
+                        cute.copy(
                             v_scale_copy,
                             v_scale_s[(None, None, None, None, Vi_index)],
                             v_scale_t,
                         )
-                        tiled_mma_pv = self.blockscaled_gemm(
-                            tiled_mma_pv,
-                            tOtOs[0],
-                            tOrPs[0],
-                            tOrVi,
-                            tPScale,
-                            tVScale,
-                            O_should_accumulate,
+                        gemm_Pi[0](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            zero_init=not O_should_accumulate,
                         )
                     else:
                         gemm_Pi[0](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 0, mbar_phase=P_full_O_rescaled_phase[0])
@@ -2220,18 +2276,19 @@ class HSTUAttentionForwardSm100:
                     cute.arch.mbarrier_wait(mbar_ptr + p_barrier_offset + 1, P_full_O_rescaled_phase[1])
                     if const_expr(is_mxfp8):
                         cute.copy(
+                            p_scale_copy,
+                            p_scale_s[(None, None, None, None, 1)],
+                            p_scale_t,
+                        )
+                        cute.copy(
                             v_scale_copy,
                             v_scale_s[(None, None, None, None, Vi_index)],
                             v_scale_t,
                         )
-                        tiled_mma_pv = self.blockscaled_gemm(
-                            tiled_mma_pv,
-                            tOtOs[0],
-                            tOrPs[1],
-                            tOrVi,
-                            tPScale,
-                            tVScale,
-                            O_should_accumulate,
+                        gemm_Pi[1](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            zero_init=not O_should_accumulate,
                         )
                     else:
                         gemm_Pi[1](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 1, mbar_phase=P_full_O_rescaled_phase[1])
@@ -2255,18 +2312,19 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_wait(mbar_ptr + p_barrier_offset + 0, P_full_O_rescaled_phase[0])
                 if const_expr(is_mxfp8):
                     cute.copy(
+                        p_scale_copy,
+                        p_scale_s[(None, None, None, None, 0)],
+                        p_scale_t,
+                    )
+                    cute.copy(
                         v_scale_copy,
                         v_scale_s[(None, None, None, None, Vi_index)],
                         v_scale_t,
                     )
-                    tiled_mma_pv = self.blockscaled_gemm(
-                        tiled_mma_pv,
-                        tOtOs[0],
-                        tOrPs[0],
-                        tOrVi,
-                        tPScale,
-                        tVScale,
-                        O_should_accumulate,
+                    gemm_Pi[0](
+                        tCrB=tOrVi,
+                        sB=sV_cur,
+                        zero_init=not O_should_accumulate,
                     )
                 else:
                     gemm_Pi[0](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 0, mbar_phase=P_full_O_rescaled_phase[0])
@@ -2280,18 +2338,19 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_wait(mbar_ptr + p_barrier_offset + 1, P_full_O_rescaled_phase[1])
                 if const_expr(is_mxfp8):
                     cute.copy(
+                        p_scale_copy,
+                        p_scale_s[(None, None, None, None, 1)],
+                        p_scale_t,
+                    )
+                    cute.copy(
                         v_scale_copy,
                         v_scale_s[(None, None, None, None, Vi_index)],
                         v_scale_t,
                     )
-                    tiled_mma_pv = self.blockscaled_gemm(
-                        tiled_mma_pv,
-                        tOtOs[0],
-                        tOrPs[1],
-                        tOrVi,
-                        tPScale,
-                        tVScale,
-                        O_should_accumulate,
+                    gemm_Pi[1](
+                        tCrB=tOrVi,
+                        sB=sV_cur,
+                        zero_init=not O_should_accumulate,
                     )
                 else:
                     gemm_Pi[1](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 1, mbar_phase=P_full_O_rescaled_phase[1])
@@ -2320,6 +2379,7 @@ class HSTUAttentionForwardSm100:
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
         store_O: Callable,
+        sP: Optional[cute.Tensor],
         func: Optional[cute.Tensor],
         buffers = None,
         fastdiv_mods = (None, None)
@@ -2351,6 +2411,23 @@ class HSTUAttentionForwardSm100:
         tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP)
         thr_tmem_store = tiled_tmem_store.get_slice(tidx)
         tStP_r2t = thr_tmem_store.partition_D(tStP)
+        if const_expr(self.is_mxfp8):
+            smem_store_atom = sm100_utils_basic.get_smem_store_op(
+                self.o_layout,
+                self.q_dtype,
+                self.qk_acc_dtype,
+                tiled_tmem_store,
+            )
+            tiled_p_store = cute.make_tiled_copy_D(
+                smem_store_atom, tiled_tmem_store
+            )
+            thr_p_store = tiled_p_store.get_slice(tidx)
+            tPsP_r2s = thr_p_store.partition_D(
+                sP[None, None, None, stage]
+            )
+        else:
+            tiled_p_store = None
+            tPsP_r2s = None
 
         epi_consumer_phase = Int32(0)
         mma_si_consumer_phase = Int32(0)
@@ -2396,6 +2473,8 @@ class HSTUAttentionForwardSm100:
                 thr_tmem_store=thr_tmem_store,
                 tStS_t2r=tStS_t2r,
                 tStP_r2t=tStP_r2t,
+                tiled_p_store=tiled_p_store,
+                tPsP_r2s=tPsP_r2s,
                 stage=stage,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
@@ -2468,6 +2547,8 @@ class HSTUAttentionForwardSm100:
         thr_tmem_store: cute.CopyAtom,
         tStS_t2r: cute.Tensor,
         tStP_r2t: cute.Tensor,
+        tiled_p_store: Optional[cute.TiledCopy],
+        tPsP_r2s: Optional[cute.Tensor],
         stage: int | Int32,
         batch_idx: Int32,
         head_idx: Int32,
@@ -2515,20 +2596,34 @@ class HSTUAttentionForwardSm100:
             # for stage 0, it does not need wait; for stage 1, it needs wait
             cute.arch.mbarrier_wait(mbar_ptr + mbar_s0_s1_sequence_offset + stage, s0_s1_sequence_phase)
         fastsilu.silu_x2(tSrS_t2r, tSrP_r2t, tSrS_preds, mask_fn=partial(mask_fn) if mask_fn is not None else None)
+        if const_expr(self.is_mxfp8):
+            p_store = tiled_p_store
+            tPrP = tiled_p_store.retile(tSrP_r2t)
+            tPdP = tPsP_r2s
+        else:
+            p_store = thr_tmem_store
+            tPrP = tSrP_r2t_f32
+            tPdP = tStP_r2t
         # Write first portion of P (split_P_arrive columns), then signal MMA to start PV
-        split_P_arrive_idx = cute.size(tStP_r2t.shape[2]) * self.split_P_arrive // self.kBlockN
+        split_P_arrive_idx = cute.size(tPdP.shape[2]) * self.split_P_arrive // self.kBlockN
         for i in cutlass.range_constexpr(split_P_arrive_idx):
-            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
-        cute.arch.fence_view_async_tmem_store()
+            cute.copy(p_store, tPrP[None, None, i], tPdP[None, None, i])
+        if const_expr(self.is_mxfp8):
+            cute.arch.fence_view_async_shared()
+        else:
+            cute.arch.fence_view_async_tmem_store()
 
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage))
         # Notify mma warp that first portion of P is ready — MMA can start PV
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
         # Write remaining P columns
-        for i in cutlass.range_constexpr(split_P_arrive_idx, cute.size(tStP_r2t.shape[2])):
-            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
-        cute.arch.fence_view_async_tmem_store()
+        for i in cutlass.range_constexpr(split_P_arrive_idx, cute.size(tPdP.shape[2])):
+            cute.copy(p_store, tPrP[None, None, i], tPdP[None, None, i])
+        if const_expr(self.is_mxfp8):
+            cute.arch.fence_view_async_shared()
+        else:
+            cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that all P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
         return mma_si_consumer_phase ^ 1, s0_s1_sequence_phase ^ 1
