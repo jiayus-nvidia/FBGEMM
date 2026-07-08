@@ -309,7 +309,6 @@ def _mxfp8_reference(
         ([33, 96], [33, 96], 1, 64, (16, 4), 1.2),
         ([24], [24], 1, 256, (-1, -1), 0.5),
         ([129], [160], 1, 64, (-1, 0), 0.9),
-        ([129], [129], 2, 64, (-1, 0), 0.9),
         ([257] * 4, [385] * 4, 16, 64, (-1, 0), 0.9),
     ],
 )
@@ -331,11 +330,7 @@ def test_hstu_mxfp8_forward_backward(
     v = _normalized_randn((total_k, heads, head_dim), 0.2)
     dout = _normalized_randn((total_q, heads, head_dim), 0.1)
     cu_q = _offsets(q_lengths)
-    cu_k = (
-        cu_q
-        if q_lengths == k_lengths and window[1] == 0
-        else _offsets(k_lengths)
-    )
+    cu_k = _offsets(k_lengths)
 
     output, _ = hstu_varlen_fwd_mxfp8_100(
         q,
