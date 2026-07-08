@@ -409,7 +409,7 @@ class HSTUAttentionForwardSm100:
                 self.sf_vec_size,
                 self.q_stage,
             )
-            sKScale_layout = blockscaled_utils.make_smem_layout_sfb(
+            sKScale_layout = blockscaled_utils.make_smem_layout_sfa(
                 tiled_mma_qk,
                 self.mma_tiler_qk,
                 self.sf_vec_size,
