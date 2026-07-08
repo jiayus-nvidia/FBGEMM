@@ -2373,7 +2373,7 @@ class HSTUAttentionForwardSm100:
                     v_scale_t,
                 )
                 debug_tOtO = cute.make_tensor(
-                    tStSs[0].iterator + 64, tOtOs[0].layout
+                    tStSs[0].iterator + 32, tOtOs[0].layout
                 )
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
                 for kblock_idx in cutlass.range_constexpr(
@@ -2407,12 +2407,12 @@ class HSTUAttentionForwardSm100:
                 output_tmem_load = tcgen05.make_tmem_copy(
                     output_load_atom,
                     cute.make_tensor(
-                        tStSs[0].iterator + 64, tStSs[0].layout
+                        tStSs[0].iterator + 32, tStSs[0].layout
                     ),
                 ).get_slice(lane)
                 output_tmem = output_tmem_load.partition_S(
                     cute.make_tensor(
-                        tStSs[0].iterator + 64, tStSs[0].layout
+                        tStSs[0].iterator + 32, tStSs[0].layout
                     )
                 )
                 output_source = output_tmem[None, 0, None, None]
