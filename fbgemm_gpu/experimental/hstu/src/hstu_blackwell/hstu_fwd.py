@@ -1379,6 +1379,14 @@ class HSTUAttentionForwardSm100:
                         number_of_threads=cute.arch.WARP_SIZE
                         * (1 + len(self.silu1_warp_ids)),
                     )
+                    store_O(
+                        seqlen=SeqlenInfoCls(Int32(0)),
+                        scale=Float32(1.0 / 128.0),
+                        m_block=Int32(0),
+                        head_idx=Int32(0),
+                        stage=0,
+                        epi_consumer_phase=Int32(0),
+                    )
                 elif const_expr(not self.debug):
                     silu_loop(stage=1, tStSi=silu_tStSs[1])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
@@ -3050,9 +3058,11 @@ class HSTUAttentionForwardSm100:
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_r2s = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
 
-        cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, epi_consumer_phase)
-        if const_expr(self.debug):
-            return
+        if const_expr(not self.debug):
+            cute.arch.mbarrier_wait(
+                mbar_ptr + self.mbar_O_full_offset + stage,
+                epi_consumer_phase,
+            )
         for i in cutlass.range_constexpr(self.head_dim_v_padded // async_copy_elems):
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_r2s[None, 0, 0, i]
