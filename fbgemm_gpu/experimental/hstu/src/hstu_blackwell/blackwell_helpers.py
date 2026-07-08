@@ -513,12 +513,20 @@ def gemm_ptx_blockscaled_ss(
     for k in range(cute.size(tCrA.shape[2])):
         smem_desc_a_lo = smem_desc_start_a_lo + offset_a[k]
         smem_desc_b_lo = smem_desc_start_b_lo + offset_b[k]
+        if k == 0:
+            accumulate = (
+                int(not zero_init)
+                if isinstance(zero_init, bool)
+                else cutlass.Int32(zero_init) ^ 1
+            )
+        else:
+            accumulate = 1
         llvm.inline_asm(
             None,
             [
                 cutlass.Int32(smem_desc_a_lo).ir_value(),
                 cutlass.Int32(smem_desc_b_lo).ir_value(),
-                cutlass.Int32(not zero_init or k != 0).ir_value(),
+                cutlass.Int32(accumulate).ir_value(),
                 cutlass.Int32(
                     tSFA[None, None, k].iterator.toint()
                 ).ir_value(),
