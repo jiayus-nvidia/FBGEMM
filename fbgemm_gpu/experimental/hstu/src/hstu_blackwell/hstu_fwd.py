@@ -1451,8 +1451,6 @@ class HSTUAttentionForwardSm100:
         )
         cute.copy(thr_tmem_load, tStS_t2r, output_values)
         cute.arch.fence_view_async_tmem_load()
-        if const_expr(self.debug):
-            return
         inv_seqlen = Float32(1.0 / 128.0)
         for i in cutlass.range_constexpr(cute.size(output_values)):
             coord = tScO_t2r[i]
