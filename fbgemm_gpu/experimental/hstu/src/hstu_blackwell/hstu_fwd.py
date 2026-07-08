@@ -486,7 +486,7 @@ class HSTUAttentionForwardSm100:
                 self.cluster_layout_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
-            tma_atom_KScale, tma_tensor_KScale = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_atom_KScale, tma_tensor_KScale = cute.nvgpu.make_tiled_tma_atom_A(
                 tma_load_op,
                 mKScale,
                 cute.slice_(sKScale_layout, (None, None, None, 0)),
@@ -562,14 +562,6 @@ class HSTUAttentionForwardSm100:
             self.tma_copy_q_bytes *= cute.size(tiled_mma_qk.thr_id.shape)
             self.tma_copy_k_bytes *= cute.size(tiled_mma_qk.thr_id.shape)
             self.tma_copy_v_bytes *= cute.size(tiled_mma_pv.thr_id.shape)
-            if const_expr(self.debug):
-                self.tma_copy_k_bytes = cute.size_in_bytes(
-                    self.k_dtype,
-                    cute.select(sK_layout, mode=[0, 1, 2]),
-                ) * cute.size(tiled_mma_qk.thr_id.shape) + cute.size_in_bytes(
-                    self.sf_dtype,
-                    cute.slice_(sKScale_layout, (None, None, None, 0)),
-                ) * 8
 
         TileScheduler = SingleTileVarlenScheduler
         # TileScheduler = SingleTileScheduler
