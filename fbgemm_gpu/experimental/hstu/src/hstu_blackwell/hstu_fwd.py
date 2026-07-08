@@ -948,7 +948,9 @@ class HSTUAttentionForwardSm100:
             pv_acc_shape = tiled_mma_pv.partition_shape_C(
                 (self.mma_tiler_pv[0], self.mma_tiler_pv[1])
             )
-            tOtO = tiled_mma_pv.make_fragment_C(pv_acc_shape)
+            tOtO = tiled_mma_pv.make_fragment_C(
+                cute.append(pv_acc_shape, 1)
+            )
         else:
             pv_acc_shape = thr_mma_pv.partition_shape_C(
                 (self.mma_tiler_pv[0], self.mma_tiler_pv[1])
@@ -2398,15 +2400,10 @@ class HSTUAttentionForwardSm100:
                 debug_tOrV = tiled_mma_pv.make_fragment_B(sV)[
                     None, None, None, Vi_index
                 ]
-                debug_acc_shape = tiled_mma_pv.partition_shape_C(
-                    (self.mma_tiler_pv[0], self.mma_tiler_pv[1])
+                debug_tOtO_base = cute.make_tensor(
+                    tStSs[0].iterator, tOtOs[0].layout
                 )
-                debug_tOtO_fake = tiled_mma_pv.make_fragment_C(
-                    debug_acc_shape
-                )
-                debug_tOtO = cute.make_tensor(
-                    tStSs[0].iterator, debug_tOtO_fake.layout
-                )
+                debug_tOtO = debug_tOtO_base[None, None, None, 0]
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
                 for kblock_idx in cutlass.range_constexpr(
                     cute.size(debug_tOrP, mode=[2])
@@ -3040,7 +3037,7 @@ class HSTUAttentionForwardSm100:
         if const_expr(self.debug):
             epi_subtile = (self.epi_tile[0], async_copy_elems)
             tOtO_epi = cute.flat_divide(
-                tOtO[((None, None), 0, 0)], epi_subtile
+                tOtO[((None, None), 0, 0, None)], epi_subtile
             )
             cO_epi = cute.flat_divide(cO, epi_subtile)
             tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
@@ -3052,7 +3049,7 @@ class HSTUAttentionForwardSm100:
                 use_2cta_instrs=False,
             )
             tiled_tmem_load = tcgen05.make_tmem_copy(
-                tmem_copy_atom, tOtO_epi[(None, None, 0, 0)]
+                tmem_copy_atom, tOtO_epi[(None, None, 0, 0, 0)]
             )
             thr_tmem_load = tiled_tmem_load.get_slice(tidx)
             tOtO_t2r = thr_tmem_load.partition_S(tOtO_epi)
@@ -3061,7 +3058,9 @@ class HSTUAttentionForwardSm100:
             for subtile in cutlass.range_constexpr(
                 cute.size(tOtO_t2r, mode=[4])
             ):
-                output_source = tOtO_t2r[None, None, None, 0, subtile]
+                output_source = tOtO_t2r[
+                    None, None, None, 0, subtile, 0
+                ]
                 output_coord = tOcO_t2r[None, None, None, 0, subtile]
                 output_values = cute.make_rmem_tensor(
                     output_source.shape, self.pv_acc_dtype
