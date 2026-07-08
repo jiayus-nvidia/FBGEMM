@@ -89,13 +89,19 @@ class MxFp8QuantizeSm100:
         blocks_per_row = cute.ceil_div(reduction, MXFP8_BLOCK_SIZE)
         row = block // blocks_per_row
         reduction_block = block - row * blocks_per_row
-        reduction_idx = reduction_block * MXFP8_BLOCK_SIZE + lane
+        first_reduction_idx = reduction_block * MXFP8_BLOCK_SIZE + lane * 4
 
-        value = Float32(0.0)
-        if reduction_idx < reduction:
-            value = Float32(source[row, reduction_idx, batch])
+        values = cute.make_rmem_tensor((4,), Float32)
+        local_amax = Float32(0.0)
+        for value_idx in cutlass.range_constexpr(4):
+            reduction_idx = first_reduction_idx + value_idx
+            value = Float32(0.0)
+            if lane < 8 and reduction_idx < reduction:
+                value = Float32(source[row, reduction_idx, batch])
+            values[value_idx] = value
+            local_amax = cute.arch.fmax(local_amax, cute.arch.fmax(value, -value))
 
-        block_amax = cute.arch.warp_reduction_max(cute.arch.fmax(value, -value))
+        block_amax = cute.arch.warp_reduction_max(local_amax)
 
         # E8M0 stores a power-of-two dequantization scale. The lower clamp also
         # gives an all-zero block a finite representable scale.
@@ -114,27 +120,13 @@ class MxFp8QuantizeSm100:
             scales[row, reduction_block * MXFP8_BLOCK_SIZE, batch] = cutlass.Uint8(
                 scale_exponent + 127
             )
-        first_lane = (lane // 4) * 4
-        packed_value_0 = cute.arch.shuffle_sync(value, first_lane)
-        packed_value_1 = cute.arch.shuffle_sync(value, first_lane + 1)
-        packed_value_2 = cute.arch.shuffle_sync(value, first_lane + 2)
-        packed_value_3 = cute.arch.shuffle_sync(value, first_lane + 3)
-        if lane % 4 == 0:
-            packed_values = cute.make_rmem_tensor((4,), Float32)
-            packed_values[0] = packed_value_0
-            packed_values[1] = packed_value_1
-            packed_values[2] = packed_value_2
-            packed_values[3] = packed_value_3
-            quantized_values = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
-            quantized_values.store(
-                (packed_values.load() / scale).to(cutlass.Float8E4M3FN)
-            )
+        quantized_values = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
+        quantized_values.store((values.load() / scale).to(cutlass.Float8E4M3FN))
+        if lane < 8:
             for value_idx in cutlass.range_constexpr(4):
-                output_reduction_idx = reduction_idx + value_idx
-                if output_reduction_idx < reduction:
-                    quantized[row, output_reduction_idx, batch] = quantized_values[
-                        value_idx
-                    ]
+                reduction_idx = first_reduction_idx + value_idx
+                if reduction_idx < reduction:
+                    quantized[row, reduction_idx, batch] = quantized_values[value_idx]
 
 
 class MxFp8DequantizeSm100:
