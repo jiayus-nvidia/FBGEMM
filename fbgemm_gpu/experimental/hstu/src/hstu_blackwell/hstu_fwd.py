@@ -1671,9 +1671,6 @@ class HSTUAttentionForwardSm100:
                     masking_step_k += 1
                     n_block_valid_k -= 1
 
-                if const_expr(self.debug):
-                    n_block_valid_v = n_block_min - 1
-
                 # load mainloop, V0 K2 V1 K3... Vi K(i+2)
                 while n_block_valid_k >= n_block_min:
                     n_block_k = sValidBlockIds[n_block_valid_k] if self.is_arbitrary else n_block_valid_k
@@ -2321,12 +2318,13 @@ class HSTUAttentionForwardSm100:
                     mbar_ptr + self.mbar_P_full_2_offset,
                     P_full_O_rescaled_phase[0],
                 )
+                pipeline_kv.consumer_release(mma_kv_consumer_state)
+                mma_kv_consumer_state.advance()
+                pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
                         mbar_ptr + self.mbar_load_q_empty_offset
-                    )
-                    cute.arch.mbarrier_arrive(
-                        mbar_ptr + self.mbar_load_kv_empty_offset + Ki_index
                     )
         while work_tile.is_valid_tile and not self.debug:
             m_block, head_idx, batch_idx = work_tile.tile_idx
