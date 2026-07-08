@@ -1582,7 +1582,7 @@ class HSTUAttentionForwardSm100:
                     n_block_valid_k -= 1
 
                 if const_expr(self.debug):
-                    return
+                    n_block_valid_v = n_block_min - 1
 
                 # load mainloop, V0 K2 V1 K3... Vi K(i+2)
                 while n_block_valid_k >= n_block_min:
