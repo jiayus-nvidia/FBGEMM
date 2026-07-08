@@ -13,6 +13,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32
 
+from .hstu_fwd import HSTUAttentionForwardSm100
 from .mxfp8_blockscaled_gemm import Sm100BlockScaledPersistentDenseGemmKernel
 from .mxfp8_quantize import (
     E4M3_MAX,
@@ -967,6 +968,7 @@ _compile_cache = {
     "pair_gradient_reduce": {},
     "quantize": {},
     "gemm": {},
+    "fused_fwd": {},
 }
 
 
@@ -1945,6 +1947,114 @@ def _reduce_pair_gradients(
     )
 
 
+def _can_use_fused_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+) -> bool:
+    batches = cu_seqlens_q.numel() - 1
+    return (
+        q.shape[2] == 128
+        and k.shape == v.shape
+        and q.shape[1:] == k.shape[1:]
+        and max_seqlen_q % 128 == 0
+        and max_seqlen_k % 128 == 0
+        and q.shape[0] == batches * max_seqlen_q
+        and k.shape[0] == batches * max_seqlen_k
+        and cu_seqlens_k.numel() == cu_seqlens_q.numel()
+    )
+
+
+def _run_fused_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    window_size_left: int,
+    window_size_right: int,
+    alpha: float,
+) -> torch.Tensor:
+    q_mx = _quantize(q.permute(0, 2, 1))
+    k_mx = _quantize(k.permute(0, 2, 1))
+    v_mx = _quantize(v.permute(2, 0, 1))
+    q_values = q_mx.values.permute(0, 2, 1)
+    k_values = k_mx.values.permute(0, 2, 1)
+    v_values = v_mx.values.permute(1, 2, 0)
+    output = torch.empty_like(q)
+
+    q_tensor = _cute_tensor(q_values, element_type=cutlass.Float8E4M3FN)
+    k_tensor = _cute_tensor(k_values, element_type=cutlass.Float8E4M3FN)
+    v_tensor = _cute_tensor(v_values, element_type=cutlass.Float8E4M3FN)
+    output_tensor = _cute_tensor(output)
+    q_scale_tensor = _cute_tensor(
+        q_mx.scales, element_type=cutlass.Float8E8M0FNU
+    )
+    k_scale_tensor = _cute_tensor(
+        k_mx.scales, element_type=cutlass.Float8E8M0FNU
+    )
+    v_scale_tensor = _cute_tensor(
+        v_mx.scales, element_type=cutlass.Float8E8M0FNU
+    )
+    cu_q_tensor = _cute_tensor(cu_seqlens_q)
+    cu_k_tensor = _cute_tensor(cu_seqlens_k)
+    stream = cutlass_torch.default_stream()
+
+    is_causal = window_size_left == max_seqlen_k and window_size_right == 0
+    is_local = (
+        window_size_left < max_seqlen_k or window_size_right < max_seqlen_k
+    ) and not is_causal
+    key = (
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(q_values.stride()),
+        tuple(k_values.stride()),
+        tuple(v_values.stride()),
+        is_causal,
+        is_local,
+    )
+    args = (
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        output_tensor,
+        Int32(max_seqlen_q),
+        Int32(max_seqlen_k),
+        cu_q_tensor,
+        cu_k_tensor,
+        None,
+        None,
+        Float32(alpha),
+        stream,
+        Int32(window_size_left),
+        Int32(window_size_right),
+        None,
+        None,
+        None,
+        None,
+        None,
+        q_scale_tensor,
+        k_scale_tensor,
+        v_scale_tensor,
+    )
+    if key not in _compile_cache["fused_fwd"]:
+        kernel = HSTUAttentionForwardSm100(
+            head_dim=128,
+            is_causal=is_causal,
+            is_local=is_local,
+            is_mxfp8=True,
+        )
+        _compile_cache["fused_fwd"][key] = cute.compile(kernel, *args)
+    _compile_cache["fused_fwd"][key](*args)
+    return output
+
+
 def hstu_varlen_fwd_mxfp8_100(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1988,6 +2098,30 @@ def hstu_varlen_fwd_mxfp8_100(
 
     window_size_left = _normalize_window(window_size_left, max_seqlen_k)
     window_size_right = _normalize_window(window_size_right, max_seqlen_k)
+    if _can_use_fused_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+    ):
+        return (
+            _run_fused_forward(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                window_size_left,
+                window_size_right,
+                alpha,
+            ),
+            None,
+        )
     batch_heads = (cu_seqlens_q.numel() - 1) * num_heads
     head_dim = q.shape[2]
     q_tile_count = padded_q // 128
