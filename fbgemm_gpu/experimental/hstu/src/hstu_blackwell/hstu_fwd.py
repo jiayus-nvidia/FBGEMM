@@ -1630,6 +1630,8 @@ class HSTUAttentionForwardSm100:
                 tSScale=tVsVScale,
                 raw_scale=raw_mVScale,
                 sScale=sVScale,
+                raw_data=gV,
+                sData=sV,
             )
             n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
             if const_expr(self.is_arbitrary):
@@ -3046,6 +3048,8 @@ class HSTUAttentionForwardSm100:
         tSScale: Optional[cute.Tensor] = None,
         raw_scale: Optional[cute.Tensor] = None,
         sScale: Optional[cute.Tensor] = None,
+        raw_data: Optional[cute.Tensor] = None,
+        sData: Optional[cute.Tensor] = None,
     ):
         assert K_or_V in ("K", "V")
         tma_copy_bytes = self.tma_copy_k_bytes if const_expr(K_or_V == "K") else self.tma_copy_v_bytes
@@ -3058,6 +3062,18 @@ class HSTUAttentionForwardSm100:
             # K. So we need to wait for the stage after that (stage 1) to be empty as well.
             if stage == 0:
                 cute.arch.mbarrier_wait(mbar_empty_ptr + 1, phase)
+        if const_expr(self.is_mxfp8 and self.debug and K_or_V == "V"):
+            g_linear = cute.group_modes(raw_data, 0, 2)
+            s_linear = cute.group_modes(sData, 0, 3)
+            lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
+            for i in cutlass.range(
+                lane, self.kBlockN * self.head_dim_v_padded, cute.arch.WARP_SIZE
+            ):
+                s_linear[i, stage] = g_linear[i, block]
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(mbar_full_ptr + stage)
+            return
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(mbar_full_ptr + stage, tma_copy_bytes)
         tXsX_cur = tXsX[None, stage]
