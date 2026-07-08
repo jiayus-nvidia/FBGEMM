@@ -68,7 +68,7 @@ class HSTUAttentionForwardSm100:
         self.is_mxfp8 = is_mxfp8
         self.q_stage = 1 if self.head_dim_padded >= 256 or is_mxfp8 else 2
         self.s_stage = 2 # score stage for intra-warp overlap
-        self.debug = True
+        self.debug = False
         assert self.q_stage in [1, 2]
         assert self.s_stage in [2]
 
@@ -81,8 +81,6 @@ class HSTUAttentionForwardSm100:
         self.pv_acc_dtype = Float32
         self.cluster_shape_mn = (1, 1)
         self.is_persistent = is_persistent
-        if self.debug:
-            self.is_persistent = False
         self.is_causal = is_causal
         self.is_local = is_local
         self.is_context = is_context
@@ -245,30 +243,20 @@ class HSTUAttentionForwardSm100:
                 raise TypeError("MXFP8 forward requires E8M0 scale factors")
             self.sf_vec_size = 32
         # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (*(
-            s
-            if isinstance(s, int)
-            else cute.assume(s, divby=128 // t.element_type.width)
-            for s in t.stride[:-1]
-        ), t.stride[-1])
+        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [0, 2, 1]
-        mO = cute.make_tensor(
-            mO.iterator, cute.select(mO.layout, mode=QO_layout_transpose)
-        )
-        if const_expr(not self.is_mxfp8):
-            mQ = cute.make_tensor(
-                mQ.iterator, cute.select(mQ.layout, mode=QO_layout_transpose)
-            )
-            KV_layout_transpose = [0, 2, 1]
-            mK, mV = [
-                cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
-                for t in (mK, mV)
-            ]
-            V_layout_transpose = [1, 0, 2]
-            mV = cute.make_tensor(
-                mV.iterator, cute.select(mV.layout, mode=V_layout_transpose)
-            )
+        mQ, mO = [
+            cute.make_tensor(t.iterator, cute.select(t.layout, mode=QO_layout_transpose))
+            for t in (mQ, mO)
+        ]
+        KV_layout_transpose = [0, 2, 1]
+        mK, mV = [
+            cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
+            for t in (mK, mV)
+        ]
+        V_layout_transpose = [1, 0, 2]
+        mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
 
         if const_expr(self.is_mxfp8):
             mQScale = cute.make_tensor(
@@ -459,7 +447,7 @@ class HSTUAttentionForwardSm100:
         tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
             mQ,
-            cute.slice_(sQ_layout, (None, None, None, 0)),
+            cute.select(sQ_layout, mode=[0, 1, 2]),
             self.mma_tiler_qk,
             tiled_mma_qk,
             self.cluster_layout_vmnk.shape,
@@ -469,7 +457,7 @@ class HSTUAttentionForwardSm100:
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_B(
             tma_load_op,
             mK,
-            cute.slice_(sK_layout, (None, None, None, 0)),
+            cute.select(sK_layout, mode=[0, 1, 2]),
             self.mma_tiler_qk,
             tiled_mma_qk,
             self.cluster_layout_vmnk.shape,
@@ -478,7 +466,7 @@ class HSTUAttentionForwardSm100:
         tma_atom_V, tma_tensor_V = cute.nvgpu.make_tiled_tma_atom_B(
             tma_load_op,
             mV,
-            cute.slice_(sV_layout, (None, None, None, 0)),
+            cute.select(sV_layout, mode=[0, 1, 2]),
             self.mma_tiler_pv,
             tiled_mma_pv,
             self.cluster_layout_vmnk.shape,
@@ -553,24 +541,10 @@ class HSTUAttentionForwardSm100:
         vO_layout = cute.make_layout((1, async_copy_elems))
         gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
-        self.tma_copy_q_bytes = cute.size_in_bytes(
-            self.q_dtype, cute.slice_(sQ_layout, (None, None, None, 0))
-        )
-        self.tma_copy_k_bytes = cute.size_in_bytes(
-            self.k_dtype, cute.slice_(sK_layout, (None, None, None, 0))
-        )
-        self.tma_copy_v_bytes = cute.size_in_bytes(
-            self.v_dtype, cute.slice_(sV_layout, (None, None, None, 0))
-        )
-        if const_expr(self.debug):
-            self.tma_copy_q_bytes = (
-                self.mma_tiler_qk[0]
-                * self.mma_tiler_qk[2]
-                * self.q_dtype.width
-                * cute.size(tiled_mma_qk.thr_id.shape)
-                // 8
-            )
-        if const_expr(self.is_mxfp8 and not self.debug):
+        self.tma_copy_q_bytes = cute.size_in_bytes(self.q_dtype, cute.select(sQ_layout, mode=[0, 1, 2]))
+        self.tma_copy_k_bytes = cute.size_in_bytes(self.k_dtype, cute.select(sK_layout, mode=[0, 1, 2]))
+        self.tma_copy_v_bytes = cute.size_in_bytes(self.v_dtype, cute.select(sV_layout, mode=[0, 1, 2]))
+        if const_expr(self.is_mxfp8):
             self.tma_copy_q_bytes += cute.size_in_bytes(
                 self.sf_dtype,
                 cute.filter_zeros(cute.slice_(sQScale_layout, (None, None, None, 0))),
@@ -991,7 +965,7 @@ class HSTUAttentionForwardSm100:
                 self.sf_vec_size,
                 cute.slice_(sVScale_layout, (None, None, None, 0)),
             )
-            scale_base = tStS.iterator + (256 if self.debug else self.tmem_total)
+            scale_base = tStS.iterator + self.tmem_total
             tQScale = cute.make_tensor(
                 cute.recast_ptr(scale_base, dtype=self.sf_dtype),
                 tQScale_layout,
@@ -1253,14 +1227,12 @@ class HSTUAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
             )
             if warp_idx <= self.silu0_warp_ids[-1] and warp_idx >= self.silu0_warp_ids[0]:
-                if const_expr(not self.debug):
-                    tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
-                    silu_loop(stage=0, tStSi=tStSi)
+                tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
+                silu_loop(stage=0, tStSi=tStSi)
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
-                if const_expr(not self.debug):
-                    tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
-                    silu_loop(stage=1, tStSi=tStSi)
+                tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
+                silu_loop(stage=1, tStSi=tStSi)
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
         return
@@ -1458,14 +1430,11 @@ class HSTUAttentionForwardSm100:
                 masking_step_v = 0
                 n_block_valid_k = n_block_max - 1
                 n_block_valid_v = n_block_max - 1
-                if const_expr(self.debug):
-                    n_block_valid_v = n_block_min - 1
                 n_block_k = sValidBlockIds[n_block_valid_k] if self.is_arbitrary else n_block_valid_k
                 load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
                 q_producer_phase ^= 1
-                if const_expr(not self.debug):
-                    load_K(block=n_block_k, producer_state=kv_producer_state, page_idx=None)  # K0
-                    kv_producer_state.advance()
+                load_K(block=n_block_k, producer_state=kv_producer_state, page_idx=None)  # K0
+                kv_producer_state.advance()
                 if is_jump and masking_step_k == n_masking_steps - 1:
                     n_block_valid_k = min(n_block_valid_k, n_block_history)
                 masking_step_k += 1
@@ -2094,16 +2063,7 @@ class HSTUAttentionForwardSm100:
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
-        if const_expr(self.debug):
-            cute.arch.mbarrier_wait(
-                mbar_ptr + self.mbar_load_q_full_offset, mma_q_consumer_phase
-            )
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive(
-                    mbar_ptr + self.mbar_load_q_empty_offset
-                )
-
-        while work_tile.is_valid_tile and not self.debug:
+        while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             offset_dynamic = (self.cta_tiler[0] - (seqlen.seqlen_q & (self.cta_tiler[0] - 1))) & (self.cta_tiler[0] - 1)
@@ -2559,7 +2519,7 @@ class HSTUAttentionForwardSm100:
                 n_block_valid -= wg_stride
 
             # epilogue step
-            if (self.q_stage == 2 or stage == 1) and not self.debug:
+            if self.q_stage == 2 or stage == 1:
                 store_O(seqlen=seqlen, scale=cute.arch.rcp_approx(seqlen.max_seqlen_q), m_block=m_block, head_idx=head_idx, stage=stage if self.q_stage == 2 else 0, epi_consumer_phase=epi_consumer_phase)
 
             # Advance to next tile
@@ -2638,10 +2598,9 @@ class HSTUAttentionForwardSm100:
             cute.arch.mbarrier_wait(mbar_ptr + mbar_s0_s1_sequence_offset + stage, s0_s1_sequence_phase)
         fastsilu.silu_x2(tSrS_t2r, tSrP, tSrS_preds, mask_fn=partial(mask_fn) if mask_fn is not None else None)
         if const_expr(self.is_mxfp8):
-            if const_expr(not self.debug):
-                for i in cutlass.range_constexpr(cute.size(tSrP)):
-                    sP_mn[tScS_t2r[i]] = tSrP[i]
-                cute.arch.fence_view_async_shared()
+            for i in cutlass.range_constexpr(cute.size(tSrP)):
+                sP_mn[tScS_t2r[i]] = tSrP[i]
+            cute.arch.fence_view_async_shared()
         else:
             split_P_arrive_idx = cute.size(tStP_r2t.shape[2]) * self.split_P_arrive // self.kBlockN
             for i in cutlass.range_constexpr(split_P_arrive_idx):
@@ -2778,7 +2737,7 @@ class HSTUAttentionForwardSm100:
         cute.copy(
             tma_atom, tQgQ[None, block], tQsQ[None, stage], tma_bar_ptr=mbar_full_ptr + stage
         )
-        if const_expr(self.is_mxfp8 and not self.debug):
+        if const_expr(self.is_mxfp8):
             cute.copy(
                 scale_atom,
                 tGScale[(None, block)],
