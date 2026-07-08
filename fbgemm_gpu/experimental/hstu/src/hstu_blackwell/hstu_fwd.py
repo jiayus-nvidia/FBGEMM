@@ -3047,6 +3047,10 @@ class HSTUAttentionForwardSm100:
                 tOsO,
                 cute.make_layout((self.kBlockM, async_copy_elems)),
             )
+            cO_i = cute.logical_divide(
+                cO,
+                cute.make_layout((self.kBlockM, async_copy_elems)),
+            )
             tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
                 self.mma_tiler_pv,
                 self.o_layout,
@@ -3074,6 +3078,9 @@ class HSTUAttentionForwardSm100:
             tOsO_r2s = thr_tmem_load.partition_D(
                 tOsO_i[(None, None), None]
             )
+            tOcO_t2r = thr_tmem_load.partition_D(
+                cO_i[(None, None), None]
+            )
             for subtile in cutlass.range_constexpr(
                 self.head_dim_v_padded // async_copy_elems
             ):
@@ -3082,13 +3089,21 @@ class HSTUAttentionForwardSm100:
                     output_destination = tOsO_r2s[
                         None, 0, 0, subtile
                     ]
+                    output_coord = tOcO_t2r[None, 0, 0, subtile]
                     output_values = cute.make_rmem_tensor(
-                        output_destination.shape, self.pv_acc_dtype
+                        output_source.shape, self.pv_acc_dtype
                     )
                     cute.copy(
                         tiled_tmem_load, output_source, output_values
                     )
                     cute.arch.fence_view_async_tmem_load()
+                    for value_idx in cutlass.range_constexpr(
+                        cute.size(output_values)
+                    ):
+                        coord = output_coord[value_idx]
+                        sO[coord[0], coord[1], stage] = self.o_dtype(
+                            output_values[value_idx] * Float32(1.0 / 128.0)
+                        )
             cute.arch.fence_view_async_shared()
             return
             cute.arch.barrier(
