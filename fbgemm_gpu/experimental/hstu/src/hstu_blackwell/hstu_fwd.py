@@ -2586,18 +2586,25 @@ class HSTUAttentionForwardSm100:
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)  # copy from tmem to rmem
         cute.arch.fence_view_async_tmem_load()
 
-        tSrP_r2t_f32 = cute.make_rmem_tensor(thr_tmem_store.partition_S(tScP).shape, Float32)
-        tSrP_r2t = cute.make_tensor(
-            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout,
-        )
+        if const_expr(self.is_mxfp8):
+            tSrP = cute.make_rmem_tensor(tSrS_t2r.shape, self.q_dtype)
+            tSrP_r2t_f32 = None
+        else:
+            tSrP_r2t_f32 = cute.make_rmem_tensor(
+                thr_tmem_store.partition_S(tScP).shape, Float32
+            )
+            tSrP = cute.make_tensor(
+                cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype),
+                tSrS_t2r.layout,
+            )
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             # s0_s1_sequence_phase = Int32(1 if stage == 0 else 0)
             # for stage 0, it does not need wait; for stage 1, it needs wait
             cute.arch.mbarrier_wait(mbar_ptr + mbar_s0_s1_sequence_offset + stage, s0_s1_sequence_phase)
-        fastsilu.silu_x2(tSrS_t2r, tSrP_r2t, tSrS_preds, mask_fn=partial(mask_fn) if mask_fn is not None else None)
+        fastsilu.silu_x2(tSrS_t2r, tSrP, tSrS_preds, mask_fn=partial(mask_fn) if mask_fn is not None else None)
         if const_expr(self.is_mxfp8):
-            tPrP = tiled_p_store.retile(tSrP_r2t)
+            tPrP = tiled_p_store.retile(tSrP)
             split_P_arrive_idx = (
                 cute.size(tPsP_r2s.shape[3])
                 * self.split_P_arrive
