@@ -308,12 +308,7 @@ class HSTUAttentionForwardSm100:
             raise RuntimeError("The layout of mQ is not supported")
         if const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
             raise RuntimeError("The layout of mK is not supported")
-        expected_v_major = (
-            tcgen05.OperandMajorMode.K
-            if self.is_mxfp8
-            else tcgen05.OperandMajorMode.MN
-        )
-        if const_expr(self.v_major_mode != expected_v_major):
+        if const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
             raise RuntimeError("The layout of mV is not supported")
 
         # check type consistency
@@ -2377,7 +2372,9 @@ class HSTUAttentionForwardSm100:
                     v_scale_s[(None, None, None, None, Vi_index)],
                     v_scale_t,
                 )
-                debug_tOtO = tStSs[0]
+                debug_tOtO = cute.make_tensor(
+                    tStSs[0].iterator, tOtOs[0].layout
+                )
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
                 for kblock_idx in cutlass.range_constexpr(
                     cute.size(tOrPs[0], mode=[2])
@@ -2408,9 +2405,9 @@ class HSTUAttentionForwardSm100:
                     Float32,
                 )
                 output_tmem_load = tcgen05.make_tmem_copy(
-                    output_load_atom, debug_tOtO
+                    output_load_atom, tStSs[0]
                 ).get_slice(lane)
-                output_tmem = output_tmem_load.partition_S(debug_tOtO)
+                output_tmem = output_tmem_load.partition_S(tStSs[0])
                 output_source = output_tmem[None, 0, None, None]
                 output_values = cute.make_rmem_tensor(
                     output_source.shape, Float32
