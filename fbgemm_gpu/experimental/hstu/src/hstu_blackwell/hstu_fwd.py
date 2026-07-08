@@ -1229,12 +1229,14 @@ class HSTUAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
             )
             if warp_idx <= self.silu0_warp_ids[-1] and warp_idx >= self.silu0_warp_ids[0]:
-                tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
-                silu_loop(stage=0, tStSi=tStSi)
+                if const_expr(not self.debug):
+                    tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
+                    silu_loop(stage=0, tStSi=tStSi)
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
-                tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
-                silu_loop(stage=1, tStSi=tStSi)
+                if const_expr(not self.debug):
+                    tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
+                    silu_loop(stage=1, tStSi=tStSi)
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
         return
