@@ -2090,7 +2090,7 @@ class HSTUAttentionForwardSm100:
                 k_scale_s[(None, None, None, None, Ki_index)],
                 k_scale_t,
             )
-            gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
+            gemm_Si[0](tCrB=tSrKi, sB=sQ[None, None, None, 0])
             with cute.arch.elect_one():
                 tcgen05.commit(mbar_ptr + self.mbar_S_full_offset)
             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset, 0)
