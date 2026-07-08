@@ -549,15 +549,15 @@ class HSTUAttentionForwardSm100:
         if const_expr(self.is_mxfp8):
             self.tma_copy_q_bytes += cute.size_in_bytes(
                 self.sf_dtype,
-                cute.filter_zeros(cute.slice_(sQScale_layout, (None, None, None, 0))),
+                cute.slice_(sQScale_layout, (None, None, None, 0)),
             )
             self.tma_copy_k_bytes += cute.size_in_bytes(
                 self.sf_dtype,
-                cute.filter_zeros(cute.slice_(sKScale_layout, (None, None, None, 0))),
+                cute.slice_(sKScale_layout, (None, None, None, 0)),
             )
             self.tma_copy_v_bytes += cute.size_in_bytes(
                 self.sf_dtype,
-                cute.filter_zeros(cute.slice_(sVScale_layout, (None, None, None, 0))),
+                cute.slice_(sVScale_layout, (None, None, None, 0)),
             )
 
         TileScheduler = SingleTileVarlenScheduler
