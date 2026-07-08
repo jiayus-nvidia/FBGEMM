@@ -562,6 +562,11 @@ class HSTUAttentionForwardSm100:
             self.tma_copy_q_bytes *= cute.size(tiled_mma_qk.thr_id.shape)
             self.tma_copy_k_bytes *= cute.size(tiled_mma_qk.thr_id.shape)
             self.tma_copy_v_bytes *= cute.size(tiled_mma_pv.thr_id.shape)
+            if const_expr(self.debug):
+                self.tma_copy_k_bytes = cute.size_in_bytes(
+                    self.sf_dtype,
+                    cute.slice_(sKScale_layout, (None, None, None, 0)),
+                ) * cute.size(tiled_mma_qk.thr_id.shape)
 
         TileScheduler = SingleTileVarlenScheduler
         # TileScheduler = SingleTileScheduler
@@ -2806,7 +2811,13 @@ class HSTUAttentionForwardSm100:
             tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
         # Currently we assume that page_size == kBlockN so we index into tXgX with block = 0
         tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
-        cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=mbar_full_ptr + stage)
+        if const_expr(not self.debug):
+            cute.copy(
+                tma_atom,
+                tXgX_cur,
+                tXsX_cur,
+                tma_bar_ptr=mbar_full_ptr + stage,
+            )
         if const_expr(self.is_mxfp8):
             tGScale_cur = tGScale[None, block]
             cute.copy(
