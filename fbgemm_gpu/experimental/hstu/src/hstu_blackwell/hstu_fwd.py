@@ -560,13 +560,14 @@ class HSTUAttentionForwardSm100:
                 cute.slice_(sVScale_layout, (None, None, None, 0)),
             )
             self.tma_copy_q_bytes *= cute.size(tiled_mma_qk.thr_id.shape)
-            self.tma_copy_k_bytes *= cute.size(tiled_mma_qk.thr_id.shape)
-            self.tma_copy_v_bytes *= cute.size(tiled_mma_pv.thr_id.shape)
-            if const_expr(self.debug):
-                self.tma_copy_k_bytes = cute.size_in_bytes(
-                    self.k_dtype,
-                    cute.select(sK_layout, mode=[0, 1, 2]),
-                )
+            self.tma_copy_k_bytes = cute.size_in_bytes(
+                self.k_dtype,
+                cute.select(sK_layout, mode=[0, 1, 2]),
+            )
+            self.tma_copy_v_bytes = cute.size_in_bytes(
+                self.v_dtype,
+                cute.select(sV_layout, mode=[0, 1, 2]),
+            )
 
         TileScheduler = SingleTileVarlenScheduler
         # TileScheduler = SingleTileScheduler
@@ -735,6 +736,7 @@ class HSTUAttentionForwardSm100:
             tma_tensor_KScale,
             tma_tensor_VScale,
             mKScale,
+            mVScale,
             tma_atom_QScale,
             tma_atom_KScale,
             tma_atom_VScale,
@@ -796,6 +798,7 @@ class HSTUAttentionForwardSm100:
         mKScale: Optional[cute.Tensor] = None,
         mVScale: Optional[cute.Tensor] = None,
         raw_mKScale: Optional[cute.Tensor] = None,
+        raw_mVScale: Optional[cute.Tensor] = None,
         tma_atom_QScale: Optional[cute.CopyAtom] = None,
         tma_atom_KScale: Optional[cute.CopyAtom] = None,
         tma_atom_VScale: Optional[cute.CopyAtom] = None,
@@ -1081,6 +1084,7 @@ class HSTUAttentionForwardSm100:
                     mKScale,
                     mVScale,
                     raw_mKScale,
+                    raw_mVScale,
                     sQScale,
                     sKScale,
                     sVScale,
@@ -1365,6 +1369,7 @@ class HSTUAttentionForwardSm100:
         mKScale: Optional[cute.Tensor],
         mVScale: Optional[cute.Tensor],
         raw_mKScale: Optional[cute.Tensor],
+        raw_mVScale: Optional[cute.Tensor],
         sQScale: Optional[cute.Tensor],
         sKScale: Optional[cute.Tensor],
         sVScale: Optional[cute.Tensor],
@@ -1416,6 +1421,24 @@ class HSTUAttentionForwardSm100:
                 )
                 gVScale = cute.local_tile(
                     mVScale_cur,
+                    cute.select(self.mma_tiler_pv, mode=[1, 2]),
+                    (0, None),
+                )
+                raw_mKScale_cur = cute.domain_offset(
+                    (seqlen.offset_k, 0),
+                    raw_mKScale[None, None, head_idx_kv],
+                )
+                raw_mVScale_cur = cute.domain_offset(
+                    (0, seqlen.offset_k),
+                    raw_mVScale[None, None, head_idx_kv],
+                )
+                raw_gKScale = cute.local_tile(
+                    raw_mKScale_cur,
+                    cute.select(self.mma_tiler_qk, mode=[1, 2]),
+                    (None, 0),
+                )
+                raw_gVScale = cute.local_tile(
+                    raw_mVScale_cur,
                     cute.select(self.mma_tiler_pv, mode=[1, 2]),
                     (0, None),
                 )
@@ -1491,6 +1514,8 @@ class HSTUAttentionForwardSm100:
                 scale_atom=tma_atom_KScale,
                 tGScale=tKgKScale,
                 tSScale=tKsKScale,
+                raw_scale=raw_gKScale,
+                sScale=sKScale,
             )
             load_V = partial(
                 self.load_KV, tma_atom_V, tVgV, tVsV,
@@ -1499,6 +1524,8 @@ class HSTUAttentionForwardSm100:
                 scale_atom=tma_atom_VScale,
                 tGScale=tVgVScale,
                 tSScale=tVsVScale,
+                raw_scale=raw_gVScale,
+                sScale=sVScale,
             )
             n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
             if const_expr(self.is_arbitrary):
@@ -1539,13 +1566,6 @@ class HSTUAttentionForwardSm100:
                 n_block_k = sValidBlockIds[n_block_valid_k] if self.is_arbitrary else n_block_valid_k
                 load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
                 q_producer_phase ^= 1
-                if const_expr(self.debug):
-                    self.load_scale_g2s(
-                        raw_mKScale,
-                        sKScale,
-                        n_block_k,
-                        kv_producer_state.index,
-                    )
                 load_K(block=n_block_k, producer_state=kv_producer_state, page_idx=None)  # K0
                 kv_producer_state.advance()
                 if is_jump and masking_step_k == n_masking_steps - 1:
@@ -2908,11 +2928,15 @@ class HSTUAttentionForwardSm100:
         scale_atom: Optional[cute.CopyAtom] = None,
         tGScale: Optional[cute.Tensor] = None,
         tSScale: Optional[cute.Tensor] = None,
+        raw_scale: Optional[cute.Tensor] = None,
+        sScale: Optional[cute.Tensor] = None,
     ):
         assert K_or_V in ("K", "V")
         tma_copy_bytes = self.tma_copy_k_bytes if const_expr(K_or_V == "K") else self.tma_copy_v_bytes
         stage, phase = producer_state.index, producer_state.phase
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
+        if const_expr(self.is_mxfp8):
+            self.load_scale_g2s(raw_scale, sScale, block, stage)
         if const_expr(K_or_V == "K" and self.uneven_kv_smem):
             # Before this round, the smem location was occupied by V, which is smaller than
             # K. So we need to wait for the stage after that (stage 1) to be empty as well.
@@ -2927,7 +2951,7 @@ class HSTUAttentionForwardSm100:
         # Currently we assume that page_size == kBlockN so we index into tXgX with block = 0
         tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
         cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=mbar_full_ptr + stage)
-        if const_expr(self.is_mxfp8 and not self.debug):
+        if const_expr(False):
             tGScale_cur = tGScale[None, block]
             cute.copy(
                 scale_atom,
@@ -2944,12 +2968,14 @@ class HSTUAttentionForwardSm100:
         block: Int32,
         stage: Int32,
     ):
+        g_origin = cute.domain_offset((0, 0, block), g_scale)
+        s_origin = cute.domain_offset((0, 0, 0, stage), s_scale)
         tile_size = cute.cosize(
             cute.slice_(s_scale.layout, (None, None, None, 0))
         )
         linear_layout = cute.make_layout(tile_size)
-        g_linear = cute.make_tensor(g_scale.iterator, linear_layout)
-        s_linear = cute.make_tensor(s_scale.iterator, linear_layout)
+        g_linear = cute.make_tensor(g_origin.iterator, linear_layout)
+        s_linear = cute.make_tensor(s_origin.iterator, linear_layout)
         lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
         for i in cutlass.range(lane, tile_size, cute.arch.WARP_SIZE):
             s_linear[i] = g_linear[i]
