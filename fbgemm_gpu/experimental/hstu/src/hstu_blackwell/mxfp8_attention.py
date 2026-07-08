@@ -340,6 +340,8 @@ class SiluBackwardMaskQuantizeSm100:
             cute.recast_ptr(dscore_t_scale_storage.iterator, dtype=cutlass.Uint8),
             transpose_scale_layout,
         )
+        blocks_per_row = cute.ceil_div(key_len, MXFP8_BLOCK_SIZE)
+        transpose_blocks_per_row = cute.ceil_div(query_len, MXFP8_BLOCK_SIZE)
         self.kernel(
             scores,
             dprobabilities,
@@ -361,8 +363,13 @@ class SiluBackwardMaskQuantizeSm100:
             query_start,
             key_start,
         ).launch(
-            grid=(query_len + key_len, batch_heads, 1),
-            block=(128, 1, 1),
+            grid=(
+                query_len * blocks_per_row
+                + key_len * transpose_blocks_per_row,
+                batch_heads,
+                1,
+            ),
+            block=(cute.arch.WARP_SIZE, 1, 1),
             stream=stream,
         )
 
@@ -389,11 +396,10 @@ class SiluBackwardMaskQuantizeSm100:
         query_start: Int32,
         key_start: Int32,
     ):
-        thread, _, _ = cute.arch.thread_idx()
-        lane = thread % cute.arch.WARP_SIZE
-        reduction_block = thread // cute.arch.WARP_SIZE
+        lane, _, _ = cute.arch.thread_idx()
         block, output_batch, _ = cute.arch.block_idx()
         query_len, key_len, _ = scores.shape
+        blocks_per_row = cute.ceil_div(key_len, MXFP8_BLOCK_SIZE)
         batch_head = output_batch
         query_tile_start = query_start
         if cutlass.const_expr(query_starts is not None):
@@ -403,10 +409,11 @@ class SiluBackwardMaskQuantizeSm100:
         batch = batch_head // num_heads
         query_length = Int32(cu_seqlens_q[batch + 1]) - Int32(cu_seqlens_q[batch])
         key_length = Int32(cu_seqlens_k[batch + 1]) - Int32(cu_seqlens_k[batch])
-        row_block_count = query_len
+        row_block_count = query_len * blocks_per_row
 
         if block < row_block_count:
-            query_idx_local = block
+            query_idx_local = block // blocks_per_row
+            reduction_block = block - query_idx_local * blocks_per_row
             first_key_idx_local = reduction_block * MXFP8_BLOCK_SIZE + lane * 4
             query_idx = query_tile_start + query_idx_local
             dscore_values = cute.make_rmem_tensor((4,), Float32)
@@ -473,7 +480,12 @@ class SiluBackwardMaskQuantizeSm100:
                         query_idx_local, key_idx_local, output_batch
                     ] = quantized_values[value_idx]
         else:
-            key_idx_local = block - row_block_count
+            transpose_block = block - row_block_count
+            transpose_blocks_per_row = cute.ceil_div(query_len, MXFP8_BLOCK_SIZE)
+            key_idx_local = transpose_block // transpose_blocks_per_row
+            reduction_block = (
+                transpose_block - key_idx_local * transpose_blocks_per_row
+            )
             first_query_idx_local = (
                 reduction_block * MXFP8_BLOCK_SIZE + lane * 4
             )
