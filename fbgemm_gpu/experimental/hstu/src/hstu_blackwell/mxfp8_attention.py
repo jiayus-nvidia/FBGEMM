@@ -1448,12 +1448,16 @@ def hstu_varlen_fwd_mxfp8_100(
         if len(k_mx_tiles) > 1
         else None
     )
-    query_starts = torch.arange(
-        0,
-        q_tile_count * 128,
-        128,
-        dtype=torch.int32,
-        device=q.device,
+    query_starts = (
+        torch.arange(
+            0,
+            q_tile_count * 128,
+            128,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        if q_tile_count > 1
+        else None
     )
     chunk_size = 16
     workspaces = {}
@@ -1500,7 +1504,11 @@ def hstu_varlen_fwd_mxfp8_100(
                 window_size_left,
                 window_size_right,
                 key_start=key_start,
-                query_starts=query_starts[query_tile_idx:query_tile_end],
+                query_starts=(
+                    query_starts[query_tile_idx:query_tile_end]
+                    if query_starts is not None
+                    else None
+                ),
                 batch_heads_per_pair=batch_heads,
                 output=probability_workspace,
             )
