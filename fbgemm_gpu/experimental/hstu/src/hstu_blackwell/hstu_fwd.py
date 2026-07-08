@@ -567,6 +567,7 @@ class HSTUAttentionForwardSm100:
                 self.mma_tiler_qk[0]
                 * self.mma_tiler_qk[2]
                 * self.q_dtype.width
+                * cute.size(tiled_mma_qk.thr_id.shape)
                 // 8
             )
         if const_expr(self.is_mxfp8 and not self.debug):
