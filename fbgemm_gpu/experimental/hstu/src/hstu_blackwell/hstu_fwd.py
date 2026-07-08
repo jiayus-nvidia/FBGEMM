@@ -2937,9 +2937,9 @@ class HSTUAttentionForwardSm100:
         assert K_or_V in ("K", "V")
         tma_copy_bytes = self.tma_copy_k_bytes if const_expr(K_or_V == "K") else self.tma_copy_v_bytes
         stage, phase = producer_state.index, producer_state.phase
-        cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
         if const_expr(self.is_mxfp8):
             self.load_scale_g2s(raw_scale, sScale, block, stage)
+        cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
         if const_expr(K_or_V == "K" and self.uneven_kv_smem):
             # Before this round, the smem location was occupied by V, which is smaller than
             # K. So we need to wait for the stage after that (stage 1) to be empty as well.
