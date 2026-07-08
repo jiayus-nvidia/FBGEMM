@@ -2104,12 +2104,7 @@ class HSTUAttentionForwardSm100:
                 gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
             # 4. release S0
             with cute.arch.elect_one():
-                if const_expr(self.debug):
-                    cute.arch.mbarrier_arrive(
-                        mbar_ptr + self.mbar_S_full_offset + 0
-                    )
-                else:
-                    tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + 0)
+                tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + 0)
             mma_q_consumer_phase ^= 1
             # 5. release K0
             pipeline_kv.consumer_release(mma_kv_consumer_state)
@@ -2364,12 +2359,7 @@ class HSTUAttentionForwardSm100:
                     gemm_Pi[1](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 1, mbar_phase=P_full_O_rescaled_phase[1])
                 P_full_O_rescaled_phase[1] ^= 1
             with cute.arch.elect_one():
-                if const_expr(self.debug):
-                    cute.arch.mbarrier_arrive(
-                        mbar_ptr + self.mbar_O_full_offset
-                    )
-                else:
-                    tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
+                tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
             pipeline_kv.consumer_release(mma_kv_consumer_state)
             mma_kv_consumer_state.advance()
 
