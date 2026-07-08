@@ -17,7 +17,7 @@ def gemm(
     tCrB: cute.Tensor,
     zero_init: bool | cutlass.Boolean = False,
 ) -> cute.TiledMma:
-    for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+    for k in range(cute.size(tCrA.shape[2])):
         tiled_mma.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
     return tiled_mma
