@@ -1453,12 +1453,12 @@ class HSTUAttentionForwardSm100:
             output_load_atom, tStS
         ).get_slice(tidx)
         output_tmem = output_tmem_load.partition_S(tStS)
-        print("MXFP8 output TMEM partition", output_tmem.shape, output_tmem.layout)
-        output_values = cute.make_rmem_tensor(output_tmem.shape, Float32)
+        output_tmem_chunk = output_tmem[None, 0, None, None]
+        output_values = cute.make_rmem_tensor(output_tmem_chunk.shape, Float32)
         cute.arch.mbarrier_wait(
             mbar_ptr + self.mbar_O_full_offset, Int32(0)
         )
-        cute.copy(output_tmem_load, output_tmem, output_values)
+        cute.copy(output_tmem_load, output_tmem_chunk, output_values)
         cute.arch.fence_view_async_tmem_load()
         if tidx == 0:
             mO[0, 0, 0] = self.o_dtype(output_values[0] * Float32(1.0 / 128.0))
