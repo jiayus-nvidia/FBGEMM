@@ -1377,7 +1377,7 @@ def _gemm(
         )
     expected_shape = (m, n, output_batches)
     if output is None:
-        output = _matrix(m, n, batches, output_dtype, a.values.device)
+        output = _matrix(m, n, output_batches, output_dtype, a.values.device)
     elif output.shape != expected_shape or output.dtype != output_dtype:
         raise ValueError(
             f"invalid GEMM output {output.shape}/{output.dtype}, expected "
