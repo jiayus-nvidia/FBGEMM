@@ -3035,36 +3035,101 @@ class HSTUAttentionForwardSm100:
         async_copy_elems = universal_copy_bits // self.o_dtype.width
 
         if const_expr(self.debug):
-            if tidx < cute.arch.WARP_SIZE:
-                tOtO_stage = tOtO[None, None, None, 0]
-                tOtO_i = cute.logical_divide(
-                    tOtO_stage,
-                    cute.make_layout((self.kBlockM, async_copy_elems)),
-                )
-                scalar_tmem_atom = sm100_utils_basic.get_tmem_load_op(
-                    self.mma_tiler_pv,
-                    self.o_layout,
-                    self.o_dtype,
-                    self.pv_acc_dtype,
-                    (self.epi_tile[0], async_copy_elems),
-                    use_2cta_instrs=False,
-                )
-                scalar_tmem_load = tcgen05.make_tmem_copy(
-                    scalar_tmem_atom, tOtO_i[(None, None), 0]
-                )
-                scalar_thread = scalar_tmem_load.get_slice(tidx)
-                scalar_source = scalar_thread.partition_S(
-                    tOtO_i[(None, None), None]
-                )[None, 0, 0, 0]
-                scalar_value = cute.make_rmem_tensor(
-                    scalar_source.shape, self.pv_acc_dtype
-                )
-                cute.copy(scalar_tmem_load, scalar_source, scalar_value)
-                cute.arch.fence_view_async_tmem_load()
-                if tidx == 0:
-                    mO[0, 0, head_idx] = self.o_dtype(
-                        scalar_value[0] * Float32(1.0 / 128.0)
+            lane = tidx % cute.arch.WARP_SIZE
+            warp_group = tidx // cute.arch.WARP_SIZE
+            tOtO_stage = tOtO[None, None, None, 0]
+            tOtO_i = cute.logical_divide(
+                tOtO_stage,
+                cute.make_layout((self.kBlockM, async_copy_elems)),
+            )
+            tOsO = thr_mma_pv.partition_C(sO[None, None, stage])
+            tOsO_i = cute.logical_divide(
+                tOsO,
+                cute.make_layout((self.kBlockM, async_copy_elems)),
+            )
+            tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
+                self.mma_tiler_pv,
+                self.o_layout,
+                self.o_dtype,
+                self.pv_acc_dtype,
+                (self.epi_tile[0], async_copy_elems),
+                use_2cta_instrs=False,
+            )
+            tiled_tmem_load = tcgen05.make_tmem_copy(
+                tmem_copy_atom, tOtO_i[(None, None), 0]
+            )
+            thr_tmem_load = tiled_tmem_load.get_slice(lane)
+            smem_copy_atom = sm100_utils_basic.get_smem_store_op(
+                self.o_layout,
+                self.o_dtype,
+                self.pv_acc_dtype,
+                tiled_tmem_load,
+            )
+            tiled_smem_store = cute.make_tiled_copy_D(
+                smem_copy_atom, tiled_tmem_load
+            )
+            tOtO_t2r = thr_tmem_load.partition_S(
+                tOtO_i[(None, None), None]
+            )
+            tOsO_r2s = thr_tmem_load.partition_D(
+                tOsO_i[(None, None), None]
+            )
+            for subtile in cutlass.range_constexpr(
+                self.head_dim_v_padded // async_copy_elems
+            ):
+                if subtile % len(self.silu1_warp_ids) == warp_group:
+                    output_source = tOtO_t2r[None, 0, 0, subtile]
+                    output_destination = tOsO_r2s[
+                        None, 0, 0, subtile
+                    ]
+                    output_values = cute.make_rmem_tensor(
+                        output_destination.shape, self.pv_acc_dtype
                     )
+                    cute.copy(
+                        tiled_tmem_load, output_source, output_values
+                    )
+                    cute.arch.fence_view_async_tmem_load()
+                    for value_idx in cutlass.range_constexpr(
+                        cute.size(output_values)
+                    ):
+                        output_values[value_idx] = (
+                            output_values[value_idx] * Float32(1.0 / 128.0)
+                        )
+                    output_converted = cute.make_rmem_tensor(
+                        output_values.shape, self.o_dtype
+                    )
+                    output_converted.store(
+                        output_values.load().to(self.o_dtype)
+                    )
+                    cute.copy(
+                        tiled_smem_store,
+                        output_converted,
+                        output_destination,
+                    )
+            cute.arch.fence_view_async_shared()
+            cute.arch.barrier(
+                barrier_id=NamedBarrierFwd.Epilogue + stage,
+                number_of_threads=cute.arch.WARP_SIZE
+                * len(self.silu1_warp_ids),
+            )
+            gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+            tOsO_g2r = gmem_thr_copy_O.partition_S(
+                sO[None, None, stage]
+            )
+            tOrO = cute.make_fragment_like(tOsO_g2r, self.o_dtype)
+            tOgO = gmem_thr_copy_O.partition_D(gO)
+            for rest_m in cutlass.range_constexpr(
+                cute.size(tOrO.shape[1])
+            ):
+                cute.autovec_copy(
+                    tOsO_g2r[None, rest_m, None],
+                    tOrO[None, rest_m, None],
+                )
+                cute.copy(
+                    gmem_tiled_copy_O,
+                    tOrO[None, rest_m, None],
+                    tOgO[None, rest_m, None],
+                )
             return
             epi_subtile = sm100_utils_basic.compute_epilogue_tile_shape(
                 self.mma_tiler_pv,
