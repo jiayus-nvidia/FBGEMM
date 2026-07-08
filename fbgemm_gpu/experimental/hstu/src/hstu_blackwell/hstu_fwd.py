@@ -3044,6 +3044,7 @@ class HSTUAttentionForwardSm100:
             tOtO_epi = cute.flat_divide(
                 tOtO[((None, None), 0, 0, None)], epi_subtile
             )
+            gO_epi = cute.flat_divide(gO, epi_subtile)
             sO_epi = cute.flat_divide(
                 sO[None, None, stage], epi_subtile
             )
@@ -3060,6 +3061,7 @@ class HSTUAttentionForwardSm100:
             )
             thr_tmem_load = tiled_tmem_load.get_slice(tidx)
             tOtO_t2r = thr_tmem_load.partition_S(tOtO_epi)
+            tOgO_t2r = thr_tmem_load.partition_D(gO_epi)
             tOtO_t2r = tOtO_t2r[
                 None, None, None, None, None, 0
             ]
@@ -3089,7 +3091,8 @@ class HSTUAttentionForwardSm100:
                     None, None, None, subtile
                 ]
                 output_values = cute.make_rmem_tensor(
-                    output_destination.shape, self.pv_acc_dtype
+                    tOgO_t2r[None, None, None, 0, 0].shape,
+                    self.pv_acc_dtype,
                 )
                 cute.copy(tiled_tmem_load, output_source, output_values)
                 cute.arch.fence_view_async_tmem_load()
