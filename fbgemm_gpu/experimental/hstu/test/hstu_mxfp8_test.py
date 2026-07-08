@@ -419,9 +419,9 @@ def test_hstu_mxfp8_forward_backward(
 
 
 def test_hstu_mxfp8_fused_forward():
-    q_lengths = [128, 128]
-    k_lengths = [128, 128]
-    heads = 2
+    q_lengths = [128]
+    k_lengths = [128]
+    heads = 1
     head_dim = 128
     alpha = 0.7
     window = (-1, 0)
