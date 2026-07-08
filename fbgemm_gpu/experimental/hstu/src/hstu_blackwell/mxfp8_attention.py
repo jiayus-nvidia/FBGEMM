@@ -70,7 +70,8 @@ class VarlenUnpackSm100:
         num_heads: Int32,
         stream: cuda.CUstream,
     ):
-        seqlen, head_dim, batch_heads = dense.shape
+        tile_count, tile_size, head_dim, batch_heads = dense.shape
+        seqlen = tile_count * tile_size
         self.kernel(dense, cu_seqlens, output, num_heads).launch(
             grid=(cute.ceil_div(seqlen * head_dim, 256), batch_heads, 1),
             block=(256, 1, 1),
@@ -87,17 +88,22 @@ class VarlenUnpackSm100:
     ):
         thread, _, _ = cute.arch.thread_idx()
         block, batch_head, _ = cute.arch.block_idx()
-        seqlen, head_dim, _ = dense.shape
+        tile_count, tile_size, head_dim, _ = dense.shape
+        seqlen = tile_count * tile_size
         linear_idx = block * 256 + thread
         if linear_idx < seqlen * head_dim:
             row = linear_idx // head_dim
             dim = linear_idx - row * head_dim
+            tile_idx = row // tile_size
+            row_in_tile = row - tile_idx * tile_size
             batch = batch_head // num_heads
             head = batch_head - batch * num_heads
             offset = Int32(cu_seqlens[batch])
             length = Int32(cu_seqlens[batch + 1]) - offset
             if row < length:
-                output[offset + row, head, dim] = dense[row, dim, batch_head]
+                output[offset + row, head, dim] = dense[
+                    tile_idx, row_in_tile, dim, batch_head
+                ]
 
 
 @cute.jit
@@ -324,7 +330,11 @@ def _leading_dim(tensor: torch.Tensor) -> int:
 
 
 def _cute_tensor(tensor: torch.Tensor, *, element_type=None):
-    leading_dim = _leading_dim(tensor) if tensor.ndim == 3 else tensor.ndim - 1
+    leading_dim = (
+        _leading_dim(tensor)
+        if tensor.ndim == 3
+        else tuple(tensor.stride()).index(1)
+    )
     result = from_dlpack(tensor.detach(), assumed_align=16).mark_layout_dynamic(
         leading_dim=leading_dim
     )
@@ -345,6 +355,20 @@ def _mark_matrix(tensor: cute.Tensor, leading_dim: int) -> cute.Tensor:
 def _matrix(rows: int, columns: int, batches: int, dtype: torch.dtype, device):
     storage = torch.empty((batches, rows, columns), dtype=dtype, device=device)
     return storage.permute(1, 2, 0)
+
+
+def _tiled_matrix(
+    tile_count: int,
+    tile_size: int,
+    columns: int,
+    batches: int,
+    dtype: torch.dtype,
+    device,
+):
+    storage = torch.empty(
+        (tile_count, batches, tile_size, columns), dtype=dtype, device=device
+    )
+    return storage.permute(0, 2, 3, 1)
 
 
 def _matrix_with_major(
@@ -414,16 +438,17 @@ def _unpack(
     num_heads: int,
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    tile_count, tile_size, head_dim, _ = dense.shape
     if output is None:
         output = torch.empty(
-            (total_tokens, num_heads, dense.shape[1]),
+            (total_tokens, num_heads, head_dim),
             dtype=dense.dtype,
             device=dense.device,
         )
-    elif output.shape != (total_tokens, num_heads, dense.shape[1]):
+    elif output.shape != (total_tokens, num_heads, head_dim):
         raise ValueError(
             f"invalid output buffer shape {output.shape}, expected "
-            f"{(total_tokens, num_heads, dense.shape[1])}"
+            f"{(total_tokens, num_heads, head_dim)}"
         )
     dense_tensor = _cute_tensor(dense)
     offsets_tensor = from_dlpack(
@@ -435,8 +460,9 @@ def _unpack(
     stream = cutlass_torch.default_stream()
     key = (
         dense.dtype,
-        dense.shape[0],
-        dense.shape[1],
+        tile_count,
+        tile_size,
+        head_dim,
         num_heads,
         cu_seqlens.numel() - 1,
     )
@@ -797,11 +823,12 @@ def hstu_varlen_fwd_mxfp8_100(
     window_size_right = _normalize_window(window_size_right, max_seqlen_k)
     batch_heads = (cu_seqlens_q.numel() - 1) * num_heads
     head_dim = q.shape[2]
-    dense_output = _matrix(padded_q, head_dim, batch_heads, torch.bfloat16, q.device)
-
     q_tiles = _tiles(dense_q)
     k_tiles = _tiles(dense_k)
     v_tiles = _tiles(dense_v)
+    dense_output = _tiled_matrix(
+        len(q_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
+    )
     k_mx_tiles = [_quantize(tile) for tile in k_tiles]
     v_mx_tiles = [_quantize(_transpose(tile)) for tile in v_tiles]
 
@@ -831,7 +858,7 @@ def hstu_varlen_fwd_mxfp8_100(
             )
             is_last_key_tile = key_tile_idx + 1 == len(k_mx_tiles)
             output = (
-                dense_output[query_start : query_start + 128]
+                dense_output[query_tile_idx]
                 if is_last_key_tile
                 else output_accumulator
             )
@@ -910,9 +937,15 @@ def hstu_varlen_bwd_mxfp8_100(
         if len(k_mx_tiles) > 1
         else [None] * len(q_tiles)
     )
-    dense_dq = _matrix(padded_q, head_dim, batch_heads, torch.bfloat16, q.device)
-    dense_dk = _matrix(padded_k, head_dim, batch_heads, torch.bfloat16, q.device)
-    dense_dv = _matrix(padded_k, head_dim, batch_heads, torch.bfloat16, q.device)
+    dense_dq = _tiled_matrix(
+        len(q_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
+    )
+    dense_dk = _tiled_matrix(
+        len(k_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
+    )
+    dense_dv = _tiled_matrix(
+        len(k_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
+    )
 
     for key_tile_idx, (key_mx, keyt_mx, value_mx) in enumerate(
         zip(k_mx_tiles, kt_mx_tiles, v_mx_tiles)
@@ -963,7 +996,7 @@ def hstu_varlen_bwd_mxfp8_100(
                 doutt_mx,
                 gradient_dtype,
                 output=(
-                    dense_dv[key_start : key_start + 128]
+                    dense_dv[key_tile_idx]
                     if is_last_query_tile
                     else dv_accumulator
                 ),
@@ -974,7 +1007,7 @@ def hstu_varlen_bwd_mxfp8_100(
                 queryt_mx,
                 gradient_dtype,
                 output=(
-                    dense_dk[key_start : key_start + 128]
+                    dense_dk[key_tile_idx]
                     if is_last_query_tile
                     else dk_accumulator
                 ),
@@ -986,7 +1019,7 @@ def hstu_varlen_bwd_mxfp8_100(
                 keyt_mx,
                 torch.bfloat16 if is_last_key_tile else torch.float32,
                 output=(
-                    dense_dq[query_start : query_start + 128]
+                    dense_dq[query_tile_idx]
                     if is_last_key_tile
                     else dq_accumulators[query_tile_idx]
                 ),
