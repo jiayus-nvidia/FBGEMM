@@ -2836,12 +2836,14 @@ class HSTUAttentionForwardSm100:
         block: Int32,
         stage: Int32,
     ):
-        g_tile = g_scale[(None, None, block)]
-        s_tile = s_scale[(None, None, None, stage)]
-        tile_size = cute.cosize(s_tile.layout)
+        g_offset = cute.crd2idx((0, 0, block), g_scale.layout)
+        s_offset = cute.crd2idx((0, 0, 0, stage), s_scale.layout)
+        tile_size = cute.cosize(
+            cute.slice_(s_scale.layout, (None, None, None, 0))
+        )
         linear_layout = cute.make_layout(tile_size)
-        g_linear = cute.make_tensor(g_tile.iterator, linear_layout)
-        s_linear = cute.make_tensor(s_tile.iterator, linear_layout)
+        g_linear = cute.make_tensor(g_scale.iterator + g_offset, linear_layout)
+        s_linear = cute.make_tensor(s_scale.iterator + s_offset, linear_layout)
         lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
         for i in cutlass.range(lane, tile_size, cute.arch.WARP_SIZE):
             s_linear[i] = g_linear[i]
