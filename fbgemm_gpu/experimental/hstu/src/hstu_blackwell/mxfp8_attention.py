@@ -579,6 +579,73 @@ class SiluBackwardMaskQuantizeSm100:
                     ] = quantized_dscores_t_values[value_idx]
 
 
+class PairGradientReduceSm100:
+    @cute.jit
+    def __call__(
+        self,
+        dk_pairs: cute.Tensor,
+        dv_pairs: cute.Tensor,
+        dk_addend: cute.Tensor,
+        dv_addend: cute.Tensor,
+        dk_output: cute.Tensor,
+        dv_output: cute.Tensor,
+        batch_heads_per_pair: Int32,
+        accumulate: Int32,
+        stream: cuda.CUstream,
+    ):
+        rows, columns, pair_batches = dk_pairs.shape
+        self.kernel(
+            dk_pairs,
+            dv_pairs,
+            dk_addend,
+            dv_addend,
+            dk_output,
+            dv_output,
+            batch_heads_per_pair,
+            accumulate,
+        ).launch(
+            grid=(
+                cute.ceil_div(rows * columns, 256),
+                batch_heads_per_pair,
+                1,
+            ),
+            block=(256, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        dk_pairs: cute.Tensor,
+        dv_pairs: cute.Tensor,
+        dk_addend: cute.Tensor,
+        dv_addend: cute.Tensor,
+        dk_output: cute.Tensor,
+        dv_output: cute.Tensor,
+        batch_heads_per_pair: Int32,
+        accumulate: Int32,
+    ):
+        thread, _, _ = cute.arch.thread_idx()
+        block, batch_head, _ = cute.arch.block_idx()
+        rows, columns, pair_batches = dk_pairs.shape
+        linear_idx = block * 256 + thread
+        if linear_idx < rows * columns:
+            row = linear_idx // columns
+            column = linear_idx - row * columns
+            dk_value = Float32(0.0)
+            dv_value = Float32(0.0)
+            if accumulate != 0:
+                dk_value = Float32(dk_addend[row, column, batch_head])
+                dv_value = Float32(dv_addend[row, column, batch_head])
+            pair_count = pair_batches // batch_heads_per_pair
+            for pair_idx in cutlass.range(pair_count, unroll=1):
+                pair_batch = pair_idx * batch_heads_per_pair + batch_head
+                dk_value += Float32(dk_pairs[row, column, pair_batch])
+                dv_value += Float32(dv_pairs[row, column, pair_batch])
+            dk_output[row, column, batch_head] = dk_value
+            dv_output[row, column, batch_head] = dv_value
+
+
 @dataclass
 class _MxMatrix:
     values: torch.Tensor
@@ -592,6 +659,7 @@ _compile_cache = {
     "unpack": {},
     "silu_quantize": {},
     "silu_bwd_quantize": {},
+    "pair_gradient_reduce": {},
     "quantize": {},
     "gemm": {},
 }
@@ -1226,6 +1294,89 @@ def _run_silu_backward(
     return outputs[0], outputs[1], outputs[2]
 
 
+def _reduce_pair_gradients(
+    dk_pairs: torch.Tensor,
+    dv_pairs: torch.Tensor,
+    batch_heads_per_pair: int,
+    dk_output: torch.Tensor,
+    dv_output: torch.Tensor,
+    dk_addend: Optional[torch.Tensor] = None,
+    dv_addend: Optional[torch.Tensor] = None,
+) -> None:
+    if (
+        dk_pairs.shape != dv_pairs.shape
+        or dk_pairs.dtype != torch.float32
+        or dv_pairs.dtype != torch.float32
+    ):
+        raise ValueError("pair gradients must have matching FP32 shapes")
+    rows, columns, pair_batches = dk_pairs.shape
+    if pair_batches % batch_heads_per_pair != 0:
+        raise ValueError("pair gradient batches must contain complete pairs")
+    expected_output_shape = (rows, columns, batch_heads_per_pair)
+    if (
+        dk_output.shape != expected_output_shape
+        or dv_output.shape != expected_output_shape
+        or dk_output.dtype != dv_output.dtype
+    ):
+        raise ValueError("pair gradient outputs have incompatible shapes or dtypes")
+    accumulate = dk_addend is not None or dv_addend is not None
+    if accumulate:
+        if dk_addend is None or dv_addend is None:
+            raise ValueError("both pair gradient addends are required")
+        if (
+            dk_addend.shape != expected_output_shape
+            or dv_addend.shape != expected_output_shape
+            or dk_addend.dtype != torch.float32
+            or dv_addend.dtype != torch.float32
+        ):
+            raise ValueError("pair gradient addends must be matching FP32 tensors")
+    else:
+        dk_addend = dk_output
+        dv_addend = dv_output
+
+    dk_pairs_tensor = _cute_tensor(dk_pairs)
+    dv_pairs_tensor = _cute_tensor(dv_pairs)
+    dk_addend_tensor = _cute_tensor(dk_addend)
+    dv_addend_tensor = _cute_tensor(dv_addend)
+    dk_output_tensor = _cute_tensor(dk_output)
+    dv_output_tensor = _cute_tensor(dv_output)
+    stream = cutlass_torch.default_stream()
+    key = (
+        tuple(dk_pairs.shape),
+        tuple(dk_pairs.stride()),
+        tuple(dk_addend.stride()),
+        dk_addend.dtype,
+        tuple(dk_output.stride()),
+        dk_output.dtype,
+        batch_heads_per_pair,
+        accumulate,
+    )
+    if key not in _compile_cache["pair_gradient_reduce"]:
+        _compile_cache["pair_gradient_reduce"][key] = cute.compile(
+            PairGradientReduceSm100(),
+            dk_pairs_tensor,
+            dv_pairs_tensor,
+            dk_addend_tensor,
+            dv_addend_tensor,
+            dk_output_tensor,
+            dv_output_tensor,
+            Int32(batch_heads_per_pair),
+            Int32(accumulate),
+            stream,
+        )
+    _compile_cache["pair_gradient_reduce"][key](
+        dk_pairs_tensor,
+        dv_pairs_tensor,
+        dk_addend_tensor,
+        dv_addend_tensor,
+        dk_output_tensor,
+        dv_output_tensor,
+        Int32(batch_heads_per_pair),
+        Int32(accumulate),
+        stream,
+    )
+
+
 def hstu_varlen_fwd_mxfp8_100(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1418,12 +1569,16 @@ def hstu_varlen_bwd_mxfp8_100(
     dout_tiles = _tiles(dense_dout)
 
     q_mx_collection, _ = _quantize_tile_collection(dense_q)
-    qt_mx_tiles = _quantize_tiles(dense_q, transpose=True)
+    qt_mx_collection, qt_mx_tiles = _quantize_tile_collection(
+        dense_q, transpose=True
+    )
     k_mx_tiles = _quantize_tiles(dense_k)
     kt_mx_tiles = _quantize_tiles(dense_k, transpose=True)
     v_mx_tiles = _quantize_tiles(dense_v)
     dout_mx_collection, _ = _quantize_tile_collection(dense_dout)
-    doutt_mx_tiles = _quantize_tiles(dense_dout, transpose=True)
+    doutt_mx_collection, doutt_mx_tiles = _quantize_tile_collection(
+        dense_dout, transpose=True
+    )
 
     q_tile_count = len(q_tiles)
     combined_batches = q_tile_count * batch_heads
@@ -1454,12 +1609,16 @@ def hstu_varlen_bwd_mxfp8_100(
         if q_tile_count > 1
         else None
     )
-    query_starts = torch.arange(
-        0,
-        q_tile_count * 128,
-        128,
-        dtype=torch.int32,
-        device=q.device,
+    query_starts = (
+        torch.arange(
+            0,
+            q_tile_count * 128,
+            128,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        if q_tile_count > 1
+        else None
     )
     chunk_size = 16
     workspaces = {}
@@ -1498,10 +1657,28 @@ def hstu_varlen_bwd_mxfp8_100(
                         _mx_workspace((128, 128, workspace_batches), q.device)
                         for _ in range(3)
                     ),
+                    _matrix(
+                        128,
+                        head_dim,
+                        workspace_batches,
+                        torch.float32,
+                        q.device,
+                    ),
+                    _matrix(
+                        128,
+                        head_dim,
+                        workspace_batches,
+                        torch.float32,
+                        q.device,
+                    ),
                 )
-            score_workspace, dprobability_workspace, silu_workspaces = (
-                workspaces[pair_count]
-            )
+            (
+                score_workspace,
+                dprobability_workspace,
+                silu_workspaces,
+                dk_pair_workspace,
+                dv_pair_workspace,
+            ) = workspaces[pair_count]
             query_mx = _slice_mx_batches(
                 q_mx_collection, batch_start, batch_end
             )
@@ -1537,7 +1714,11 @@ def hstu_varlen_bwd_mxfp8_100(
                 window_size_left,
                 window_size_right,
                 key_start=key_start,
-                query_starts=query_starts[query_tile_idx:query_tile_end],
+                query_starts=(
+                    query_starts[query_tile_idx:query_tile_end]
+                    if query_starts is not None
+                    else None
+                ),
                 batch_heads_per_pair=batch_heads,
                 outputs=silu_workspaces,
             )
@@ -1559,45 +1740,58 @@ def hstu_varlen_bwd_mxfp8_100(
                 ),
             )
 
-            for pair_idx, current_query_tile in enumerate(
-                range(query_tile_idx, query_tile_end)
-            ):
-                pair_batch_start = pair_idx * batch_heads
-                pair_batch_end = pair_batch_start + batch_heads
-                probabilities_t_tile = _slice_mx_batches(
-                    probabilities_t_mx, pair_batch_start, pair_batch_end
-                )
-                dscores_t_tile = _slice_mx_batches(
-                    dscores_t_mx, pair_batch_start, pair_batch_end
-                )
-                is_last_query_tile = current_query_tile + 1 == q_tile_count
-                gradient_dtype = (
-                    torch.bfloat16 if is_last_query_tile else torch.float32
+            if q_tile_count == 1:
+                _gemm(
+                    probabilities_t_mx,
+                    doutt_mx_tiles[0],
+                    torch.bfloat16,
+                    output=dense_dv[key_tile_idx],
                 )
                 _gemm(
-                    probabilities_t_tile,
-                    doutt_mx_tiles[current_query_tile],
-                    gradient_dtype,
-                    output=(
-                        dense_dv[key_tile_idx]
-                        if is_last_query_tile
-                        else dv_accumulator
-                    ),
-                    addend=(
-                        dv_accumulator if current_query_tile > 0 else None
-                    ),
+                    dscores_t_mx,
+                    qt_mx_tiles[0],
+                    torch.bfloat16,
+                    output=dense_dk[key_tile_idx],
+                )
+            else:
+                queryt_chunk = _slice_mx_batches(
+                    qt_mx_collection, batch_start, batch_end
+                )
+                doutt_chunk = _slice_mx_batches(
+                    doutt_mx_collection, batch_start, batch_end
                 )
                 _gemm(
-                    dscores_t_tile,
-                    qt_mx_tiles[current_query_tile],
-                    gradient_dtype,
-                    output=(
+                    probabilities_t_mx,
+                    doutt_chunk,
+                    torch.float32,
+                    output=dv_pair_workspace,
+                )
+                _gemm(
+                    dscores_t_mx,
+                    queryt_chunk,
+                    torch.float32,
+                    output=dk_pair_workspace,
+                )
+                is_last_query_chunk = query_tile_end == q_tile_count
+                _reduce_pair_gradients(
+                    dk_pair_workspace,
+                    dv_pair_workspace,
+                    batch_heads,
+                    (
                         dense_dk[key_tile_idx]
-                        if is_last_query_tile
+                        if is_last_query_chunk
                         else dk_accumulator
                     ),
-                    addend=(
-                        dk_accumulator if current_query_tile > 0 else None
+                    (
+                        dense_dv[key_tile_idx]
+                        if is_last_query_chunk
+                        else dv_accumulator
+                    ),
+                    dk_addend=(
+                        dk_accumulator if query_tile_idx > 0 else None
+                    ),
+                    dv_addend=(
+                        dv_accumulator if query_tile_idx > 0 else None
                     ),
                 )
 
