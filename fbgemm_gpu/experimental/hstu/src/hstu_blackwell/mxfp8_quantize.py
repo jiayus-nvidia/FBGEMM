@@ -125,6 +125,132 @@ class MxFp8QuantizeSm100:
                     quantized[row, reduction_idx, batch] = quantized_values[value_idx]
 
 
+class MxFp8QuantizePairSm100:
+    """Quantize two same-shaped matrices in one launch."""
+
+    @cute.jit
+    def __call__(
+        self,
+        source_a: cute.Tensor,
+        source_b: cute.Tensor,
+        quantized_a: cute.Tensor,
+        quantized_b: cute.Tensor,
+        scale_storage_a: cute.Tensor,
+        scale_storage_b: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        scale_layout = blockscaled_utils.tile_atom_to_shape_SF(
+            source_a.shape, MXFP8_BLOCK_SIZE
+        )
+        scales_a = cute.make_tensor(
+            cute.recast_ptr(scale_storage_a.iterator, dtype=cutlass.Uint8),
+            scale_layout,
+        )
+        scales_b = cute.make_tensor(
+            cute.recast_ptr(scale_storage_b.iterator, dtype=cutlass.Uint8),
+            scale_layout,
+        )
+        rows, reduction, batches = source_a.shape
+        blocks_per_row = cute.ceil_div(reduction, MXFP8_BLOCK_SIZE)
+        self.kernel(
+            source_a,
+            source_b,
+            quantized_a,
+            quantized_b,
+            scales_a,
+            scales_b,
+            rows,
+            reduction,
+        ).launch(
+            grid=(rows * blocks_per_row, batches, 1),
+            block=(cute.arch.WARP_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        source_a: cute.Tensor,
+        source_b: cute.Tensor,
+        quantized_a: cute.Tensor,
+        quantized_b: cute.Tensor,
+        scales_a: cute.Tensor,
+        scales_b: cute.Tensor,
+        rows: Int32,
+        reduction: Int32,
+    ):
+        lane, _, _ = cute.arch.thread_idx()
+        block, batch, _ = cute.arch.block_idx()
+        blocks_per_row = cute.ceil_div(reduction, MXFP8_BLOCK_SIZE)
+        row = block // blocks_per_row
+        reduction_block = block - row * blocks_per_row
+        first_reduction_idx = reduction_block * MXFP8_BLOCK_SIZE + lane * 4
+
+        values_a = cute.make_rmem_tensor((4,), Float32)
+        values_b = cute.make_rmem_tensor((4,), Float32)
+        local_amax_a = Float32(0.0)
+        local_amax_b = Float32(0.0)
+        for value_idx in cutlass.range_constexpr(4):
+            reduction_idx = first_reduction_idx + value_idx
+            value_a = Float32(0.0)
+            value_b = Float32(0.0)
+            if lane < 8 and reduction_idx < reduction:
+                value_a = Float32(source_a[row, reduction_idx, batch])
+                value_b = Float32(source_b[row, reduction_idx, batch])
+            values_a[value_idx] = value_a
+            values_b[value_idx] = value_b
+            local_amax_a = cute.arch.fmax(
+                local_amax_a, cute.arch.fmax(value_a, -value_a)
+            )
+            local_amax_b = cute.arch.fmax(
+                local_amax_b, cute.arch.fmax(value_b, -value_b)
+            )
+
+        block_amax_a = cute.arch.warp_reduction_max(local_amax_a)
+        block_amax_b = cute.arch.warp_reduction_max(local_amax_b)
+        min_amax = 2.0**-126 * E4M3_MAX
+        log_scale_a = cute.math.log2(
+            cute.arch.fmax(block_amax_a, min_amax) / E4M3_MAX
+        )
+        log_scale_b = cute.math.log2(
+            cute.arch.fmax(block_amax_b, min_amax) / E4M3_MAX
+        )
+        scale_exponent_a = Int32(log_scale_a)
+        scale_exponent_b = Int32(log_scale_b)
+        if log_scale_a > Float32(scale_exponent_a):
+            scale_exponent_a += 1
+        if log_scale_b > Float32(scale_exponent_b):
+            scale_exponent_b += 1
+        scale_exponent_a = cutlass.max(-126, cutlass.min(scale_exponent_a, 127))
+        scale_exponent_b = cutlass.max(-126, cutlass.min(scale_exponent_b, 127))
+        scale_a = cute.math.exp2(Float32(scale_exponent_a))
+        scale_b = cute.math.exp2(Float32(scale_exponent_b))
+
+        if lane == 0:
+            scale_idx = reduction_block * MXFP8_BLOCK_SIZE
+            scales_a[row, scale_idx, batch] = cutlass.Uint8(scale_exponent_a + 127)
+            scales_b[row, scale_idx, batch] = cutlass.Uint8(scale_exponent_b + 127)
+
+        quantized_values_a = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
+        quantized_values_b = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
+        quantized_values_a.store(
+            (values_a.load() / scale_a).to(cutlass.Float8E4M3FN)
+        )
+        quantized_values_b.store(
+            (values_b.load() / scale_b).to(cutlass.Float8E4M3FN)
+        )
+        if lane < 8:
+            for value_idx in cutlass.range_constexpr(4):
+                reduction_idx = first_reduction_idx + value_idx
+                if reduction_idx < reduction:
+                    quantized_a[row, reduction_idx, batch] = quantized_values_a[
+                        value_idx
+                    ]
+                    quantized_b[row, reduction_idx, batch] = quantized_values_b[
+                        value_idx
+                    ]
+
+
 class MxFp8DequantizeSm100:
     """Dequantize an MXFP8 tensor, primarily for numerical validation."""
 

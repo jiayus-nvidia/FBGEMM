@@ -17,6 +17,7 @@ from .mxfp8_blockscaled_gemm import Sm100BlockScaledPersistentDenseGemmKernel
 from .mxfp8_quantize import (
     E4M3_MAX,
     MXFP8_BLOCK_SIZE,
+    MxFp8QuantizePairSm100,
     MxFp8QuantizeSm100,
     scale_factor_storage_size,
 )
@@ -414,6 +415,7 @@ _compile_cache = {
     "silu_quantize": {},
     "silu_bwd_quantize": {},
     "quantize": {},
+    "quantize_pair": {},
     "gemm": {},
 }
 
@@ -622,6 +624,75 @@ def _quantize(matrix: torch.Tensor) -> _MxMatrix:
         )
     _compile_cache["quantize"][key](source_tensor, values_tensor, scales_tensor, stream)
     return _MxMatrix(values, scales)
+
+
+def _quantize_pair(
+    matrix_a: torch.Tensor, matrix_b: torch.Tensor
+) -> tuple[_MxMatrix, _MxMatrix]:
+    if matrix_a.shape != matrix_b.shape:
+        raise ValueError(
+            f"paired quantization requires equal shapes, got "
+            f"{matrix_a.shape} and {matrix_b.shape}"
+        )
+    rows, reduction, batches = matrix_a.shape
+    logical_scale_count = (
+        rows * ((reduction + MXFP8_BLOCK_SIZE - 1) // MXFP8_BLOCK_SIZE) * batches
+    )
+    scale_storage_size = scale_factor_storage_size(rows, reduction, batches)
+    if scale_storage_size != logical_scale_count:
+        raise ValueError("paired quantization requires unpadded scale storage")
+
+    outputs = []
+    output_tensors = []
+    for matrix in (matrix_a, matrix_b):
+        leading_dim = _leading_dim(matrix)
+        values = _matrix_with_major(
+            *matrix.shape, torch.uint8, matrix.device, leading_dim
+        )
+        scales = torch.empty(
+            scale_storage_size, dtype=torch.uint8, device=matrix.device
+        )
+        outputs.append(_MxMatrix(values, scales))
+        output_tensors.extend(
+            (
+                _mark_matrix(
+                    _cute_tensor(values, element_type=cutlass.Float8E4M3FN),
+                    leading_dim,
+                ),
+                _cute_tensor(scales, element_type=cutlass.Float8E8M0FNU),
+            )
+        )
+
+    source_tensors = (_cute_tensor(matrix_a), _cute_tensor(matrix_b))
+    stream = cutlass_torch.default_stream()
+    key = (
+        matrix_a.dtype,
+        tuple(matrix_a.shape),
+        tuple(matrix_a.stride()),
+        matrix_b.dtype,
+        tuple(matrix_b.stride()),
+    )
+    if key not in _compile_cache["quantize_pair"]:
+        _compile_cache["quantize_pair"][key] = cute.compile(
+            MxFp8QuantizePairSm100(),
+            source_tensors[0],
+            source_tensors[1],
+            output_tensors[0],
+            output_tensors[2],
+            output_tensors[1],
+            output_tensors[3],
+            stream,
+        )
+    _compile_cache["quantize_pair"][key](
+        source_tensors[0],
+        source_tensors[1],
+        output_tensors[0],
+        output_tensors[2],
+        output_tensors[1],
+        output_tensors[3],
+        stream,
+    )
+    return outputs[0], outputs[1]
 
 
 def _gemm(
@@ -1114,13 +1185,16 @@ def hstu_varlen_bwd_mxfp8_100(
                 probabilities=scores,
                 dscores=dprobabilities,
             )
+            probabilities_t_mx, dscores_t_mx = _quantize_pair(
+                _transpose(scores), _transpose(dprobabilities)
+            )
 
             is_last_query_tile = query_tile_idx + 1 == len(q_mx_tiles)
             gradient_dtype = (
                 torch.bfloat16 if is_last_query_tile else torch.float32
             )
             _gemm(
-                _quantize(_transpose(scores)),
+                probabilities_t_mx,
                 doutt_mx,
                 gradient_dtype,
                 output=(
@@ -1131,7 +1205,7 @@ def hstu_varlen_bwd_mxfp8_100(
                 addend=dv_accumulator if query_tile_idx > 0 else None,
             )
             _gemm(
-                _quantize(_transpose(dprobabilities)),
+                dscores_t_mx,
                 queryt_mx,
                 gradient_dtype,
                 output=(
