@@ -2068,9 +2068,6 @@ class HSTUAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         if const_expr(self.debug):
-            cute.arch.mbarrier_wait(
-                mbar_ptr + self.mbar_load_q_full_offset, mma_q_consumer_phase
-            )
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(
                     mbar_ptr + self.mbar_load_q_empty_offset
