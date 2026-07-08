@@ -3114,6 +3114,7 @@ class HSTUAttentionForwardSm100:
                     output_destination,
                 )
             cute.arch.fence_view_async_shared()
+            return
             cute.arch.barrier(
                 barrier_id=NamedBarrierFwd.Epilogue + stage,
                 number_of_threads=cute.arch.WARP_SIZE
