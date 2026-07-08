@@ -326,6 +326,25 @@ class HSTUAttentionForwardSm100:
                 self.mma_tiler_pv[:2],
                 p_source,
             )
+            tiled_mma_qk_compute = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                self.q_dtype,
+                self.q_major_mode,
+                self.k_major_mode,
+                self.sf_dtype,
+                self.sf_vec_size,
+                cta_group,
+                self.mma_tiler_qk[:2],
+            )
+            tiled_mma_pv_compute = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                self.v_dtype,
+                p_major_mode,
+                self.v_major_mode,
+                self.sf_dtype,
+                self.sf_vec_size,
+                cta_group,
+                self.mma_tiler_pv[:2],
+                p_source,
+            )
         else:
             tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
                 self.q_dtype,
@@ -344,6 +363,8 @@ class HSTUAttentionForwardSm100:
                 self.mma_tiler_pv[:2],
                 p_source,
             )
+            tiled_mma_qk_compute = tiled_mma_qk
+            tiled_mma_pv_compute = tiled_mma_pv
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -666,6 +687,8 @@ class HSTUAttentionForwardSm100:
             gmem_tiled_copy_O,
             tiled_mma_qk,
             tiled_mma_pv,
+            tiled_mma_qk_compute,
+            tiled_mma_pv_compute,
             tile_sched_params,
             buffers,
             fastdiv_mods,
@@ -723,6 +746,8 @@ class HSTUAttentionForwardSm100:
         gmem_tiled_copy_O: cute.TiledCopy,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
+        tiled_mma_qk_compute: cute.TiledMma,
+        tiled_mma_pv_compute: cute.TiledMma,
         tile_sched_params: ParamsBase,
         buffers = None,
         fastdiv_mods = (None, None),
@@ -1069,8 +1094,8 @@ class HSTUAttentionForwardSm100:
             else:
                 if const_expr(self.is_mxfp8):
                     self.mma_intraoverlap(
-                        tiled_mma_qk,
-                        tiled_mma_pv,
+                        tiled_mma_qk_compute,
+                        tiled_mma_pv_compute,
                         sQ,
                         sK,
                         sV,
