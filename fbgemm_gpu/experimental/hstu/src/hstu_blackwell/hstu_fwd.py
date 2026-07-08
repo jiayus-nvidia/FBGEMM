@@ -738,10 +738,10 @@ class HSTUAttentionForwardSm100:
         tma_atom_QScale: Optional[cute.CopyAtom] = None,
         tma_atom_KScale: Optional[cute.CopyAtom] = None,
         tma_atom_VScale: Optional[cute.CopyAtom] = None,
-        sQScale_layout: Optional[cute.ComposedLayout] = None,
-        sKScale_layout: Optional[cute.ComposedLayout] = None,
-        sPScale_layout: Optional[cute.ComposedLayout] = None,
-        sVScale_layout: Optional[cute.ComposedLayout] = None,
+        sQScale_layout: Optional[cute.Layout] = None,
+        sKScale_layout: Optional[cute.Layout] = None,
+        sPScale_layout: Optional[cute.Layout] = None,
+        sVScale_layout: Optional[cute.Layout] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
