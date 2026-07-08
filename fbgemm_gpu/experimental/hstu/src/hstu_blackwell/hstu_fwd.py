@@ -2091,15 +2091,6 @@ class HSTUAttentionForwardSm100:
                     cute.arch.mbarrier_arrive(
                         mbar_ptr + self.mbar_load_kv_empty_offset + Ki_index
                     )
-                mma_kv_consumer_state.advance()
-                pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                Vi_index = mma_kv_consumer_state.index
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(
-                        mbar_ptr + self.mbar_load_kv_empty_offset + Vi_index
-                    )
-                mma_kv_consumer_state.advance()
-
         while work_tile.is_valid_tile and not self.debug:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
