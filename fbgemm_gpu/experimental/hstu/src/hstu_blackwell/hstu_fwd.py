@@ -2844,8 +2844,9 @@ class HSTUAttentionForwardSm100:
         )
         lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
         for i in cutlass.range(lane, cute.size(s_compact), cute.arch.WARP_SIZE):
-            coord = cute.idx2crd(i, s_compact.shape)
-            s_compact[coord] = g_compact[coord]
+            src_coord = cute.idx2crd(i, g_compact.shape)
+            dst_coord = cute.idx2crd(i, s_compact.shape)
+            s_compact[dst_coord] = g_compact[src_coord]
         cute.arch.sync_warp()
 
     @cute.jit
