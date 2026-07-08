@@ -944,8 +944,16 @@ class HSTUAttentionForwardSm100:
                                  assumed_align=16)
         tStS = cute.make_tensor(tmem_ptr, tStS_fake.layout)
 
-        pv_acc_shape = thr_mma_pv.partition_shape_C((self.mma_tiler_pv[0], self.mma_tiler_pv[1]))
-        tOtO = thr_mma_pv.make_fragment_C(pv_acc_shape)
+        if const_expr(self.is_mxfp8):
+            pv_acc_shape = tiled_mma_pv.partition_shape_C(
+                (self.mma_tiler_pv[0], self.mma_tiler_pv[1])
+            )
+            tOtO = tiled_mma_pv.make_fragment_C(pv_acc_shape)
+        else:
+            pv_acc_shape = thr_mma_pv.partition_shape_C(
+                (self.mma_tiler_pv[0], self.mma_tiler_pv[1])
+            )
+            tOtO = thr_mma_pv.make_fragment_C(pv_acc_shape)
 
         tStSs = tuple(cute.make_tensor(tStS.iterator + self.tmem_s_offset[stage], tStS.layout)
                       for stage in range(self.s_stage))
@@ -1366,7 +1374,14 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
                 if const_expr(self.debug and self.is_mxfp8):
-                    pass
+                    store_O(
+                        seqlen=SeqlenInfoCls(Int32(0)),
+                        scale=Float32(1.0 / 128.0),
+                        m_block=Int32(0),
+                        head_idx=Int32(0),
+                        stage=0,
+                        epi_consumer_phase=Int32(0),
+                    )
                 elif const_expr(not self.debug):
                     silu_loop(stage=1, tStSi=silu_tStSs[1])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
@@ -2408,47 +2423,6 @@ class HSTUAttentionForwardSm100:
                     tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
                 with cute.arch.elect_one():
                     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
-                cute.arch.mbarrier_wait(
-                    mbar_ptr + self.mbar_O_full_offset, Int32(0)
-                )
-                lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
-                async_copy_elems = 128 // self.o_dtype.width
-                tOtO_i = cute.logical_divide(
-                    debug_tOtO,
-                    cute.make_layout(
-                        (self.kBlockM, async_copy_elems)
-                    ),
-                )
-                tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
-                    self.mma_tiler_pv,
-                    self.o_layout,
-                    self.o_dtype,
-                    self.pv_acc_dtype,
-                    (self.epi_tile[0], async_copy_elems),
-                    use_2cta_instrs=False,
-                )
-                tiled_tmem_load = tcgen05.make_tmem_copy(
-                    tmem_copy_atom, tOtO_i[(None, None), 0]
-                )
-                inv_seqlen = Float32(1.0 / 128.0)
-                for warp_group in cutlass.range_constexpr(1):
-                    virtual_tidx = lane + warp_group * cute.arch.WARP_SIZE
-                    thr_tmem_load = tiled_tmem_load.get_slice(virtual_tidx)
-                    tOtO_t2r = thr_tmem_load.partition_S(
-                        tOtO_i[(None, None), None]
-                    )
-                    for subtile in cutlass.range_constexpr(1):
-                        output_source = tOtO_t2r[None, 0, 0, subtile]
-                        output_values = cute.make_rmem_tensor(
-                            output_source.shape, self.pv_acc_dtype
-                        )
-                        cute.copy(
-                            tiled_tmem_load, output_source, output_values
-                        )
-                        cute.arch.fence_view_async_tmem_load()
-                        mO[lane, 0, 0] = self.o_dtype(
-                            output_values[0] * inv_seqlen
-                        )
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
@@ -3084,9 +3058,6 @@ class HSTUAttentionForwardSm100:
             tOrO_frg_cvt = cute.make_rmem_tensor(tOrO_frg.shape, self.o_dtype)
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
             cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
-
-        if const_expr(self.debug):
-            return
 
         cute.arch.barrier(barrier_id=NamedBarrierFwd.Epilogue + stage, number_of_threads=cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
 
