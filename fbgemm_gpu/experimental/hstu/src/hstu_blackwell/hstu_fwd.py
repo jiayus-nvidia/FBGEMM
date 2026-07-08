@@ -68,7 +68,7 @@ class HSTUAttentionForwardSm100:
         self.is_mxfp8 = is_mxfp8
         self.q_stage = 1 if self.head_dim_padded >= 256 or is_mxfp8 else 2
         self.s_stage = 2 # score stage for intra-warp overlap
-        self.debug = False
+        self.debug = True
         assert self.q_stage in [1, 2]
         assert self.s_stage in [2]
 
@@ -2321,11 +2321,12 @@ class HSTUAttentionForwardSm100:
                         v_scale_s[(None, None, None, None, Vi_index)],
                         v_scale_t,
                     )
-                    gemm_Pi[0](
-                        tCrB=tOrVi,
-                        sB=sV_cur,
-                        zero_init=not O_should_accumulate,
-                    )
+                    if const_expr(not self.debug):
+                        gemm_Pi[0](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            zero_init=not O_should_accumulate,
+                        )
                 else:
                     gemm_Pi[0](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 0, mbar_phase=P_full_O_rescaled_phase[0])
                 P_full_O_rescaled_phase[0] ^= 1
@@ -2347,16 +2348,22 @@ class HSTUAttentionForwardSm100:
                         v_scale_s[(None, None, None, None, Vi_index)],
                         v_scale_t,
                     )
-                    gemm_Pi[1](
-                        tCrB=tOrVi,
-                        sB=sV_cur,
-                        zero_init=not O_should_accumulate,
-                    )
+                    if const_expr(not self.debug):
+                        gemm_Pi[1](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            zero_init=not O_should_accumulate,
+                        )
                 else:
                     gemm_Pi[1](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 1, mbar_phase=P_full_O_rescaled_phase[1])
                 P_full_O_rescaled_phase[1] ^= 1
             with cute.arch.elect_one():
-                tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
+                if const_expr(self.debug):
+                    cute.arch.mbarrier_arrive(
+                        mbar_ptr + self.mbar_O_full_offset
+                    )
+                else:
+                    tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
             pipeline_kv.consumer_release(mma_kv_consumer_state)
             mma_kv_consumer_state.advance()
 
