@@ -512,66 +512,63 @@ def gemm_ptx_blockscaled_ss(
         for k in range(cute.size(tCrB.shape[2]))
     ]
 
-    assert cute.size(tCrA.shape[2]) == 4
-    accumulate = (
-        int(not zero_init)
-        if isinstance(zero_init, bool)
-        else cutlass.Int32(zero_init) ^ 1
-    )
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(smem_desc_start_a_lo).ir_value(),
-            cutlass.Int32(smem_desc_start_b_lo).ir_value(),
-            cutlass.Int32(accumulate).ir_value(),
-            cutlass.Int32(tSFA[None, None, 0].iterator.toint()).ir_value(),
-            cutlass.Int32(tSFB[None, None, 0].iterator.toint()).ir_value(),
-            cutlass.Int32(tSFA[None, None, 1].iterator.toint()).ir_value(),
-            cutlass.Int32(tSFB[None, None, 1].iterator.toint()).ir_value(),
-            cutlass.Int32(tSFA[None, None, 2].iterator.toint()).ir_value(),
-            cutlass.Int32(tSFB[None, None, 2].iterator.toint()).ir_value(),
-            cutlass.Int32(tSFA[None, None, 3].iterator.toint()).ir_value(),
-            cutlass.Int32(tSFB[None, None, 3].iterator.toint()).ir_value(),
-            cutlass.Int32(acc_tmem_addr).ir_value(),
-        ],
-        "{\n\t"
-        ".reg .pred leader_thread;\n\t"
-        ".reg .pred p;\n\t"
-        ".reg .b32 idesc, sf_id;\n\t"
-        ".reg .b32 tmem_acc, tmem_sfa, tmem_sfb;\n\t"
-        ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
-        ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
-        "elect.sync _|leader_thread, -1;\n\t"
-        "mov.b32 tmem_acc, $11;\n\t"
-        f"mov.b32 idesc, {hex(idesc)};\n\t"
-        "mov.b32 smem_desc_a_lo, $0;\n\t"
-        "mov.b32 smem_desc_b_lo, $1;\n\t"
-        f"mov.b64 smem_desc_a, {{smem_desc_a_lo, {hex(smem_desc_a_hi)}}};\n\t"
-        f"mov.b64 smem_desc_b, {{smem_desc_b_lo, {hex(smem_desc_b_hi)}}};\n\t"
-        "mov.b32 tmem_sfa, $3;\n\t"
-        "mov.b32 tmem_sfb, $4;\n\t"
-        "shr.u32 sf_id, tmem_sfa, 30;\n\tshl.b32 sf_id, sf_id, 29;\n\tor.b32 idesc, idesc, sf_id;\n\t"
-        "shr.u32 sf_id, tmem_sfb, 30;\n\tshl.b32 sf_id, sf_id, 4;\n\tor.b32 idesc, idesc, sf_id;\n\t"
-        "setp.ne.b32 p, $2, 0;\n\t"
-        "@leader_thread tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sfa], [tmem_sfb], p;\n\t"
-        f"mov.b32 idesc, {hex(idesc)};\n\tadd.u32 smem_desc_a_lo, $0, {hex(offset_a[1])};\n\tadd.u32 smem_desc_b_lo, $1, {hex(offset_b[1])};\n\t"
-        f"mov.b64 smem_desc_a, {{smem_desc_a_lo, {hex(smem_desc_a_hi)}}};\n\tmov.b64 smem_desc_b, {{smem_desc_b_lo, {hex(smem_desc_b_hi)}}};\n\t"
-        "mov.b32 tmem_sfa, $5;\n\tmov.b32 tmem_sfb, $6;\n\tshr.u32 sf_id, tmem_sfa, 30;\n\tshl.b32 sf_id, sf_id, 29;\n\tor.b32 idesc, idesc, sf_id;\n\tshr.u32 sf_id, tmem_sfb, 30;\n\tshl.b32 sf_id, sf_id, 4;\n\tor.b32 idesc, idesc, sf_id;\n\t"
-        "@leader_thread tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sfa], [tmem_sfb], 1;\n\t"
-        f"mov.b32 idesc, {hex(idesc)};\n\tadd.u32 smem_desc_a_lo, $0, {hex(offset_a[2])};\n\tadd.u32 smem_desc_b_lo, $1, {hex(offset_b[2])};\n\t"
-        f"mov.b64 smem_desc_a, {{smem_desc_a_lo, {hex(smem_desc_a_hi)}}};\n\tmov.b64 smem_desc_b, {{smem_desc_b_lo, {hex(smem_desc_b_hi)}}};\n\t"
-        "mov.b32 tmem_sfa, $7;\n\tmov.b32 tmem_sfb, $8;\n\tshr.u32 sf_id, tmem_sfa, 30;\n\tshl.b32 sf_id, sf_id, 29;\n\tor.b32 idesc, idesc, sf_id;\n\tshr.u32 sf_id, tmem_sfb, 30;\n\tshl.b32 sf_id, sf_id, 4;\n\tor.b32 idesc, idesc, sf_id;\n\t"
-        "@leader_thread tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sfa], [tmem_sfb], 1;\n\t"
-        f"mov.b32 idesc, {hex(idesc)};\n\tadd.u32 smem_desc_a_lo, $0, {hex(offset_a[3])};\n\tadd.u32 smem_desc_b_lo, $1, {hex(offset_b[3])};\n\t"
-        f"mov.b64 smem_desc_a, {{smem_desc_a_lo, {hex(smem_desc_a_hi)}}};\n\tmov.b64 smem_desc_b, {{smem_desc_b_lo, {hex(smem_desc_b_hi)}}};\n\t"
-        "mov.b32 tmem_sfa, $9;\n\tmov.b32 tmem_sfb, $10;\n\tshr.u32 sf_id, tmem_sfa, 30;\n\tshl.b32 sf_id, sf_id, 29;\n\tor.b32 idesc, idesc, sf_id;\n\tshr.u32 sf_id, tmem_sfb, 30;\n\tshl.b32 sf_id, sf_id, 4;\n\tor.b32 idesc, idesc, sf_id;\n\t"
-        "@leader_thread tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sfa], [tmem_sfb], 1;\n\t"
-        "}\n",
-        "r,r,r,r,r,r,r,r,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    for k in range(cute.size(tCrA.shape[2])):
+        smem_desc_a_lo = smem_desc_start_a_lo + offset_a[k]
+        smem_desc_b_lo = smem_desc_start_b_lo + offset_b[k]
+        if k == 0:
+            accumulate = (
+                int(not zero_init)
+                if isinstance(zero_init, bool)
+                else cutlass.Int32(zero_init) ^ 1
+            )
+        else:
+            accumulate = 1
+        llvm.inline_asm(
+            None,
+            [
+                cutlass.Int32(smem_desc_a_lo).ir_value(),
+                cutlass.Int32(smem_desc_b_lo).ir_value(),
+                cutlass.Int32(accumulate).ir_value(),
+                cutlass.Int32(
+                    tSFA[None, None, k].iterator.toint()
+                ).ir_value(),
+                cutlass.Int32(
+                    tSFB[None, None, k].iterator.toint()
+                ).ir_value(),
+                cutlass.Int32(acc_tmem_addr).ir_value(),
+            ],
+            "{\n\t"
+            ".reg .pred leader_thread;\n\t"
+            ".reg .pred p;\n\t"
+            ".reg .b32 idesc, sf_id;\n\t"
+            ".reg .b32 tmem_acc, tmem_sfa, tmem_sfb;\n\t"
+            ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+            ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
+            "elect.sync _|leader_thread, -1;\n\t"
+            f"mov.b32 idesc, {hex(idesc)};\n\t"
+            "mov.b32 tmem_acc, $5;\n\t"
+            "mov.b32 smem_desc_a_lo, $0;\n\t"
+            "mov.b32 smem_desc_b_lo, $1;\n\t"
+            f"mov.b64 smem_desc_a, {{smem_desc_a_lo, {hex(smem_desc_a_hi)}}};\n\t"
+            f"mov.b64 smem_desc_b, {{smem_desc_b_lo, {hex(smem_desc_b_hi)}}};\n\t"
+            "mov.b32 tmem_sfa, $3;\n\t"
+            "mov.b32 tmem_sfb, $4;\n\t"
+            "shr.u32 sf_id, tmem_sfa, 30;\n\t"
+            "shl.b32 sf_id, sf_id, 29;\n\t"
+            "or.b32 idesc, idesc, sf_id;\n\t"
+            "shr.u32 sf_id, tmem_sfb, 30;\n\t"
+            "shl.b32 sf_id, sf_id, 4;\n\t"
+            "or.b32 idesc, idesc, sf_id;\n\t"
+            "setp.ne.b32 p, $2, 0;\n\t"
+            "@leader_thread tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X "
+            "[tmem_acc], smem_desc_a, smem_desc_b, idesc, "
+            "[tmem_sfa], [tmem_sfb], p;\n\t"
+            "}\n",
+            "r,r,r,r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
 
 
 @cute.jit
