@@ -546,7 +546,7 @@ class HSTUAttentionForwardSm100:
         self.tma_copy_q_bytes = cute.size_in_bytes(self.q_dtype, cute.select(sQ_layout, mode=[0, 1, 2]))
         self.tma_copy_k_bytes = cute.size_in_bytes(self.k_dtype, cute.select(sK_layout, mode=[0, 1, 2]))
         self.tma_copy_v_bytes = cute.size_in_bytes(self.v_dtype, cute.select(sV_layout, mode=[0, 1, 2]))
-        if const_expr(self.is_mxfp8):
+        if const_expr(self.is_mxfp8 and not self.debug):
             self.tma_copy_q_bytes += cute.size_in_bytes(
                 self.sf_dtype,
                 cute.filter_zeros(cute.slice_(sQScale_layout, (None, None, None, 0))),
@@ -2751,7 +2751,7 @@ class HSTUAttentionForwardSm100:
         cute.copy(
             tma_atom, tQgQ[None, block], tQsQ[None, stage], tma_bar_ptr=mbar_full_ptr + stage
         )
-        if const_expr(self.is_mxfp8):
+        if const_expr(self.is_mxfp8 and not self.debug):
             cute.copy(
                 scale_atom,
                 tGScale[(None, block)],
