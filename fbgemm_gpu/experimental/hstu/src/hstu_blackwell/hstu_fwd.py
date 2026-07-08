@@ -2098,12 +2098,18 @@ class HSTUAttentionForwardSm100:
                     k_scale_s[(None, None, None, None, Ki_index)],
                     k_scale_t,
                 )
-                gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
+                if const_expr(not self.debug):
+                    gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
             else:
                 gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
             # 4. release S0
             with cute.arch.elect_one():
-                tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + 0)
+                if const_expr(self.debug):
+                    cute.arch.mbarrier_arrive(
+                        mbar_ptr + self.mbar_S_full_offset + 0
+                    )
+                else:
+                    tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + 0)
             mma_q_consumer_phase ^= 1
             # 5. release K0
             pipeline_kv.consumer_release(mma_kv_consumer_state)
