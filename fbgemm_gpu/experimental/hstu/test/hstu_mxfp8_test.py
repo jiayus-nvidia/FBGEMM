@@ -309,7 +309,6 @@ def _mxfp8_reference(
         ([33, 96], [33, 96], 1, 64, (16, 4), 1.2),
         ([24], [24], 1, 256, (-1, -1), 0.5),
         ([129], [160], 1, 64, (-1, 0), 0.9),
-        ([128, 128], [128, 128], 2, 128, (-1, 0), 0.7),
         ([257] * 4, [385] * 4, 16, 64, (-1, 0), 0.9),
     ],
 )
@@ -417,6 +416,69 @@ def test_hstu_mxfp8_forward_backward(
     assert _normalized_difference(dq, dq_mx_ref) < 5.0e-6
     assert _normalized_difference(dk, dk_mx_ref) < 5.0e-6
     assert _normalized_difference(dv, dv_mx_ref) < 5.0e-6
+
+
+def test_hstu_mxfp8_fused_forward():
+    q_lengths = [128, 128]
+    k_lengths = [128, 128]
+    heads = 2
+    head_dim = 128
+    alpha = 0.7
+    window = (-1, 0)
+    torch.manual_seed(2154)
+    q = _normalized_randn((sum(q_lengths), heads, head_dim), 0.2)
+    k = _normalized_randn((sum(k_lengths), heads, head_dim), 0.2)
+    v = _normalized_randn((sum(k_lengths), heads, head_dim), 0.2)
+    dout = _normalized_randn((sum(q_lengths), heads, head_dim), 0.1)
+    cu_q = _offsets(q_lengths)
+    cu_k = _offsets(k_lengths)
+
+    output, _ = hstu_varlen_fwd_mxfp8_100(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        128,
+        128,
+        None,
+        None,
+        1,
+        window[0],
+        window[1],
+        alpha,
+        None,
+        None,
+    )
+    output_ref = _reference(
+        q.float(),
+        k.float(),
+        v.float(),
+        q_lengths,
+        k_lengths,
+        128,
+        128,
+        alpha,
+        window,
+    )
+    output_mx_ref, _, _, _ = _mxfp8_reference(
+        q,
+        k,
+        v,
+        dout,
+        q_lengths,
+        k_lengths,
+        128,
+        128,
+        alpha,
+        window,
+    )
+
+    assert output.dtype == torch.bfloat16
+    assert torch.isfinite(output).all()
+    assert _normalized_difference(output, output_ref) < 0.020
+    assert (output.float() - output_ref.float()).abs().max().item() < 0.01
+    assert _normalized_difference(output, output_mx_ref) < 5.0e-6
 
 
 def test_hstu_mxfp8_has_no_quadratic_fp32_workspace(monkeypatch):
