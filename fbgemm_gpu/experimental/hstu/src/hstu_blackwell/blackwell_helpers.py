@@ -512,7 +512,7 @@ def gemm_ptx_blockscaled_ss(
         for k in range(cute.size(tCrB.shape[2]))
     ]
 
-    for k in range(cute.size(tCrA.shape[2])):
+    for k in range(1):
         smem_desc_a_lo = smem_desc_start_a_lo + offset_a[k]
         smem_desc_b_lo = smem_desc_start_b_lo + offset_b[k]
         if k == 0:
