@@ -1314,7 +1314,8 @@ class HSTUAttentionForwardSm100:
                 )
                 silu_tOtOs = tuple(
                     cute.make_tensor(
-                        silu_tmem_ptr + self.tmem_o_offset[stage],
+                        silu_tmem_ptr
+                        + (0 if self.debug else self.tmem_o_offset[stage]),
                         tOtOs[stage].layout,
                     )
                     for stage in range(self.q_stage)
@@ -1361,7 +1362,16 @@ class HSTUAttentionForwardSm100:
                     silu_loop(stage=0, tStSi=silu_tStSs[0])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
-                if const_expr(not self.debug):
+                if const_expr(self.debug and self.is_mxfp8):
+                    store_O(
+                        seqlen=SeqlenInfoCls(Int32(0)),
+                        scale=cute.arch.rcp_approx(Float32(128.0)),
+                        m_block=Int32(0),
+                        head_idx=Int32(0),
+                        stage=0,
+                        epi_consumer_phase=Int32(0),
+                    )
+                elif const_expr(not self.debug):
                     silu_loop(stage=1, tStSi=silu_tStSs[1])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
@@ -2362,7 +2372,7 @@ class HSTUAttentionForwardSm100:
                     v_scale_t,
                 )
                 debug_tOtO = cute.make_tensor(
-                    tStSs[1].iterator, tOtOs[0].layout
+                    tStSs[0].iterator, tOtOs[0].layout
                 )
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
                 for kblock_idx in cutlass.range_constexpr(
@@ -2385,9 +2395,6 @@ class HSTUAttentionForwardSm100:
                     tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
                 with cute.arch.elect_one():
                     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
-                cute.arch.mbarrier_wait(
-                    mbar_ptr + self.mbar_O_full_offset, Int32(0)
-                )
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
