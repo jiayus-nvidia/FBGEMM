@@ -1363,13 +1363,11 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
                 if const_expr(self.debug and self.is_mxfp8):
-                    store_O(
-                        seqlen=SeqlenInfoCls(Int32(0)),
-                        scale=cute.arch.rcp_approx(Float32(128.0)),
-                        m_block=Int32(0),
-                        head_idx=Int32(0),
-                        stage=0,
-                        epi_consumer_phase=Int32(0),
+                    self.store_O_fixed_debug(
+                        thr_mma_pv,
+                        silu_tOtOs[0],
+                        mO,
+                        mbar_ptr,
                     )
                 elif const_expr(not self.debug):
                     silu_loop(stage=1, tStSi=silu_tStSs[1])
@@ -1449,6 +1447,43 @@ class HSTUAttentionForwardSm100:
             seqlen,
             mask_fn=mask_fn,
         )
+
+    @cute.jit
+    def store_O_fixed_debug(
+        self,
+        thr_mma_pv: cute.core.ThrMma,
+        tOtO: cute.Tensor,
+        mO: cute.Tensor,
+        mbar_ptr: cute.Pointer,
+    ):
+        tidx = cute.arch.thread_idx()[0] % (
+            cute.arch.WARP_SIZE * len(self.silu1_warp_ids)
+        )
+        cO = cute.make_identity_tensor(
+            (self.mma_tiler_pv[0], self.mma_tiler_pv[1])
+        )
+        tCcO = thr_mma_pv.partition_C(cO)
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+            Float32,
+        )
+        thr_tmem_load = tcgen05.make_tmem_copy(
+            tmem_load_atom, tOtO
+        ).get_slice(tidx)
+        tOtO_t2r = thr_tmem_load.partition_S(tOtO)
+        tOcO = thr_tmem_load.partition_D(tCcO)
+        values = cute.make_rmem_tensor(tOtO_t2r.shape, Float32)
+        cute.arch.mbarrier_wait(
+            mbar_ptr + self.mbar_O_full_offset, Int32(0)
+        )
+        cute.copy(thr_tmem_load, tOtO_t2r, values)
+        cute.arch.fence_view_async_tmem_load()
+        inv_seqlen = Float32(1.0 / 128.0)
+        for i in cutlass.range_constexpr(cute.size(values)):
+            coord = tOcO[i]
+            mO[coord[0], coord[1], 0] = self.o_dtype(
+                values[i] * inv_seqlen
+            )
 
     @cute.jit
     def load(
