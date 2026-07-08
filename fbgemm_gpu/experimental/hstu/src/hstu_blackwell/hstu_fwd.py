@@ -1001,26 +1001,30 @@ class HSTUAttentionForwardSm100:
                 cute.recast_ptr(scale_base, dtype=self.sf_dtype),
                 tQScale_layout,
             )
-            scale_base += tcgen05.find_tmem_tensor_col_offset(tQScale)
-            tKScale = cute.make_tensor(
-                cute.recast_ptr(scale_base, dtype=self.sf_dtype),
-                tKScale_layout,
-            )
-            scale_base += tcgen05.find_tmem_tensor_col_offset(tKScale)
             tPScale = cute.make_tensor(
                 cute.recast_ptr(scale_base, dtype=self.sf_dtype),
                 tPScale_layout,
             )
-            scale_base += tcgen05.find_tmem_tensor_col_offset(tPScale)
+            self.scale_sfa_cols = const_expr(
+                max(
+                    tcgen05.find_tmem_tensor_col_offset(tQScale),
+                    tcgen05.find_tmem_tensor_col_offset(tPScale),
+                )
+            )
+            scale_base += self.scale_sfa_cols
+            tKScale = cute.make_tensor(
+                cute.recast_ptr(scale_base, dtype=self.sf_dtype),
+                tKScale_layout,
+            )
             tVScale = cute.make_tensor(
                 cute.recast_ptr(scale_base, dtype=self.sf_dtype),
                 tVScale_layout,
             )
-            scale_cols = (
-                tcgen05.find_tmem_tensor_col_offset(tQScale)
-                + tcgen05.find_tmem_tensor_col_offset(tKScale)
-                + tcgen05.find_tmem_tensor_col_offset(tPScale)
-                + tcgen05.find_tmem_tensor_col_offset(tVScale)
+            scale_cols = self.scale_sfa_cols + const_expr(
+                max(
+                    tcgen05.find_tmem_tensor_col_offset(tKScale),
+                    tcgen05.find_tmem_tensor_col_offset(tVScale),
+                )
             )
             if const_expr(self.tmem_total + scale_cols > self.tmem_alloc_cols):
                 raise RuntimeError("MXFP8 scale factors exceed TMEM capacity")
@@ -1181,22 +1185,14 @@ class HSTUAttentionForwardSm100:
                     cute.recast_ptr(runtime_scale_base, dtype=self.sf_dtype),
                     tQScale.layout,
                 )
-                runtime_scale_base += tcgen05.find_tmem_tensor_col_offset(
-                    runtime_tQScale
-                )
-                runtime_tKScale = cute.make_tensor(
-                    cute.recast_ptr(runtime_scale_base, dtype=self.sf_dtype),
-                    tKScale.layout,
-                )
-                runtime_scale_base += tcgen05.find_tmem_tensor_col_offset(
-                    runtime_tKScale
-                )
                 runtime_tPScale = cute.make_tensor(
                     cute.recast_ptr(runtime_scale_base, dtype=self.sf_dtype),
                     tPScale.layout,
                 )
-                runtime_scale_base += tcgen05.find_tmem_tensor_col_offset(
-                    runtime_tPScale
+                runtime_scale_base += self.scale_sfa_cols
+                runtime_tKScale = cute.make_tensor(
+                    cute.recast_ptr(runtime_scale_base, dtype=self.sf_dtype),
+                    tKScale.layout,
                 )
                 runtime_tVScale = cute.make_tensor(
                     cute.recast_ptr(runtime_scale_base, dtype=self.sf_dtype),
