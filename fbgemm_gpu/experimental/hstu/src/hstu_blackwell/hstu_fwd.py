@@ -3074,6 +3074,28 @@ class HSTUAttentionForwardSm100:
                     mO[coord[0], coord[1], head_idx] = self.o_dtype(
                         output_values[value_idx] * inv_seqlen
                     )
+            if tidx < cute.arch.WARP_SIZE:
+                tOtO_stage = tOtO[None, None, None, 0]
+                tOtO_i = cute.logical_divide(
+                    tOtO_stage,
+                    cute.make_layout((self.kBlockM, async_copy_elems)),
+                )
+                scalar_tmem_load = tcgen05.make_tmem_copy(
+                    tmem_copy_atom, tOtO_i[(None, None), 0]
+                )
+                scalar_thread = scalar_tmem_load.get_slice(tidx)
+                scalar_source = scalar_thread.partition_S(
+                    tOtO_i[(None, None), None]
+                )[None, 0, 0, 0]
+                scalar_value = cute.make_rmem_tensor(
+                    scalar_source.shape, self.pv_acc_dtype
+                )
+                cute.copy(scalar_tmem_load, scalar_source, scalar_value)
+                cute.arch.fence_view_async_tmem_load()
+                if tidx == 0:
+                    mO[0, 0, head_idx] = self.o_dtype(
+                        scalar_value[0] * inv_seqlen
+                    )
             return
 
         tOsO = thr_mma_pv.partition_C(sO[None, None, stage])
