@@ -33,6 +33,9 @@ def scale_factor_storage_size(m: int, k: int, batch: int) -> int:
 class MxFp8QuantizeSm100:
     """Quantize an (M, K, L) tensor to OCP MXFP8 along its K dimension."""
 
+    def __init__(self, initialize_padding: bool = True):
+        self.initialize_padding = initialize_padding
+
     @cute.jit
     def __call__(
         self,
@@ -60,11 +63,12 @@ class MxFp8QuantizeSm100:
         rows, reduction, batches = source.shape
         blocks_per_row = cute.ceil_div(reduction, MXFP8_BLOCK_SIZE)
 
-        initialize_scale_storage_kernel(raw_scales).launch(
-            grid=(cute.ceil_div(cute.size(raw_scales), 256), 1, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
+        if cutlass.const_expr(self.initialize_padding):
+            initialize_scale_storage_kernel(raw_scales).launch(
+                grid=(cute.ceil_div(cute.size(raw_scales), 256), 1, 1),
+                block=(256, 1, 1),
+                stream=stream,
+            )
         self.kernel(source, quantized, scales, rows, reduction).launch(
             grid=(rows * blocks_per_row, batches, 1),
             block=(cute.arch.WARP_SIZE, 1, 1),

@@ -908,15 +908,20 @@ def _quantize(matrix: torch.Tensor) -> _MxMatrix:
     )
     scales_tensor = _cute_tensor(scales, element_type=cutlass.Float8E8M0FNU)
     stream = cutlass_torch.default_stream()
+    blocks_per_row = (
+        _round_up(matrix.shape[1], MXFP8_BLOCK_SIZE) // MXFP8_BLOCK_SIZE
+    )
+    initialize_padding = matrix.shape[0] % 128 != 0 or blocks_per_row % 4 != 0
     key = (
         matrix.dtype,
         tuple(matrix.shape),
         tuple(matrix.stride()),
         tuple(values.stride()),
+        initialize_padding,
     )
     if key not in _compile_cache["quantize"]:
         _compile_cache["quantize"][key] = cute.compile(
-            MxFp8QuantizeSm100(),
+            MxFp8QuantizeSm100(initialize_padding),
             source_tensor,
             values_tensor,
             scales_tensor,
