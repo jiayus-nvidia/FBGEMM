@@ -554,89 +554,6 @@ class SiluBackwardMaskQuantizeSm100:
                     ] = quantized_dscores_t_values[value_idx]
 
 
-class MxFp8BackwardCoreSm100:
-    def __init__(self):
-        self.score_gemm = Sm100BlockScaledPersistentDenseGemmKernel(
-            32, (128, 128), (1, 1)
-        )
-        self.dprobability_gemm = Sm100BlockScaledPersistentDenseGemmKernel(
-            32, (128, 128), (1, 1)
-        )
-        self.silu_backward = SiluBackwardMaskQuantizeSm100()
-
-    @cute.jit
-    def __call__(
-        self,
-        query: cute.Tensor,
-        key: cute.Tensor,
-        query_scales: cute.Tensor,
-        key_scales: cute.Tensor,
-        dout: cute.Tensor,
-        value: cute.Tensor,
-        dout_scales: cute.Tensor,
-        value_scales: cute.Tensor,
-        scores: cute.Tensor,
-        dprobabilities: cute.Tensor,
-        quantized_dscores: cute.Tensor,
-        dscore_scales: cute.Tensor,
-        quantized_probabilities_t: cute.Tensor,
-        probability_t_scales: cute.Tensor,
-        quantized_dscores_t: cute.Tensor,
-        dscore_t_scales: cute.Tensor,
-        cu_seqlens_q: cute.Tensor,
-        cu_seqlens_k: cute.Tensor,
-        num_heads: Int32,
-        normalization: Int32,
-        alpha: Float32,
-        window_left: Int32,
-        window_right: Int32,
-        query_start: Int32,
-        key_start: Int32,
-        max_active_clusters: cutlass.Constexpr,
-        stream: cuda.CUstream,
-    ):
-        self.score_gemm(
-            query,
-            key,
-            query_scales,
-            key_scales,
-            scores,
-            scores,
-            max_active_clusters,
-            stream,
-        )
-        self.dprobability_gemm(
-            dout,
-            value,
-            dout_scales,
-            value_scales,
-            dprobabilities,
-            dprobabilities,
-            max_active_clusters,
-            stream,
-        )
-        self.silu_backward(
-            scores,
-            dprobabilities,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            quantized_dscores,
-            dscore_scales,
-            quantized_probabilities_t,
-            probability_t_scales,
-            quantized_dscores_t,
-            dscore_t_scales,
-            num_heads,
-            normalization,
-            alpha,
-            window_left,
-            window_right,
-            query_start,
-            key_start,
-            stream,
-        )
-
-
 @dataclass
 class _MxMatrix:
     values: torch.Tensor
@@ -650,7 +567,6 @@ _compile_cache = {
     "unpack": {},
     "silu_quantize": {},
     "silu_bwd_quantize": {},
-    "bwd_core": {},
     "quantize": {},
     "gemm": {},
 }
@@ -1200,118 +1116,6 @@ def _run_silu_backward(
     return outputs[0], outputs[1], outputs[2]
 
 
-def _run_backward_core(
-    query: _MxMatrix,
-    key: _MxMatrix,
-    dout: _MxMatrix,
-    value: _MxMatrix,
-    scores: torch.Tensor,
-    dprobabilities: torch.Tensor,
-    outputs: tuple[_MxMatrix, _MxMatrix, _MxMatrix],
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    num_heads: int,
-    normalization: int,
-    alpha: float,
-    window_left: int,
-    window_right: int,
-    query_start: int,
-    key_start: int,
-):
-    if scores.shape[:2] != (128, 128) or scores.dtype != torch.float32:
-        raise ValueError("backward core requires a 128x128 FP32 score workspace")
-    if dprobabilities.shape != scores.shape or dprobabilities.dtype != torch.float32:
-        raise ValueError("backward core requires a matching FP32 dP workspace")
-
-    query_tensor, query_scales = _mx_cute_tensors(query)
-    key_tensor, key_scales = _mx_cute_tensors(key)
-    dout_tensor, dout_scales = _mx_cute_tensors(dout)
-    value_tensor, value_scales = _mx_cute_tensors(value)
-    score_tensor = _mark_matrix(_cute_tensor(scores), 1)
-    dprobability_tensor = _mark_matrix(_cute_tensor(dprobabilities), 1)
-    output_tensors = []
-    for output in outputs:
-        _validate_mx_workspace(output, scores.shape, scores.device)
-        output_tensors.extend(_mx_cute_tensors(output))
-    offsets_q = from_dlpack(
-        cu_seqlens_q.detach(), assumed_align=16
-    ).mark_layout_dynamic(leading_dim=0)
-    offsets_k = from_dlpack(
-        cu_seqlens_k.detach(), assumed_align=16
-    ).mark_layout_dynamic(leading_dim=0)
-    stream = cutlass_torch.default_stream()
-    max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
-    cache_key = (
-        tuple(query.values.shape),
-        tuple(query.values.stride()),
-        tuple(key.values.stride()),
-        tuple(dout.values.stride()),
-        tuple(value.values.stride()),
-        tuple(scores.stride()),
-        num_heads,
-    )
-    if cache_key not in _compile_cache["bwd_core"]:
-        _compile_cache["bwd_core"][cache_key] = cute.compile(
-            MxFp8BackwardCoreSm100(),
-            query_tensor,
-            key_tensor,
-            query_scales,
-            key_scales,
-            dout_tensor,
-            value_tensor,
-            dout_scales,
-            value_scales,
-            score_tensor,
-            dprobability_tensor,
-            output_tensors[0],
-            output_tensors[1],
-            output_tensors[2],
-            output_tensors[3],
-            output_tensors[4],
-            output_tensors[5],
-            offsets_q,
-            offsets_k,
-            Int32(num_heads),
-            Int32(normalization),
-            Float32(alpha),
-            Int32(window_left),
-            Int32(window_right),
-            Int32(query_start),
-            Int32(key_start),
-            max_active_clusters,
-            stream,
-        )
-    _compile_cache["bwd_core"][cache_key](
-        query_tensor,
-        key_tensor,
-        query_scales,
-        key_scales,
-        dout_tensor,
-        value_tensor,
-        dout_scales,
-        value_scales,
-        score_tensor,
-        dprobability_tensor,
-        output_tensors[0],
-        output_tensors[1],
-        output_tensors[2],
-        output_tensors[3],
-        output_tensors[4],
-        output_tensors[5],
-        offsets_q,
-        offsets_k,
-        Int32(num_heads),
-        Int32(normalization),
-        Float32(alpha),
-        Int32(window_left),
-        Int32(window_right),
-        Int32(query_start),
-        Int32(key_start),
-        stream,
-    )
-    return outputs
-
-
 def hstu_varlen_fwd_mxfp8_100(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1515,14 +1319,16 @@ def hstu_varlen_bwd_mxfp8_100(
             doutt_mx,
         ) in enumerate(zip(q_mx_tiles, qt_mx_tiles, dout_mx_tiles, doutt_mx_tiles)):
             query_start = query_tile_idx * 128
-            dscores_mx, probabilities_t_mx, dscores_t_mx = _run_backward_core(
-                query_mx,
-                key_mx,
+            scores = _gemm(query_mx, key_mx, torch.float32, output=score_workspace)
+            dprobabilities = _gemm(
                 dout_mx,
                 value_mx,
-                score_workspace,
-                dprobability_workspace,
-                silu_workspaces,
+                torch.float32,
+                output=dprobability_workspace,
+            )
+            dscores_mx, probabilities_t_mx, dscores_t_mx = _run_silu_backward(
+                scores,
+                dprobabilities,
                 cu_seqlens_q,
                 cu_seqlens_k,
                 num_heads,
@@ -1530,8 +1336,9 @@ def hstu_varlen_bwd_mxfp8_100(
                 alpha,
                 window_size_left,
                 window_size_right,
-                query_start,
-                key_start,
+                query_start=query_start,
+                key_start=key_start,
+                outputs=silu_workspaces,
             )
 
             is_last_query_tile = query_tile_idx + 1 == len(q_mx_tiles)
