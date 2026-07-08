@@ -3063,15 +3063,14 @@ class HSTUAttentionForwardSm100:
             if stage == 0:
                 cute.arch.mbarrier_wait(mbar_empty_ptr + 1, phase)
         if const_expr(self.is_mxfp8 and self.debug and K_or_V == "V"):
-            g_linear = cute.group_modes(raw_data, 0, 3)
             s_linear = cute.group_modes(sData, 0, 3)
             lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
             for i in cutlass.range(
                 lane, self.kBlockN * self.head_dim_v_padded, cute.arch.WARP_SIZE
             ):
-                s_linear[i, stage] = g_linear[
-                    block * self.kBlockN * self.head_dim_v_padded + i
-                ]
+                n = i // self.kBlockN
+                k = i - n * self.kBlockN
+                s_linear[i, stage] = raw_data[n, k, block]
             cute.arch.sync_warp()
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(mbar_full_ptr + stage)
