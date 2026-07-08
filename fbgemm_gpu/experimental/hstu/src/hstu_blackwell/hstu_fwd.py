@@ -1514,7 +1514,7 @@ class HSTUAttentionForwardSm100:
                 scale_atom=tma_atom_KScale,
                 tGScale=tKgKScale,
                 tSScale=tKsKScale,
-                raw_scale=raw_gKScale,
+                raw_scale=raw_mKScale,
                 sScale=sKScale,
             )
             load_V = partial(
@@ -1524,7 +1524,7 @@ class HSTUAttentionForwardSm100:
                 scale_atom=tma_atom_VScale,
                 tGScale=tVgVScale,
                 tSScale=tVsVScale,
-                raw_scale=raw_gVScale,
+                raw_scale=raw_mVScale,
                 sScale=sVScale,
             )
             n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
@@ -2971,7 +2971,11 @@ class HSTUAttentionForwardSm100:
         block: Int32,
         stage: Int32,
     ):
-        g_origin = cute.domain_offset((0, 0, block), g_scale)
+        g_origin = (
+            g_scale
+            if const_expr(self.debug)
+            else cute.domain_offset((0, 0, block), g_scale)
+        )
         s_origin = cute.domain_offset((0, 0, 0, stage), s_scale)
         tile_size = cute.cosize(
             cute.slice_(s_scale.layout, (None, None, None, 0))
