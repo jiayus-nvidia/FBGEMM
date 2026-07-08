@@ -3100,6 +3100,7 @@ class HSTUAttentionForwardSm100:
                 k = i - n * self.kBlockN
                 s_linear[i, stage] = raw_data[n, k, block]
             cute.arch.sync_warp()
+            cute.arch.fence_view_async_shared()
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(mbar_full_ptr + stage)
             return
