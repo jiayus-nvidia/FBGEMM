@@ -559,6 +559,9 @@ class HSTUAttentionForwardSm100:
                 self.sf_dtype,
                 cute.slice_(sVScale_layout, (None, None, None, 0)),
             )
+            self.tma_copy_q_bytes *= cute.size(tiled_mma_qk.thr_id.shape)
+            self.tma_copy_k_bytes *= cute.size(tiled_mma_qk.thr_id.shape)
+            self.tma_copy_v_bytes *= cute.size(tiled_mma_pv.thr_id.shape)
 
         TileScheduler = SingleTileVarlenScheduler
         # TileScheduler = SingleTileScheduler
