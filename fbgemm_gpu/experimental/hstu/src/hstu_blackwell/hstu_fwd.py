@@ -1337,9 +1337,14 @@ class HSTUAttentionForwardSm100:
             )
             if warp_idx <= self.silu0_warp_ids[-1] and warp_idx >= self.silu0_warp_ids[0]:
                 if const_expr(self.debug and self.is_mxfp8):
-                    cute.arch.mbarrier_wait(
-                        mbar_ptr + self.mbar_S_full_offset,
-                        0,
+                    self.silu_fixed_debug(
+                        score_scale,
+                        thr_mma_qk,
+                        silu_tStSs[0],
+                        mbar_ptr,
+                        SeqlenInfoCls,
+                        AttentionMaskCls,
+                        sP,
                     )
                 elif const_expr(not self.debug):
                     silu_loop(stage=0, tStSi=silu_tStSs[0])
@@ -1350,6 +1355,79 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
         return
+
+    @cute.jit
+    def silu_fixed_debug(
+        self,
+        score_scale: Float32,
+        thr_mma_qk: cute.core.ThrMma,
+        tStS: cute.Tensor,
+        mbar_ptr: cute.Pointer,
+        SeqlenInfoCls: Callable,
+        AttentionMaskCls: Callable,
+        sP: cute.Tensor,
+    ):
+        tidx = cute.arch.thread_idx()[0] % (
+            cute.arch.WARP_SIZE * len(self.silu0_warp_ids)
+        )
+        cS = cute.make_identity_tensor(
+            (self.mma_tiler_qk[0], self.mma_tiler_qk[1])
+        )
+        tScS = thr_mma_qk.partition_C(cS)
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+            Float32,
+        )
+        thr_tmem_load = tcgen05.make_tmem_copy(
+            tmem_load_atom, tStS
+        ).get_slice(tidx)
+        tStS_t2r = thr_tmem_load.partition_S(tStS)
+        sP_stage = sP[None, None, None, 0]
+        sP_mn = cute.make_tensor(
+            sP_stage.iterator,
+            cute.composition(
+                sP_stage.layout,
+                cute.make_layout(
+                    (self.mma_tiler_pv[0], self.mma_tiler_pv[2])
+                ),
+            ),
+        )
+        seqlen = SeqlenInfoCls(Int32(0))
+        mask = AttentionMaskCls(
+            offset_q=seqlen.offset_q,
+            seqlen_q=seqlen.seqlen_q,
+            seqlen_k=seqlen.seqlen_k,
+            seqlen_c=seqlen.seqlen_c,
+            seqlen_h=seqlen.seqlen_h,
+            offset_dynamic=Int32(0),
+            func=None,
+        )
+        mask_fn = partial(
+            mask.apply_mask,
+            m_block=Int32(0),
+            thr_mma=thr_mma_qk,
+            thr_tmem_load=thr_tmem_load,
+        )
+        self.silu_step(
+            Int32(0),
+            Int32(1),
+            Int32(0),
+            FastSilU(score_scale=score_scale),
+            mbar_ptr,
+            self.mbar_s0_s1_sequence_offset,
+            thr_mma_qk,
+            thr_tmem_load,
+            None,
+            tStS_t2r,
+            None,
+            sP_mn,
+            0,
+            Int32(0),
+            Int32(0),
+            Int32(0),
+            seqlen,
+            mask_fn=mask_fn,
+        )
 
     @cute.jit
     def load(
@@ -2744,8 +2822,6 @@ class HSTUAttentionForwardSm100:
         3. Computing SiLU
         4. Coordinating pipeline synchronization between different processing stages
         """
-        if const_expr(self.debug):
-            return mma_si_consumer_phase ^ 1, s0_s1_sequence_phase ^ 1
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor((self.mma_tiler_qk[0], self.mma_tiler_qk[1])))
         tScS_vec_layout = cute.composition(tScS.layout, cute.make_layout((self.kBlockM, 1)))
