@@ -158,7 +158,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         ...     mma_tiler_mn=(256, 128),
         ...     cluster_shape_mn=(2, 1)
         ... )
-        >>> gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, max_active_clusters, stream)
+        >>> gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, c_tensor, max_active_clusters, stream)
     """
 
     def __init__(
@@ -166,6 +166,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        accumulate_output: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -189,6 +190,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
+        self.accumulate_output = accumulate_output
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
@@ -373,6 +375,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfa_tensor: cute.Tensor,
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
+        addend_tensor: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -407,9 +410,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.b_dtype: Type[cutlass.Numeric] = b_tensor.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa_tensor.element_type
         self.c_dtype: Type[cutlass.Numeric] = c_tensor.element_type
+        self.addend_dtype: Type[cutlass.Numeric] = addend_tensor.element_type
         self.a_major_mode = utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
         self.b_major_mode = utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
+        if cutlass.const_expr(
+            utils.LayoutEnum.from_tensor(addend_tensor) != self.c_layout
+        ):
+            raise ValueError("Output and addend must have the same layout")
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -628,6 +636,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tma_tensor_sfb,
             tma_atom_c,
             tma_tensor_c,
+            addend_tensor,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -662,6 +671,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mSFB_nkl: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
+        mAddend_mnl: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -826,6 +836,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
+        gAddend_mnl = cute.local_tile(
+            mAddend_mnl,
+            cute.slice_(self.mma_tiler, (None, None, 0)),
+            (None, None, None),
+        )
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
         #
@@ -843,6 +858,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
+        tCgAddend = thr_mma.partition_C(gAddend_mnl)
 
         #
         # Partition global/shared tensor for TMA load A/B
@@ -1297,6 +1313,26 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
             )
 
+            tTR_gAddend_partitioned = None
+            tTR_rAddend = None
+            addend_copy_atom = None
+            if cutlass.const_expr(self.accumulate_output):
+                addend_epi = cute.flat_divide(
+                    tCgAddend[((None, None), 0, 0, None, None, None)],
+                    epi_tile,
+                )
+                thr_copy_t2r = tiled_copy_t2r.get_slice(epi_tidx)
+                tTR_gAddend_partitioned = thr_copy_t2r.partition_D(addend_epi)
+                tTR_rAddend = cute.make_rmem_tensor(
+                    tTR_gAddend_partitioned[
+                        (None, None, None, 0, 0, 0, 0, 0)
+                    ].shape,
+                    self.addend_dtype,
+                )
+                addend_copy_atom = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), self.addend_dtype
+                )
+
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                 tiled_copy_t2r, tTR_rC, epi_tidx, sC
@@ -1352,6 +1388,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         *mma_tile_coord_mnl,
                     )
                 ]
+                tTR_gAddend = None
+                if cutlass.const_expr(self.accumulate_output):
+                    tTR_gAddend = tTR_gAddend_partitioned[
+                        (None, None, None, None, None, *mma_tile_coord_mnl)
+                    ]
 
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
@@ -1366,6 +1407,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                if cutlass.const_expr(self.accumulate_output):
+                    tTR_gAddend = cute.group_modes(
+                        tTR_gAddend, 3, cute.rank(tTR_gAddend)
+                    )
 
                 #
                 # Store accumulator to global memory in subtiles
@@ -1379,10 +1424,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
+                    if cutlass.const_expr(self.accumulate_output):
+                        cute.copy(
+                            addend_copy_atom,
+                            tTR_gAddend[(None, None, None, subtile_idx)],
+                            tTR_rAddend,
+                        )
+
                     #
                     # Convert to C type
                     #
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                    if cutlass.const_expr(self.accumulate_output):
+                        addend_vec = tiled_copy_r2s.retile(tTR_rAddend).load()
+                        acc_vec = acc_vec + addend_vec.to(self.acc_dtype)
                     acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                     tRS_rC.store(acc_vec)
 
@@ -2287,6 +2342,7 @@ def run(
         sfa_tensor,
         sfb_tensor,
         c_tensor,
+        c_tensor,
         max_active_clusters,
         current_stream,
     )
@@ -2295,7 +2351,13 @@ def run(
     if not skip_ref_check:
         # Execute kernel once for reference checking
         compiled_gemm(
-            a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, current_stream
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            c_tensor,
+            c_tensor,
+            current_stream,
         )
         print("Verifying results...")
         res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
@@ -2362,7 +2424,13 @@ def run(
         _, sfa_tensor, _ = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
         _, sfb_tensor, _ = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
         return cute.testing.JitArguments(
-            a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, current_stream
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            c_tensor,
+            c_tensor,
+            current_stream,
         )
 
     workspace_count = 1

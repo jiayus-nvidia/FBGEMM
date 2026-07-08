@@ -295,94 +295,6 @@ class SiluBackwardMaskSm100:
             dscores[query_idx_local, key_idx_local, batch_head] = dscore
 
 
-class MatrixFillSm100:
-    @cute.jit
-    def __call__(
-        self,
-        output: cute.Tensor,
-        value: Float32,
-        stream: cuda.CUstream,
-    ):
-        self.kernel(output, value).launch(
-            grid=(cute.ceil_div(cute.size(output), 256), 1, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(self, output: cute.Tensor, value: Float32):
-        thread, _, _ = cute.arch.thread_idx()
-        block, _, _ = cute.arch.block_idx()
-        idx = block * 256 + thread
-        if idx < cute.size(output):
-            rows, columns, _ = output.shape
-            column = idx % columns
-            row_batch = idx // columns
-            row = row_batch % rows
-            batch = row_batch // rows
-            output[row, column, batch] = output.element_type(value)
-
-
-class MatrixAddSm100:
-    @cute.jit
-    def __call__(
-        self,
-        source: cute.Tensor,
-        destination: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
-        self.kernel(source, destination).launch(
-            grid=(cute.ceil_div(cute.size(source), 256), 1, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(self, source: cute.Tensor, destination: cute.Tensor):
-        thread, _, _ = cute.arch.thread_idx()
-        block, _, _ = cute.arch.block_idx()
-        idx = block * 256 + thread
-        if idx < cute.size(source):
-            rows, columns, _ = source.shape
-            column = idx % columns
-            row_batch = idx // columns
-            row = row_batch % rows
-            batch = row_batch // rows
-            destination[row, column, batch] = (
-                destination[row, column, batch] + source[row, column, batch]
-            )
-
-
-class MatrixConvertSm100:
-    @cute.jit
-    def __call__(
-        self,
-        source: cute.Tensor,
-        destination: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
-        self.kernel(source, destination).launch(
-            grid=(cute.ceil_div(cute.size(source), 256), 1, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(self, source: cute.Tensor, destination: cute.Tensor):
-        thread, _, _ = cute.arch.thread_idx()
-        block, _, _ = cute.arch.block_idx()
-        idx = block * 256 + thread
-        if idx < cute.size(source):
-            rows, columns, _ = source.shape
-            column = idx % columns
-            row_batch = idx // columns
-            row = row_batch % rows
-            batch = row_batch // rows
-            destination[row, column, batch] = destination.element_type(
-                source[row, column, batch]
-            )
-
-
 @dataclass
 class _MxMatrix:
     values: torch.Tensor
@@ -396,9 +308,6 @@ _compile_cache = {
     "silu_bwd": {},
     "quantize": {},
     "gemm": {},
-    "fill": {},
-    "add": {},
-    "convert": {},
 }
 
 
@@ -588,14 +497,34 @@ def _quantize(matrix: torch.Tensor) -> _MxMatrix:
     return _MxMatrix(values, scales)
 
 
-def _gemm(a: _MxMatrix, b: _MxMatrix, output_dtype: torch.dtype) -> torch.Tensor:
+def _gemm(
+    a: _MxMatrix,
+    b: _MxMatrix,
+    output_dtype: torch.dtype,
+    output: Optional[torch.Tensor] = None,
+    addend: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     m, k, batches = a.values.shape
     n, b_k, b_batches = b.values.shape
     if k != b_k or batches != b_batches:
         raise ValueError(
             f"incompatible MXFP8 GEMM shapes {a.values.shape} and {b.values.shape}"
         )
-    output = _matrix(m, n, batches, output_dtype, a.values.device)
+    expected_shape = (m, n, batches)
+    if output is None:
+        output = _matrix(m, n, batches, output_dtype, a.values.device)
+    elif output.shape != expected_shape or output.dtype != output_dtype:
+        raise ValueError(
+            f"invalid GEMM output {output.shape}/{output.dtype}, expected "
+            f"{expected_shape}/{output_dtype}"
+        )
+    accumulate_output = addend is not None
+    if addend is None:
+        addend = output
+    elif addend.shape != expected_shape:
+        raise ValueError(
+            f"invalid GEMM addend shape {addend.shape}, expected {expected_shape}"
+        )
 
     a_leading = _leading_dim(a.values)
     b_leading = _leading_dim(b.values)
@@ -608,6 +537,8 @@ def _gemm(a: _MxMatrix, b: _MxMatrix, output_dtype: torch.dtype) -> torch.Tensor
     a_scales = _cute_tensor(a.scales, element_type=cutlass.Float8E8M0FNU)
     b_scales = _cute_tensor(b.scales, element_type=cutlass.Float8E8M0FNU)
     output_tensor = _mark_matrix(_cute_tensor(output), 1)
+    addend_leading = _leading_dim(addend)
+    addend_tensor = _mark_matrix(_cute_tensor(addend), addend_leading)
     stream = cutlass_torch.default_stream()
     mma_n = 64 if n <= 64 else 128
     key = (
@@ -616,10 +547,19 @@ def _gemm(a: _MxMatrix, b: _MxMatrix, output_dtype: torch.dtype) -> torch.Tensor
         tuple(b.values.shape),
         tuple(b.values.stride()),
         output_dtype,
+        tuple(output.stride()),
+        addend.dtype,
+        tuple(addend.stride()),
+        accumulate_output,
         mma_n,
     )
     if key not in _compile_cache["gemm"]:
-        gemm = Sm100BlockScaledPersistentDenseGemmKernel(32, (128, mma_n), (1, 1))
+        gemm = Sm100BlockScaledPersistentDenseGemmKernel(
+            32,
+            (128, mma_n),
+            (1, 1),
+            accumulate_output=accumulate_output,
+        )
         max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
         _compile_cache["gemm"][key] = cute.compile(
             gemm,
@@ -628,66 +568,20 @@ def _gemm(a: _MxMatrix, b: _MxMatrix, output_dtype: torch.dtype) -> torch.Tensor
             a_scales,
             b_scales,
             output_tensor,
+            addend_tensor,
             max_active_clusters,
             stream,
         )
     _compile_cache["gemm"][key](
-        a_tensor, b_tensor, a_scales, b_scales, output_tensor, stream
+        a_tensor,
+        b_tensor,
+        a_scales,
+        b_scales,
+        output_tensor,
+        addend_tensor,
+        stream,
     )
     return output
-
-
-def _fill(matrix: torch.Tensor, value: float = 0.0) -> None:
-    matrix_tensor = _cute_tensor(matrix)
-    stream = cutlass_torch.default_stream()
-    key = (matrix.dtype, tuple(matrix.shape), tuple(matrix.stride()))
-    if key not in _compile_cache["fill"]:
-        _compile_cache["fill"][key] = cute.compile(
-            MatrixFillSm100(), matrix_tensor, Float32(value), stream
-        )
-    _compile_cache["fill"][key](matrix_tensor, Float32(value), stream)
-
-
-def _add(source: torch.Tensor, destination: torch.Tensor) -> None:
-    if source.shape != destination.shape:
-        raise ValueError(f"cannot add shapes {source.shape} and {destination.shape}")
-    source_tensor = _cute_tensor(source)
-    destination_tensor = _cute_tensor(destination)
-    stream = cutlass_torch.default_stream()
-    key = (
-        source.dtype,
-        tuple(source.shape),
-        tuple(source.stride()),
-        destination.dtype,
-        tuple(destination.stride()),
-    )
-    if key not in _compile_cache["add"]:
-        _compile_cache["add"][key] = cute.compile(
-            MatrixAddSm100(), source_tensor, destination_tensor, stream
-        )
-    _compile_cache["add"][key](source_tensor, destination_tensor, stream)
-
-
-def _convert(source: torch.Tensor, destination: torch.Tensor) -> None:
-    if source.shape != destination.shape:
-        raise ValueError(
-            f"cannot convert shapes {source.shape} and {destination.shape}"
-        )
-    source_tensor = _cute_tensor(source)
-    destination_tensor = _cute_tensor(destination)
-    stream = cutlass_torch.default_stream()
-    key = (
-        source.dtype,
-        tuple(source.shape),
-        tuple(source.stride()),
-        destination.dtype,
-        tuple(destination.stride()),
-    )
-    if key not in _compile_cache["convert"]:
-        _compile_cache["convert"][key] = cute.compile(
-            MatrixConvertSm100(), source_tensor, destination_tensor, stream
-        )
-    _compile_cache["convert"][key](source_tensor, destination_tensor, stream)
 
 
 def _tiles(matrix: torch.Tensor, tile_size: int = 128):
@@ -912,10 +806,11 @@ def hstu_varlen_fwd_mxfp8_100(
     v_mx_tiles = [_quantize(_transpose(tile)) for tile in v_tiles]
 
     for query_tile_idx, query_tile in enumerate(q_tiles):
-        output_accumulator = _matrix(
-            128, head_dim, batch_heads, torch.float32, q.device
+        output_accumulator = (
+            _matrix(128, head_dim, batch_heads, torch.float32, q.device)
+            if len(k_mx_tiles) > 1
+            else None
         )
-        _fill(output_accumulator)
         query_mx = _quantize(query_tile)
         query_start = query_tile_idx * 128
         for key_tile_idx, (key_mx, value_mx) in enumerate(zip(k_mx_tiles, v_mx_tiles)):
@@ -934,12 +829,19 @@ def hstu_varlen_fwd_mxfp8_100(
                 key_start=key_start,
                 output=scores,
             )
-            partial_output = _gemm(_quantize(scores), value_mx, torch.float32)
-            _add(partial_output, output_accumulator)
-        _convert(
-            output_accumulator,
-            dense_output[query_start : query_start + 128],
-        )
+            is_last_key_tile = key_tile_idx + 1 == len(k_mx_tiles)
+            output = (
+                dense_output[query_start : query_start + 128]
+                if is_last_key_tile
+                else output_accumulator
+            )
+            _gemm(
+                _quantize(scores),
+                value_mx,
+                torch.bfloat16 if is_last_key_tile else torch.float32,
+                output=output,
+                addend=output_accumulator if key_tile_idx > 0 else None,
+            )
 
     return _unpack(dense_output, cu_seqlens_q, q.shape[0], num_heads), None
 
@@ -1000,22 +902,31 @@ def hstu_varlen_bwd_mxfp8_100(
     dout_mx_tiles = [_quantize(tile) for tile in dout_tiles]
     doutt_mx_tiles = [_quantize(_transpose(tile)) for tile in dout_tiles]
 
-    dq_accumulators = [
-        _matrix(128, head_dim, batch_heads, torch.float32, q.device) for _ in q_tiles
-    ]
-    for accumulator in dq_accumulators:
-        _fill(accumulator)
-
+    dq_accumulators = (
+        [
+            _matrix(128, head_dim, batch_heads, torch.float32, q.device)
+            for _ in q_tiles
+        ]
+        if len(k_mx_tiles) > 1
+        else [None] * len(q_tiles)
+    )
+    dense_dq = _matrix(padded_q, head_dim, batch_heads, torch.bfloat16, q.device)
     dense_dk = _matrix(padded_k, head_dim, batch_heads, torch.bfloat16, q.device)
     dense_dv = _matrix(padded_k, head_dim, batch_heads, torch.bfloat16, q.device)
 
     for key_tile_idx, (key_mx, keyt_mx, value_mx) in enumerate(
         zip(k_mx_tiles, kt_mx_tiles, v_mx_tiles)
     ):
-        dk_accumulator = _matrix(128, head_dim, batch_heads, torch.float32, q.device)
-        dv_accumulator = _matrix(128, head_dim, batch_heads, torch.float32, q.device)
-        _fill(dk_accumulator)
-        _fill(dv_accumulator)
+        dk_accumulator = (
+            _matrix(128, head_dim, batch_heads, torch.float32, q.device)
+            if len(q_mx_tiles) > 1
+            else None
+        )
+        dv_accumulator = (
+            _matrix(128, head_dim, batch_heads, torch.float32, q.device)
+            if len(q_mx_tiles) > 1
+            else None
+        )
         key_start = key_tile_idx * 128
 
         for query_tile_idx, (
@@ -1043,33 +954,48 @@ def hstu_varlen_bwd_mxfp8_100(
                 dscores=dprobabilities,
             )
 
-            partial_dv = _gemm(_quantize(_transpose(scores)), doutt_mx, torch.float32)
-            partial_dk = _gemm(
+            is_last_query_tile = query_tile_idx + 1 == len(q_mx_tiles)
+            gradient_dtype = (
+                torch.bfloat16 if is_last_query_tile else torch.float32
+            )
+            _gemm(
+                _quantize(_transpose(scores)),
+                doutt_mx,
+                gradient_dtype,
+                output=(
+                    dense_dv[key_start : key_start + 128]
+                    if is_last_query_tile
+                    else dv_accumulator
+                ),
+                addend=dv_accumulator if query_tile_idx > 0 else None,
+            )
+            _gemm(
                 _quantize(_transpose(dprobabilities)),
                 queryt_mx,
-                torch.float32,
+                gradient_dtype,
+                output=(
+                    dense_dk[key_start : key_start + 128]
+                    if is_last_query_tile
+                    else dk_accumulator
+                ),
+                addend=dk_accumulator if query_tile_idx > 0 else None,
             )
-            partial_dq = _gemm(_quantize(dprobabilities), keyt_mx, torch.float32)
-            _add(partial_dv, dv_accumulator)
-            _add(partial_dk, dk_accumulator)
-            _add(partial_dq, dq_accumulators[query_tile_idx])
-
-        _convert(
-            dk_accumulator,
-            dense_dk[key_start : key_start + 128],
-        )
-        _convert(
-            dv_accumulator,
-            dense_dv[key_start : key_start + 128],
-        )
-
-    dense_dq = _matrix(padded_q, head_dim, batch_heads, torch.bfloat16, q.device)
-    for query_tile_idx, accumulator in enumerate(dq_accumulators):
-        query_start = query_tile_idx * 128
-        _convert(
-            accumulator,
-            dense_dq[query_start : query_start + 128],
-        )
+            is_last_key_tile = key_tile_idx + 1 == len(k_mx_tiles)
+            _gemm(
+                _quantize(dprobabilities),
+                keyt_mx,
+                torch.bfloat16 if is_last_key_tile else torch.float32,
+                output=(
+                    dense_dq[query_start : query_start + 128]
+                    if is_last_key_tile
+                    else dq_accumulators[query_tile_idx]
+                ),
+                addend=(
+                    dq_accumulators[query_tile_idx]
+                    if key_tile_idx > 0
+                    else None
+                ),
+            )
 
     dq_result = _unpack(dense_dq, cu_seqlens_q, q.shape[0], num_heads, output=dq)
     dk_result = _unpack(dense_dk, cu_seqlens_k, k.shape[0], num_heads, output=dk)
