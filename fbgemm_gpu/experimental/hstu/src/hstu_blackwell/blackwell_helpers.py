@@ -559,7 +559,7 @@ def gemm_ptx_blockscaled_ss(
             "shl.b32 sf_id, sf_id, 4;\n\t"
             "or.b32 idesc, idesc, sf_id;\n\t"
             "setp.ne.b32 p, $2, 0;\n\t"
-            "@leader_thread tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale "
+            "@leader_thread tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X "
             "[tmem_acc], smem_desc_a, smem_desc_b, idesc, "
             "[tmem_sfa], [tmem_sfb], p;\n\t"
             "}\n",
