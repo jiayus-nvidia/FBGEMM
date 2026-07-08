@@ -564,9 +564,9 @@ class HSTUAttentionForwardSm100:
             self.tma_copy_v_bytes *= cute.size(tiled_mma_pv.thr_id.shape)
             if const_expr(self.debug):
                 self.tma_copy_k_bytes = cute.size_in_bytes(
-                    self.sf_dtype,
-                    cute.slice_(sKScale_layout, (None, None, None, 0)),
-                )
+                    self.k_dtype,
+                    cute.select(sK_layout, mode=[0, 1, 2]),
+                ) * cute.size(tiled_mma_qk.thr_id.shape)
 
         TileScheduler = SingleTileVarlenScheduler
         # TileScheduler = SingleTileScheduler
@@ -1445,6 +1445,13 @@ class HSTUAttentionForwardSm100:
                 n_block_k = sValidBlockIds[n_block_valid_k] if self.is_arbitrary else n_block_valid_k
                 load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
                 q_producer_phase ^= 1
+                if const_expr(self.debug):
+                    self.load_scale_g2s(
+                        gKScale,
+                        sKScale,
+                        n_block_k,
+                        kv_producer_state.index,
+                    )
                 load_K(block=n_block_k, producer_state=kv_producer_state, page_idx=None)  # K0
                 kv_producer_state.advance()
                 if is_jump and masking_step_k == n_masking_steps - 1:
@@ -2811,14 +2818,8 @@ class HSTUAttentionForwardSm100:
             tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
         # Currently we assume that page_size == kBlockN so we index into tXgX with block = 0
         tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
-        if const_expr(not self.debug):
-            cute.copy(
-                tma_atom,
-                tXgX_cur,
-                tXsX_cur,
-                tma_bar_ptr=mbar_full_ptr + stage,
-            )
-        if const_expr(self.is_mxfp8):
+        cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=mbar_full_ptr + stage)
+        if const_expr(self.is_mxfp8 and not self.debug):
             tGScale_cur = tGScale[None, block]
             cute.copy(
                 scale_atom,
@@ -2826,6 +2827,26 @@ class HSTUAttentionForwardSm100:
                 tSScale[None, stage],
                 tma_bar_ptr=mbar_full_ptr + stage,
             )
+
+    @cute.jit
+    def load_scale_g2s(
+        self,
+        g_scale: cute.Tensor,
+        s_scale: cute.Tensor,
+        block: Int32,
+        stage: Int32,
+    ):
+        g_compact = cute.filter_zeros(
+            g_scale[(None, None, None, None, block)]
+        )
+        s_compact = cute.filter_zeros(
+            s_scale[(None, None, None, None, stage)]
+        )
+        lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
+        for i in cutlass.range(lane, cute.size(s_compact), cute.arch.WARP_SIZE):
+            coord = cute.idx2crd(i, s_compact.shape)
+            s_compact[coord] = g_compact[coord]
+        cute.arch.sync_warp()
 
     @cute.jit
     def offset_kv_smem(self, sX: cute.Tensor, stage: Int32, phase: Int32):
