@@ -2093,7 +2093,9 @@ class HSTUAttentionForwardSm100:
             gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
             with cute.arch.elect_one():
                 tcgen05.commit(mbar_ptr + self.mbar_S_full_offset)
-                tcgen05.commit(mbar_ptr + self.mbar_load_q_empty_offset)
+                cute.arch.mbarrier_arrive(
+                    mbar_ptr + self.mbar_load_q_empty_offset
+                )
             pipeline_kv.consumer_release(mma_kv_consumer_state)
             mma_kv_consumer_state.advance()
             pipeline_kv.consumer_wait(mma_kv_consumer_state)
