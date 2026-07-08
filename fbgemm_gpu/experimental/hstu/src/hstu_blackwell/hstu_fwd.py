@@ -1891,7 +1891,6 @@ class HSTUAttentionForwardSm100:
         scale_b: cute.Tensor,
         accumulate: Boolean | bool,
     ):
-        tiled_mma = cute.make_tiled_mma(cute.make_mma_atom(tiled_mma.op))
         tiled_mma.set(tcgen05.Field.ACCUMULATE, accumulate)
         for kblock in cutlass.range_constexpr(cute.size(operand_a, mode=[2])):
             scale_coord = (None, None, kblock)
@@ -1906,6 +1905,7 @@ class HSTUAttentionForwardSm100:
                 accumulator,
             )
             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+        return tiled_mma
 
     @cute.jit
     def mma_intraoverlap(
@@ -1946,6 +1946,12 @@ class HSTUAttentionForwardSm100:
         tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 0])
 
         if const_expr(is_mxfp8):
+            tiled_mma_qk = cute.make_tiled_mma(
+                cute.make_mma_atom(tiled_mma_qk.op)
+            )
+            tiled_mma_pv = cute.make_tiled_mma(
+                cute.make_mma_atom(tiled_mma_pv.op)
+            )
             q_scale_copy, q_scale_s, q_scale_t = self.scale_s2t_copy_and_partition(
                 sQScale, tQScale
             )
@@ -2028,7 +2034,7 @@ class HSTUAttentionForwardSm100:
                     k_scale_s[(None, None, None, None, Ki_index)],
                     k_scale_t,
                 )
-                self.blockscaled_gemm(
+                tiled_mma_qk = self.blockscaled_gemm(
                     tiled_mma_qk,
                     tStSs[0],
                     tSrQs[0],
@@ -2060,7 +2066,7 @@ class HSTUAttentionForwardSm100:
                         k_scale_s[(None, None, None, None, Ki_index)],
                         k_scale_t,
                     )
-                    self.blockscaled_gemm(
+                    tiled_mma_qk = self.blockscaled_gemm(
                         tiled_mma_qk,
                         tStSs[1],
                         tSrQs[1],
@@ -2101,7 +2107,7 @@ class HSTUAttentionForwardSm100:
                             v_scale_s[(None, None, None, None, Vi_index)],
                             v_scale_t,
                         )
-                        self.blockscaled_gemm(
+                        tiled_mma_pv = self.blockscaled_gemm(
                             tiled_mma_pv,
                             tOtOs[0],
                             tOrPs[0],
@@ -2126,7 +2132,7 @@ class HSTUAttentionForwardSm100:
                             v_scale_s[(None, None, None, None, Vi_index)],
                             v_scale_t,
                         )
-                        self.blockscaled_gemm(
+                        tiled_mma_pv = self.blockscaled_gemm(
                             tiled_mma_pv,
                             tOtOs[0],
                             tOrPs[1],
@@ -2156,7 +2162,7 @@ class HSTUAttentionForwardSm100:
                         k_scale_t,
                     )
                     if i & (self.s_stage - 1) == 0:
-                        self.blockscaled_gemm(
+                        tiled_mma_qk = self.blockscaled_gemm(
                             tiled_mma_qk,
                             tStSs[0],
                             tSrQs[0],
@@ -2166,7 +2172,7 @@ class HSTUAttentionForwardSm100:
                             False,
                         )
                     else:
-                        self.blockscaled_gemm(
+                        tiled_mma_qk = self.blockscaled_gemm(
                             tiled_mma_qk,
                             tStSs[1],
                             tSrQs[1],
@@ -2210,7 +2216,7 @@ class HSTUAttentionForwardSm100:
                             v_scale_s[(None, None, None, None, Vi_index)],
                             v_scale_t,
                         )
-                        self.blockscaled_gemm(
+                        tiled_mma_pv = self.blockscaled_gemm(
                             tiled_mma_pv,
                             tOtOs[0],
                             tOrPs[0],
@@ -2235,7 +2241,7 @@ class HSTUAttentionForwardSm100:
                             v_scale_s[(None, None, None, None, Vi_index)],
                             v_scale_t,
                         )
-                        self.blockscaled_gemm(
+                        tiled_mma_pv = self.blockscaled_gemm(
                             tiled_mma_pv,
                             tOtOs[0],
                             tOrPs[1],
@@ -2270,7 +2276,7 @@ class HSTUAttentionForwardSm100:
                         v_scale_s[(None, None, None, None, Vi_index)],
                         v_scale_t,
                     )
-                    self.blockscaled_gemm(
+                    tiled_mma_pv = self.blockscaled_gemm(
                         tiled_mma_pv,
                         tOtOs[0],
                         tOrPs[0],
@@ -2295,7 +2301,7 @@ class HSTUAttentionForwardSm100:
                         v_scale_s[(None, None, None, None, Vi_index)],
                         v_scale_t,
                     )
-                    self.blockscaled_gemm(
+                    tiled_mma_pv = self.blockscaled_gemm(
                         tiled_mma_pv,
                         tOtOs[0],
                         tOrPs[1],
