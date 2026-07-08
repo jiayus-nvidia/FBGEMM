@@ -1990,9 +1990,7 @@ def _run_fused_forward(
     output = torch.empty_like(q)
 
     q_tensor, k_tensor, v_tensor, output_tensor = [
-        from_dlpack(tensor.detach(), assumed_align=16).mark_layout_dynamic(
-            leading_dim=2
-        )
+        from_dlpack(tensor.detach(), assumed_align=16)
         for tensor in (q_values, k_values, v_values, output)
     ]
     q_tensor.element_type = cutlass.Float8E4M3FN
