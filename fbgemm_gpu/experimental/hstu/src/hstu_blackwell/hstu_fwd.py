@@ -81,6 +81,8 @@ class HSTUAttentionForwardSm100:
         self.pv_acc_dtype = Float32
         self.cluster_shape_mn = (1, 1)
         self.is_persistent = is_persistent
+        if self.debug:
+            self.is_persistent = False
         self.is_causal = is_causal
         self.is_local = is_local
         self.is_context = is_context
@@ -2063,7 +2065,40 @@ class HSTUAttentionForwardSm100:
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
-        while work_tile.is_valid_tile:
+        if const_expr(self.debug):
+            cute.arch.mbarrier_wait(
+                mbar_ptr + self.mbar_load_q_full_offset, mma_q_consumer_phase
+            )
+            cute.copy(
+                q_scale_copy,
+                q_scale_s[(None, None, None, None, 0)],
+                q_scale_t,
+            )
+            pipeline_kv.consumer_wait(mma_kv_consumer_state)
+            Ki_index, Ki_phase = (
+                mma_kv_consumer_state.index,
+                mma_kv_consumer_state.phase,
+            )
+            tSrKi = tSrK[None, None, None, Ki_index]
+            sK_cur = sK[None, None, None, Ki_index]
+            if const_expr(self.uneven_kv_smem):
+                sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
+            cute.copy(
+                k_scale_copy,
+                k_scale_s[(None, None, None, None, Ki_index)],
+                k_scale_t,
+            )
+            gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
+            with cute.arch.elect_one():
+                tcgen05.commit(mbar_ptr + self.mbar_S_full_offset)
+                tcgen05.commit(mbar_ptr + self.mbar_load_q_empty_offset)
+            pipeline_kv.consumer_release(mma_kv_consumer_state)
+            mma_kv_consumer_state.advance()
+            pipeline_kv.consumer_wait(mma_kv_consumer_state)
+            pipeline_kv.consumer_release(mma_kv_consumer_state)
+            mma_kv_consumer_state.advance()
+
+        while work_tile.is_valid_tile and not self.debug:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             offset_dynamic = (self.cta_tiler[0] - (seqlen.seqlen_q & (self.cta_tiler[0] - 1))) & (self.cta_tiler[0] - 1)
@@ -2108,14 +2143,6 @@ class HSTUAttentionForwardSm100:
             # 5. release K0
             pipeline_kv.consumer_release(mma_kv_consumer_state)
             mma_kv_consumer_state.advance()
-
-            if const_expr(self.debug):
-                with cute.arch.elect_one():
-                    tcgen05.commit(mbar_ptr + self.mbar_load_q_empty_offset)
-                pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                pipeline_kv.consumer_release(mma_kv_consumer_state)
-                mma_kv_consumer_state.advance()
-                return
 
             if n_block_nums > 1: # GEMM_QK1 (Q1 * K1 -> S1)
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
