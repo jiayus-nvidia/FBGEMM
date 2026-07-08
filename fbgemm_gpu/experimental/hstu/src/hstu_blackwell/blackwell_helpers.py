@@ -463,7 +463,9 @@ def gemm_ptx_blockscaled_ss(
     assert op.a_src == cute.nvgpu.tcgen05.OperandSource.SMEM
     sA_layout = sA.layout
     sB_layout = sB.layout
-    idesc: int = cutlass.const_expr(sm100_desc.mma_op_to_idesc(op))
+    idesc: int = cutlass.const_expr(
+        sm100_desc.mma_op_to_block_scaled_idesc(op)
+    )
     smem_desc_base_a: int = cutlass.const_expr(
         sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
@@ -537,7 +539,7 @@ def gemm_ptx_blockscaled_ss(
             "{\n\t"
             ".reg .pred leader_thread;\n\t"
             ".reg .pred p;\n\t"
-            ".reg .b32 idesc;\n\t"
+            ".reg .b32 idesc, sf_id;\n\t"
             ".reg .b32 tmem_acc, tmem_sfa, tmem_sfb;\n\t"
             ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
             ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
@@ -550,6 +552,12 @@ def gemm_ptx_blockscaled_ss(
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo, {hex(smem_desc_b_hi)}}};\n\t"
             "mov.b32 tmem_sfa, $3;\n\t"
             "mov.b32 tmem_sfb, $4;\n\t"
+            "shr.u32 sf_id, tmem_sfa, 30;\n\t"
+            "shl.b32 sf_id, sf_id, 29;\n\t"
+            "or.b32 idesc, idesc, sf_id;\n\t"
+            "shr.u32 sf_id, tmem_sfb, 30;\n\t"
+            "shl.b32 sf_id, sf_id, 4;\n\t"
+            "or.b32 idesc, idesc, sf_id;\n\t"
             "setp.ne.b32 p, $2, 0;\n\t"
             "@leader_thread tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale "
             "[tmem_acc], smem_desc_a, smem_desc_b, idesc, "

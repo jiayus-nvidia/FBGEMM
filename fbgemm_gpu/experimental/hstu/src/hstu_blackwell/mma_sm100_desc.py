@@ -53,6 +53,11 @@ class MXF8F6F4Format(IntEnum):
     E2M1 = 5
 
 
+class ScaleFormat(IntEnum):
+    UE4M3 = 0
+    UE8M0 = 1
+
+
 class MaxShift(IntEnum):
     NoShift = 0
     MaxShift8 = 1
@@ -169,6 +174,55 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
         op.shape_mnk[1],
         Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
         Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+    )
+
+
+def make_instr_desc_block_scaled(
+    a_type,
+    b_type,
+    sf_type,
+    M: int,
+    N: int,
+    a_major: Major,
+    b_major: Major,
+    a_neg: ScaleIn = ScaleIn.One,
+    b_neg: ScaleIn = ScaleIn.One,
+    is_sparse: bool = False,
+) -> int:
+    if sf_type is cutlass.Float8E8M0FNU:
+        scale_format = ScaleFormat.UE8M0
+    elif sf_type is cutlass.Float8E4M3FN:
+        scale_format = ScaleFormat.UE4M3
+    else:
+        raise TypeError(f"Unsupported block scale type: {sf_type!r}")
+
+    desc = 0
+    desc |= (int(is_sparse) & 0x1) << 2
+    desc |= (int(to_UMMA_format(a_type)) & 0x7) << 7
+    desc |= (int(to_UMMA_format(b_type)) & 0x7) << 10
+    desc |= (int(a_neg) & 0x1) << 13
+    desc |= (int(b_neg) & 0x1) << 14
+    desc |= (int(a_major) & 0x1) << 15
+    desc |= (int(b_major) & 0x1) << 16
+    desc |= ((N >> 3) & 0x3F) << 17
+    desc |= (int(scale_format) & 0x1) << 23
+    desc |= ((M >> 4) & 0x1F) << 24
+    return desc & 0xFFFF_FFFF
+
+
+def mma_op_to_block_scaled_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
+    return make_instr_desc_block_scaled(
+        op.a_dtype,
+        op.b_dtype,
+        op.sf_dtype,
+        op.shape_mnk[0],
+        op.shape_mnk[1],
+        Major.K
+        if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
+        else Major.MN,
+        Major.K
+        if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
+        else Major.MN,
     )
 
 
