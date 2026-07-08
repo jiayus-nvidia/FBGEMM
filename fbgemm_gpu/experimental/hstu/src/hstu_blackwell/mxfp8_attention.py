@@ -1661,19 +1661,27 @@ def hstu_varlen_bwd_mxfp8_100(
                         _mx_workspace((128, 128, workspace_batches), q.device)
                         for _ in range(3)
                     ),
-                    _matrix(
-                        128,
-                        head_dim,
-                        workspace_batches,
-                        torch.float32,
-                        q.device,
+                    (
+                        _matrix(
+                            128,
+                            head_dim,
+                            workspace_batches,
+                            torch.float32,
+                            q.device,
+                        )
+                        if q_tile_count > 1
+                        else None
                     ),
-                    _matrix(
-                        128,
-                        head_dim,
-                        workspace_batches,
-                        torch.float32,
-                        q.device,
+                    (
+                        _matrix(
+                            128,
+                            head_dim,
+                            workspace_batches,
+                            torch.float32,
+                            q.device,
+                        )
+                        if q_tile_count > 1
+                        else None
                     ),
                 )
             (
