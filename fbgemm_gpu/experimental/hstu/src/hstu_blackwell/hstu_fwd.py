@@ -253,17 +253,22 @@ class HSTUAttentionForwardSm100:
         ), t.stride[-1])
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [0, 2, 1]
-        mQ, mO = [
-            cute.make_tensor(t.iterator, cute.select(t.layout, mode=QO_layout_transpose))
-            for t in (mQ, mO)
-        ]
-        KV_layout_transpose = [0, 2, 1]
-        mK, mV = [
-            cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
-            for t in (mK, mV)
-        ]
-        V_layout_transpose = [1, 0, 2]
-        mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
+        mO = cute.make_tensor(
+            mO.iterator, cute.select(mO.layout, mode=QO_layout_transpose)
+        )
+        if const_expr(not self.is_mxfp8):
+            mQ = cute.make_tensor(
+                mQ.iterator, cute.select(mQ.layout, mode=QO_layout_transpose)
+            )
+            KV_layout_transpose = [0, 2, 1]
+            mK, mV = [
+                cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
+                for t in (mK, mV)
+            ]
+            V_layout_transpose = [1, 0, 2]
+            mV = cute.make_tensor(
+                mV.iterator, cute.select(mV.layout, mode=V_layout_transpose)
+            )
 
         if const_expr(self.is_mxfp8):
             mQScale = cute.make_tensor(

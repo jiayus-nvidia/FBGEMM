@@ -1984,9 +1984,9 @@ def _run_fused_forward(
     q_mx = _quantize(q.permute(0, 2, 1))
     k_mx = _quantize(k.permute(0, 2, 1))
     v_mx = _quantize(v.permute(2, 0, 1))
-    q_values = q_mx.values.permute(0, 2, 1)
-    k_values = k_mx.values.permute(0, 2, 1)
-    v_values = v_mx.values.permute(1, 2, 0)
+    q_values = q_mx.values
+    k_values = k_mx.values
+    v_values = v_mx.values
     output = torch.empty_like(q)
 
     q_tensor, k_tensor, v_tensor, output_tensor = [
