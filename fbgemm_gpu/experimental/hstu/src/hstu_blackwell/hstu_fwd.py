@@ -2423,6 +2423,9 @@ class HSTUAttentionForwardSm100:
                     tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
                 with cute.arch.elect_one():
                     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + self.mbar_O_full_offset, Int32(0)
+                )
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
