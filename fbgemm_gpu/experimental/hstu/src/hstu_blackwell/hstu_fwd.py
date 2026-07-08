@@ -1581,6 +1581,9 @@ class HSTUAttentionForwardSm100:
                     masking_step_k += 1
                     n_block_valid_k -= 1
 
+                if const_expr(self.debug):
+                    return
+
                 # load mainloop, V0 K2 V1 K3... Vi K(i+2)
                 while n_block_valid_k >= n_block_min:
                     n_block_k = sValidBlockIds[n_block_valid_k] if self.is_arbitrary else n_block_valid_k
