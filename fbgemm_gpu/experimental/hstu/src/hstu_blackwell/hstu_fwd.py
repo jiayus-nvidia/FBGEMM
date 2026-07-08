@@ -2419,6 +2419,14 @@ class HSTUAttentionForwardSm100:
                         (self.kBlockM, async_copy_elems)
                     ),
                 )
+                cO_i = cute.logical_divide(
+                    cute.make_identity_tensor(
+                        (self.kBlockM, self.head_dim_v_padded)
+                    ),
+                    cute.make_layout(
+                        (self.kBlockM, async_copy_elems)
+                    ),
+                )
                 tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
                     self.mma_tiler_pv,
                     self.o_layout,
@@ -2430,20 +2438,35 @@ class HSTUAttentionForwardSm100:
                 tiled_tmem_load = tcgen05.make_tmem_copy(
                     tmem_copy_atom, tOtO_i[(None, None), 0]
                 )
-                thr_tmem_load = tiled_tmem_load.get_slice(lane)
-                tOtO_t2r = thr_tmem_load.partition_S(
-                    tOtO_i[(None, None), None]
-                )
-                output_source = tOtO_t2r[None, 0, 0, 0]
-                output_values = cute.make_rmem_tensor(
-                    output_source.shape, self.pv_acc_dtype
-                )
-                cute.copy(tiled_tmem_load, output_source, output_values)
-                cute.arch.fence_view_async_tmem_load()
-                if lane == 0:
-                    mO[0, 0, 0] = self.o_dtype(
-                        output_values[0] * Float32(1.0 / 128.0)
+                inv_seqlen = Float32(1.0 / 128.0)
+                for warp_group in cutlass.range_constexpr(4):
+                    virtual_tidx = lane + warp_group * cute.arch.WARP_SIZE
+                    thr_tmem_load = tiled_tmem_load.get_slice(virtual_tidx)
+                    tOtO_t2r = thr_tmem_load.partition_S(
+                        tOtO_i[(None, None), None]
                     )
+                    tOcO_t2r = thr_tmem_load.partition_D(
+                        cO_i[(None, None), None]
+                    )
+                    for subtile in cutlass.range_constexpr(
+                        self.head_dim_v_padded // async_copy_elems
+                    ):
+                        output_source = tOtO_t2r[None, 0, 0, subtile]
+                        output_coord = tOcO_t2r[None, 0, 0, subtile]
+                        output_values = cute.make_rmem_tensor(
+                            output_source.shape, self.pv_acc_dtype
+                        )
+                        cute.copy(
+                            tiled_tmem_load, output_source, output_values
+                        )
+                        cute.arch.fence_view_async_tmem_load()
+                        for value_idx in cutlass.range_constexpr(
+                            cute.size(output_values)
+                        ):
+                            coord = output_coord[value_idx]
+                            mO[coord[0], coord[1], 0] = self.o_dtype(
+                                output_values[value_idx] * inv_seqlen
+                            )
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
