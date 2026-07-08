@@ -2362,7 +2362,7 @@ class HSTUAttentionForwardSm100:
                     v_scale_t,
                 )
                 debug_tOtO = cute.make_tensor(
-                    tStSs[0].iterator, tOtOs[0].layout
+                    tStSs[1].iterator, tOtOs[0].layout
                 )
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
                 for kblock_idx in cutlass.range_constexpr(
