@@ -1128,7 +1128,7 @@ class HSTUAttentionForwardSm100:
                 cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
                 cute.arch.sync_warp()
 
-            if const_expr(self.is_mxfp8):
+            if const_expr(self.is_mxfp8 and not self.debug):
                 cute.arch.barrier(
                     barrier_id=self.tmem_alloc_sync_bar_id,
                     number_of_threads=cute.arch.WARP_SIZE
@@ -1279,7 +1279,7 @@ class HSTUAttentionForwardSm100:
         if warp_idx >= self.silu0_warp_ids[0] and warp_idx <= self.silu1_warp_ids[-1]:
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.num_regs_silu)
-            if const_expr(self.is_mxfp8):
+            if const_expr(self.is_mxfp8 and not self.debug):
                 cute.arch.barrier(
                     barrier_id=self.tmem_alloc_sync_bar_id,
                     number_of_threads=cute.arch.WARP_SIZE
