@@ -283,12 +283,14 @@ class SiluBackwardMaskQuantizeSm100:
         dprobabilities: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
+        query_starts: Optional[cute.Tensor],
         quantized_dscores: cute.Tensor,
         dscore_scale_storage: cute.Tensor,
         quantized_probabilities_t: cute.Tensor,
         probability_t_scale_storage: cute.Tensor,
         quantized_dscores_t: cute.Tensor,
         dscore_t_scale_storage: cute.Tensor,
+        batch_heads_per_pair: Int32,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -326,12 +328,14 @@ class SiluBackwardMaskQuantizeSm100:
             dprobabilities,
             cu_seqlens_q,
             cu_seqlens_k,
+            query_starts,
             quantized_dscores,
             dscore_scales,
             quantized_probabilities_t,
             probability_t_scales,
             quantized_dscores_t,
             dscore_t_scales,
+            batch_heads_per_pair,
             num_heads,
             normalization,
             alpha,
@@ -357,12 +361,14 @@ class SiluBackwardMaskQuantizeSm100:
         dprobabilities: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
+        query_starts: Optional[cute.Tensor],
         quantized_dscores: cute.Tensor,
         dscore_scales: cute.Tensor,
         quantized_probabilities_t: cute.Tensor,
         probability_t_scales: cute.Tensor,
         quantized_dscores_t: cute.Tensor,
         dscore_t_scales: cute.Tensor,
+        batch_heads_per_pair: Int32,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -372,9 +378,15 @@ class SiluBackwardMaskQuantizeSm100:
         key_start: Int32,
     ):
         lane, _, _ = cute.arch.thread_idx()
-        block, batch_head, _ = cute.arch.block_idx()
+        block, output_batch, _ = cute.arch.block_idx()
         query_len, key_len, _ = scores.shape
         blocks_per_row = cute.ceil_div(key_len, MXFP8_BLOCK_SIZE)
+        batch_head = output_batch
+        query_tile_start = query_start
+        if cutlass.const_expr(query_starts is not None):
+            pair_idx = output_batch // batch_heads_per_pair
+            batch_head = output_batch - pair_idx * batch_heads_per_pair
+            query_tile_start = Int32(query_starts[pair_idx])
         batch = batch_head // num_heads
         query_length = Int32(cu_seqlens_q[batch + 1]) - Int32(cu_seqlens_q[batch])
         key_length = Int32(cu_seqlens_k[batch + 1]) - Int32(cu_seqlens_k[batch])
@@ -384,7 +396,7 @@ class SiluBackwardMaskQuantizeSm100:
             query_idx_local = block // blocks_per_row
             reduction_block = block - query_idx_local * blocks_per_row
             first_key_idx_local = reduction_block * MXFP8_BLOCK_SIZE + lane * 4
-            query_idx = query_start + query_idx_local
+            query_idx = query_tile_start + query_idx_local
             dscore_values = cute.make_rmem_tensor((4,), Float32)
             local_amax = Float32(0.0)
             for value_idx in cutlass.range_constexpr(4):
@@ -404,7 +416,7 @@ class SiluBackwardMaskQuantizeSm100:
                     )
                 ):
                     scaled_score = (
-                        Float32(scores[query_idx_local, key_idx_local, batch_head])
+                        Float32(scores[query_idx_local, key_idx_local, output_batch])
                         * alpha
                     )
                     sigmoid = 1.0 / (1.0 + cute.math.exp(-scaled_score))
@@ -412,7 +424,7 @@ class SiluBackwardMaskQuantizeSm100:
                     dscore = (
                         Float32(
                             dprobabilities[
-                                query_idx_local, key_idx_local, batch_head
+                                query_idx_local, key_idx_local, output_batch
                             ]
                         )
                         * derivative
@@ -436,7 +448,7 @@ class SiluBackwardMaskQuantizeSm100:
                 dscore_scales[
                     query_idx_local,
                     reduction_block * MXFP8_BLOCK_SIZE,
-                    batch_head,
+                    output_batch,
                 ] = cutlass.Uint8(scale_exponent + 127)
             quantized_values = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
             quantized_values.store(
@@ -446,7 +458,7 @@ class SiluBackwardMaskQuantizeSm100:
                 key_idx_local = first_key_idx_local + value_idx
                 if lane < 8 and key_idx_local < key_len:
                     quantized_dscores[
-                        query_idx_local, key_idx_local, batch_head
+                        query_idx_local, key_idx_local, output_batch
                     ] = quantized_values[value_idx]
         else:
             transpose_block = block - row_block_count
@@ -465,7 +477,7 @@ class SiluBackwardMaskQuantizeSm100:
             local_dscore_amax = Float32(0.0)
             for value_idx in cutlass.range_constexpr(4):
                 query_idx_local = first_query_idx_local + value_idx
-                query_idx = query_start + query_idx_local
+                query_idx = query_tile_start + query_idx_local
                 probability = Float32(0.0)
                 dscore = Float32(0.0)
                 if (
@@ -481,7 +493,7 @@ class SiluBackwardMaskQuantizeSm100:
                     )
                 ):
                     scaled_score = (
-                        Float32(scores[query_idx_local, key_idx_local, batch_head])
+                        Float32(scores[query_idx_local, key_idx_local, output_batch])
                         * alpha
                     )
                     sigmoid = 1.0 / (1.0 + cute.math.exp(-scaled_score))
@@ -492,7 +504,7 @@ class SiluBackwardMaskQuantizeSm100:
                     dscore = (
                         Float32(
                             dprobabilities[
-                                query_idx_local, key_idx_local, batch_head
+                                query_idx_local, key_idx_local, output_batch
                             ]
                         )
                         * derivative
@@ -536,10 +548,10 @@ class SiluBackwardMaskQuantizeSm100:
             if lane == 0:
                 scale_idx = reduction_block * MXFP8_BLOCK_SIZE
                 probability_t_scales[
-                    key_idx_local, scale_idx, batch_head
+                    key_idx_local, scale_idx, output_batch
                 ] = cutlass.Uint8(probability_scale_exponent + 127)
                 dscore_t_scales[
-                    key_idx_local, scale_idx, batch_head
+                    key_idx_local, scale_idx, output_batch
                 ] = cutlass.Uint8(dscore_scale_exponent + 127)
 
             quantized_probabilities = cute.make_rmem_tensor(
@@ -560,10 +572,10 @@ class SiluBackwardMaskQuantizeSm100:
                 query_idx_local = first_query_idx_local + value_idx
                 if lane < 8 and query_idx_local < query_len:
                     quantized_probabilities_t[
-                        key_idx_local, query_idx_local, batch_head
+                        key_idx_local, query_idx_local, output_batch
                     ] = quantized_probabilities[value_idx]
                     quantized_dscores_t[
-                        key_idx_local, query_idx_local, batch_head
+                        key_idx_local, query_idx_local, output_batch
                     ] = quantized_dscores_t_values[value_idx]
 
 
@@ -1117,10 +1129,17 @@ def _run_silu_backward(
     window_right: int,
     query_start: int = 0,
     key_start: int = 0,
+    query_starts: Optional[torch.Tensor] = None,
+    batch_heads_per_pair: Optional[int] = None,
     outputs: Optional[tuple[_MxMatrix, _MxMatrix, _MxMatrix]] = None,
 ):
-    if scores.shape[:2] != (128, 128):
+    if scores.shape[:2] != (128, 128) or scores.dtype != torch.float32:
         raise ValueError("fused SiLU backward quantization requires 128x128 tiles")
+    if (
+        dprobabilities.shape != scores.shape
+        or dprobabilities.dtype != torch.float32
+    ):
+        raise ValueError("dprobabilities must match the FP32 score tile")
     shape = tuple(scores.shape)
     if outputs is None:
         outputs = tuple(_mx_workspace(shape, scores.device) for _ in range(3))
@@ -1138,8 +1157,26 @@ def _run_silu_backward(
     offsets_k = from_dlpack(
         cu_seqlens_k.detach(), assumed_align=16
     ).mark_layout_dynamic(leading_dim=0)
+    if query_starts is None:
+        query_starts_tensor = None
+        batch_heads_per_pair = scores.shape[2]
+    else:
+        if query_starts.dtype != torch.int32 or query_starts.ndim != 1:
+            raise ValueError("query_starts must be a 1-D int32 tensor")
+        if batch_heads_per_pair is None or batch_heads_per_pair <= 0:
+            raise ValueError("batched SiLU backward requires batch_heads_per_pair")
+        query_starts_tensor = from_dlpack(
+            query_starts.detach(), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=0)
     stream = cutlass_torch.default_stream()
-    key = (tuple(scores.shape), num_heads)
+    key = (
+        tuple(scores.shape),
+        tuple(scores.stride()),
+        tuple(dprobabilities.stride()),
+        num_heads,
+        query_starts is not None,
+        batch_heads_per_pair,
+    )
     if key not in _compile_cache["silu_bwd_quantize"]:
         _compile_cache["silu_bwd_quantize"][key] = cute.compile(
             SiluBackwardMaskQuantizeSm100(),
@@ -1147,12 +1184,14 @@ def _run_silu_backward(
             dprobability_tensor,
             offsets_q,
             offsets_k,
+            query_starts_tensor,
             output_tensors[0],
             output_tensors[1],
             output_tensors[2],
             output_tensors[3],
             output_tensors[4],
             output_tensors[5],
+            Int32(batch_heads_per_pair),
             Int32(num_heads),
             Int32(normalization),
             Float32(alpha),
@@ -1167,12 +1206,14 @@ def _run_silu_backward(
         dprobability_tensor,
         offsets_q,
         offsets_k,
+        query_starts_tensor,
         output_tensors[0],
         output_tensors[1],
         output_tensors[2],
         output_tensors[3],
         output_tensors[4],
         output_tensors[5],
+        Int32(batch_heads_per_pair),
         Int32(num_heads),
         Int32(normalization),
         Float32(alpha),
@@ -1376,24 +1417,18 @@ def hstu_varlen_bwd_mxfp8_100(
     v_tiles = _tiles(dense_v)
     dout_tiles = _tiles(dense_dout)
 
-    q_mx_tiles = _quantize_tiles(dense_q)
+    q_mx_collection, _ = _quantize_tile_collection(dense_q)
     qt_mx_tiles = _quantize_tiles(dense_q, transpose=True)
     k_mx_tiles = _quantize_tiles(dense_k)
     kt_mx_tiles = _quantize_tiles(dense_k, transpose=True)
     v_mx_tiles = _quantize_tiles(dense_v)
-    dout_mx_tiles = _quantize_tiles(dense_dout)
+    dout_mx_collection, _ = _quantize_tile_collection(dense_dout)
     doutt_mx_tiles = _quantize_tiles(dense_dout, transpose=True)
 
-    dq_accumulators = (
-        [
-            _matrix(128, head_dim, batch_heads, torch.float32, q.device)
-            for _ in q_tiles
-        ]
-        if len(k_mx_tiles) > 1
-        else [None] * len(q_tiles)
-    )
+    q_tile_count = len(q_tiles)
+    combined_batches = q_tile_count * batch_heads
     dense_dq = _tiled_matrix(
-        len(q_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
+        q_tile_count, 128, head_dim, batch_heads, torch.bfloat16, q.device
     )
     dense_dk = _tiled_matrix(
         len(k_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
@@ -1401,40 +1436,93 @@ def hstu_varlen_bwd_mxfp8_100(
     dense_dv = _tiled_matrix(
         len(k_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
     )
-    score_workspace = _matrix(128, 128, batch_heads, torch.float32, q.device)
-    dprobability_workspace = _matrix(
-        128, 128, batch_heads, torch.float32, q.device
+    dense_dq_matrix = dense_dq.permute(1, 2, 0, 3).reshape(
+        128, head_dim, combined_batches
     )
-    silu_workspaces = tuple(
-        _mx_workspace((128, 128, batch_heads), q.device) for _ in range(3)
+    dq_accumulator = (
+        _matrix(128, head_dim, combined_batches, torch.float32, q.device)
+        if len(k_mx_tiles) > 1
+        else None
     )
     dk_accumulator = (
         _matrix(128, head_dim, batch_heads, torch.float32, q.device)
-        if len(q_mx_tiles) > 1
+        if q_tile_count > 1
         else None
     )
     dv_accumulator = (
         _matrix(128, head_dim, batch_heads, torch.float32, q.device)
-        if len(q_mx_tiles) > 1
+        if q_tile_count > 1
         else None
     )
+    query_starts = torch.arange(
+        0,
+        q_tile_count * 128,
+        128,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    chunk_size = 16
+    workspaces = {}
 
     for key_tile_idx, (key_mx, keyt_mx, value_mx) in enumerate(
         zip(k_mx_tiles, kt_mx_tiles, v_mx_tiles)
     ):
         key_start = key_tile_idx * 128
+        repeated_key = _repeat_mx_batches(key_mx, q_tile_count)
+        repeated_keyt = _repeat_mx_batches(keyt_mx, q_tile_count)
+        repeated_value = _repeat_mx_batches(value_mx, q_tile_count)
 
-        for query_tile_idx, (
-            query_mx,
-            queryt_mx,
-            dout_mx,
-            doutt_mx,
-        ) in enumerate(zip(q_mx_tiles, qt_mx_tiles, dout_mx_tiles, doutt_mx_tiles)):
-            query_start = query_tile_idx * 128
-            scores = _gemm(query_mx, key_mx, torch.float32, output=score_workspace)
+        for query_tile_idx in range(0, q_tile_count, chunk_size):
+            query_tile_end = min(query_tile_idx + chunk_size, q_tile_count)
+            pair_count = query_tile_end - query_tile_idx
+            batch_start = query_tile_idx * batch_heads
+            batch_end = query_tile_end * batch_heads
+            if pair_count not in workspaces:
+                workspace_batches = pair_count * batch_heads
+                workspaces[pair_count] = (
+                    _matrix(
+                        128,
+                        128,
+                        workspace_batches,
+                        torch.float32,
+                        q.device,
+                    ),
+                    _matrix(
+                        128,
+                        128,
+                        workspace_batches,
+                        torch.float32,
+                        q.device,
+                    ),
+                    tuple(
+                        _mx_workspace((128, 128, workspace_batches), q.device)
+                        for _ in range(3)
+                    ),
+                )
+            score_workspace, dprobability_workspace, silu_workspaces = (
+                workspaces[pair_count]
+            )
+            query_mx = _slice_mx_batches(
+                q_mx_collection, batch_start, batch_end
+            )
+            dout_mx = _slice_mx_batches(
+                dout_mx_collection, batch_start, batch_end
+            )
+            key_chunk = _slice_mx_batches(
+                repeated_key, batch_start, batch_end
+            )
+            keyt_chunk = _slice_mx_batches(
+                repeated_keyt, batch_start, batch_end
+            )
+            value_chunk = _slice_mx_batches(
+                repeated_value, batch_start, batch_end
+            )
+            scores = _gemm(
+                query_mx, key_chunk, torch.float32, output=score_workspace
+            )
             dprobabilities = _gemm(
                 dout_mx,
-                value_mx,
+                value_chunk,
                 torch.float32,
                 output=dprobability_workspace,
             )
@@ -1448,53 +1536,70 @@ def hstu_varlen_bwd_mxfp8_100(
                 alpha,
                 window_size_left,
                 window_size_right,
-                query_start=query_start,
                 key_start=key_start,
+                query_starts=query_starts[query_tile_idx:query_tile_end],
+                batch_heads_per_pair=batch_heads,
                 outputs=silu_workspaces,
             )
 
-            is_last_query_tile = query_tile_idx + 1 == len(q_mx_tiles)
-            gradient_dtype = (
-                torch.bfloat16 if is_last_query_tile else torch.float32
-            )
-            _gemm(
-                probabilities_t_mx,
-                doutt_mx,
-                gradient_dtype,
-                output=(
-                    dense_dv[key_tile_idx]
-                    if is_last_query_tile
-                    else dv_accumulator
-                ),
-                addend=dv_accumulator if query_tile_idx > 0 else None,
-            )
-            _gemm(
-                dscores_t_mx,
-                queryt_mx,
-                gradient_dtype,
-                output=(
-                    dense_dk[key_tile_idx]
-                    if is_last_query_tile
-                    else dk_accumulator
-                ),
-                addend=dk_accumulator if query_tile_idx > 0 else None,
-            )
             is_last_key_tile = key_tile_idx + 1 == len(k_mx_tiles)
             _gemm(
                 dscores_mx,
-                keyt_mx,
+                keyt_chunk,
                 torch.bfloat16 if is_last_key_tile else torch.float32,
                 output=(
-                    dense_dq[query_tile_idx]
+                    dense_dq_matrix[:, :, batch_start:batch_end]
                     if is_last_key_tile
-                    else dq_accumulators[query_tile_idx]
+                    else dq_accumulator[:, :, batch_start:batch_end]
                 ),
                 addend=(
-                    dq_accumulators[query_tile_idx]
+                    dq_accumulator[:, :, batch_start:batch_end]
                     if key_tile_idx > 0
                     else None
                 ),
             )
+
+            for pair_idx, current_query_tile in enumerate(
+                range(query_tile_idx, query_tile_end)
+            ):
+                pair_batch_start = pair_idx * batch_heads
+                pair_batch_end = pair_batch_start + batch_heads
+                probabilities_t_tile = _slice_mx_batches(
+                    probabilities_t_mx, pair_batch_start, pair_batch_end
+                )
+                dscores_t_tile = _slice_mx_batches(
+                    dscores_t_mx, pair_batch_start, pair_batch_end
+                )
+                is_last_query_tile = current_query_tile + 1 == q_tile_count
+                gradient_dtype = (
+                    torch.bfloat16 if is_last_query_tile else torch.float32
+                )
+                _gemm(
+                    probabilities_t_tile,
+                    doutt_mx_tiles[current_query_tile],
+                    gradient_dtype,
+                    output=(
+                        dense_dv[key_tile_idx]
+                        if is_last_query_tile
+                        else dv_accumulator
+                    ),
+                    addend=(
+                        dv_accumulator if current_query_tile > 0 else None
+                    ),
+                )
+                _gemm(
+                    dscores_t_tile,
+                    qt_mx_tiles[current_query_tile],
+                    gradient_dtype,
+                    output=(
+                        dense_dk[key_tile_idx]
+                        if is_last_query_tile
+                        else dk_accumulator
+                    ),
+                    addend=(
+                        dk_accumulator if current_query_tile > 0 else None
+                    ),
+                )
 
     dq_result = _unpack(dense_dq, cu_seqlens_q, q.shape[0], num_heads, output=dq)
     dk_result = _unpack(dense_dk, cu_seqlens_k, k.shape[0], num_heads, output=dk)
