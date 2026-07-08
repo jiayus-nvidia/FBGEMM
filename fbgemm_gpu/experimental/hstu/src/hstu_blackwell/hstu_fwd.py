@@ -2448,9 +2448,7 @@ class HSTUAttentionForwardSm100:
                     tOcO_t2r = thr_tmem_load.partition_D(
                         cO_i[(None, None), None]
                     )
-                    for subtile in cutlass.range_constexpr(
-                        self.head_dim_v_padded // async_copy_elems
-                    ):
+                    for subtile in cutlass.range_constexpr(1):
                         output_source = tOtO_t2r[None, 0, 0, subtile]
                         output_coord = tOcO_t2r[None, 0, 0, subtile]
                         output_values = cute.make_rmem_tensor(
