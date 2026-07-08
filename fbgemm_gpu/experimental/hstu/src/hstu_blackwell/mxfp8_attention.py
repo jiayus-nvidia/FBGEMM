@@ -1881,7 +1881,17 @@ def hstu_varlen_fwd_mxfp8_100(
                 workspaces[workspace_key] = (
                     _matrix(128, 128, pair_batches, torch.float32, q.device),
                     _mx_workspace((128, 128, pair_batches), q.device),
-                    _matrix(128, head_dim, pair_batches, torch.float32, q.device),
+                    (
+                        _matrix(
+                            128,
+                            head_dim,
+                            pair_batches,
+                            torch.float32,
+                            q.device,
+                        )
+                        if len(k_mx_tiles) > 1
+                        else None
+                    ),
                 )
             score_workspace, probability_workspace, partial_output_workspace = (
                 workspaces[workspace_key]
@@ -1891,8 +1901,8 @@ def hstu_varlen_fwd_mxfp8_100(
                 key_mx,
                 torch.float32,
                 output=score_workspace,
-                broadcast_a_batches=True,
-                broadcast_b_batches=True,
+                broadcast_a_batches=len(k_mx_tiles) > 1,
+                broadcast_b_batches=query_count > 1 or len(k_mx_tiles) > 1,
                 batch_heads=batch_heads,
             )
             probabilities_mx = _run_silu(
@@ -1911,6 +1921,15 @@ def hstu_varlen_fwd_mxfp8_100(
                 batch_heads_per_pair=batch_heads,
                 output=probability_workspace,
             )
+            if len(k_mx_tiles) == 1:
+                _gemm(
+                    probabilities_mx,
+                    value_mx,
+                    torch.bfloat16,
+                    output=dense_output_matrix[:, :, batch_start:batch_end],
+                    broadcast_b_batches=query_count > 1,
+                )
+                continue
             partial_outputs = _gemm(
                 probabilities_mx,
                 value_mx,
