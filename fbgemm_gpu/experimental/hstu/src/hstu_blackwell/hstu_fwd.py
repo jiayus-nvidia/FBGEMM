@@ -1270,8 +1270,6 @@ class HSTUAttentionForwardSm100:
         tma_atom_KScale: Optional[cute.CopyAtom],
         tma_atom_VScale: Optional[cute.CopyAtom],
     ):
-        if const_expr(self.debug):
-            return
         q_producer_phase = Int32(1)
         kv_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.kv_stage)
         tile_scheduler = TileSchedulerCls()
@@ -1436,11 +1434,14 @@ class HSTUAttentionForwardSm100:
                 masking_step_v = 0
                 n_block_valid_k = n_block_max - 1
                 n_block_valid_v = n_block_max - 1
+                if const_expr(self.debug):
+                    n_block_valid_v = n_block_min - 1
                 n_block_k = sValidBlockIds[n_block_valid_k] if self.is_arbitrary else n_block_valid_k
                 load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
                 q_producer_phase ^= 1
-                load_K(block=n_block_k, producer_state=kv_producer_state, page_idx=None)  # K0
-                kv_producer_state.advance()
+                if const_expr(not self.debug):
+                    load_K(block=n_block_k, producer_state=kv_producer_state, page_idx=None)  # K0
+                    kv_producer_state.advance()
                 if is_jump and masking_step_k == n_masking_steps - 1:
                     n_block_valid_k = min(n_block_valid_k, n_block_history)
                 masking_step_k += 1
@@ -2070,6 +2071,9 @@ class HSTUAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         if const_expr(self.debug):
+            cute.arch.mbarrier_wait(
+                mbar_ptr + self.mbar_load_q_full_offset, mma_q_consumer_phase
+            )
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(
                     mbar_ptr + self.mbar_load_q_empty_offset
