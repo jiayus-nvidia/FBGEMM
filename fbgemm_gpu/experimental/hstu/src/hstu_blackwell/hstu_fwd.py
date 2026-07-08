@@ -1270,6 +1270,8 @@ class HSTUAttentionForwardSm100:
         tma_atom_KScale: Optional[cute.CopyAtom],
         tma_atom_VScale: Optional[cute.CopyAtom],
     ):
+        if const_expr(self.debug):
+            return
         q_producer_phase = Int32(1)
         kv_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.kv_stage)
         tile_scheduler = TileSchedulerCls()
