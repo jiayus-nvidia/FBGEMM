@@ -45,8 +45,6 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.runtime import from_dlpack
 
-from . import blackwell_helpers as hstu_helpers
-
 """
 This example provides an experimental implementation of the SM100 batched dense blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
 
@@ -1250,19 +1248,37 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             tCtSFB_compact_s2t,
                         )
 
-                        hstu_helpers.gemm_ptx_blockscaled_ss(
-                            tiled_mma.op,
-                            tCtAcc.iterator.toint(),
-                            tCrA[(None, None, None, ab_consumer_state.index)],
-                            tCrB[(None, None, None, ab_consumer_state.index)],
-                            sA[None, None, None, ab_consumer_state.index],
-                            sB[None, None, None, ab_consumer_state.index],
-                            a_smem_layout_staged.inner,
-                            b_smem_layout_staged.inner,
-                            tCtSFA,
-                            tCtSFB_mma,
-                            zero_init=True,
-                        )
+                        # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
+                        num_kblocks = cute.size(tCrA, mode=[2])
+                        for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
+                            kblock_coord = (
+                                None,
+                                None,
+                                kblock_idx,
+                                ab_consumer_state.index,
+                            )
+
+                            # Set SFA/SFB tensor to tiled_mma
+                            sf_kblock_coord = (None, None, kblock_idx)
+                            tiled_mma.set(
+                                tcgen05.Field.SFA,
+                                tCtSFA[sf_kblock_coord].iterator,
+                            )
+                            tiled_mma.set(
+                                tcgen05.Field.SFB,
+                                tCtSFB_mma[sf_kblock_coord].iterator,
+                            )
+
+                            cute.gemm(
+                                tiled_mma,
+                                tCtAcc,
+                                tCrA[kblock_coord],
+                                tCrB[kblock_coord],
+                                tCtAcc,
+                            )
+
+                            # Enable accumulate on tCtAcc after first kblock
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
                         # Async arrive AB buffer empty
                         ab_pipeline.consumer_release(ab_consumer_state)

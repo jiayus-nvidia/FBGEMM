@@ -535,7 +535,6 @@ def gemm_ptx_blockscaled_ss(
                 cutlass.Int32(
                     tSFB[None, None, k].iterator.toint()
                 ).ir_value(),
-                cutlass.Int32(acc_tmem_addr).ir_value(),
             ],
             "{\n\t"
             ".reg .pred leader_thread;\n\t"
@@ -546,7 +545,7 @@ def gemm_ptx_blockscaled_ss(
             ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
             "elect.sync _|leader_thread, -1;\n\t"
             f"mov.b32 idesc, {hex(idesc)};\n\t"
-            "mov.b32 tmem_acc, $5;\n\t"
+            f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
             "mov.b32 smem_desc_a_lo, $0;\n\t"
             "mov.b32 smem_desc_b_lo, $1;\n\t"
             f"mov.b64 smem_desc_a, {{smem_desc_a_lo, {hex(smem_desc_a_hi)}}};\n\t"
@@ -564,7 +563,7 @@ def gemm_ptx_blockscaled_ss(
             "[tmem_acc], smem_desc_a, smem_desc_b, idesc, "
             "[tmem_sfa], [tmem_sfb], p;\n\t"
             "}\n",
-            "r,r,r,r,r,r",
+            "r,r,r,r,r",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
