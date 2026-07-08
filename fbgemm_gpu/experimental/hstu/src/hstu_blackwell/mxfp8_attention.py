@@ -642,8 +642,12 @@ class PairGradientReduceSm100:
                 pair_batch = pair_idx * batch_heads_per_pair + batch_head
                 dk_value += Float32(dk_pairs[row, column, pair_batch])
                 dv_value += Float32(dv_pairs[row, column, pair_batch])
-            dk_output[row, column, batch_head] = dk_value
-            dv_output[row, column, batch_head] = dv_value
+            dk_output[row, column, batch_head] = dk_value.to(
+                dk_output.element_type
+            )
+            dv_output[row, column, batch_head] = dv_value.to(
+                dv_output.element_type
+            )
 
 
 @dataclass
