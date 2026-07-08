@@ -1245,15 +1245,8 @@ def _unpack(
     return output
 
 
-def _quantize(
-    matrix: torch.Tensor, *, output_leading_dim: Optional[int] = None
-) -> _MxMatrix:
-    source_leading_dim = _leading_dim(matrix)
-    leading_dim = (
-        source_leading_dim
-        if output_leading_dim is None
-        else output_leading_dim
-    )
+def _quantize(matrix: torch.Tensor) -> _MxMatrix:
+    leading_dim = _leading_dim(matrix)
     values = _matrix_with_major(
         *matrix.shape,
         torch.uint8,
@@ -1990,7 +1983,7 @@ def _run_fused_forward(
 ) -> torch.Tensor:
     q_mx = _quantize(q.permute(0, 2, 1))
     k_mx = _quantize(k.permute(0, 2, 1))
-    v_mx = _quantize(v.permute(2, 0, 1), output_leading_dim=1)
+    v_mx = _quantize(v.permute(2, 0, 1))
     q_values = q_mx.values.permute(0, 2, 1)
     k_values = k_mx.values.permute(0, 2, 1)
     v_values = v_mx.values
@@ -2004,7 +1997,7 @@ def _run_fused_forward(
     ]
     v_tensor = from_dlpack(
         v_values.detach(), assumed_align=16
-    ).mark_layout_dynamic(leading_dim=1)
+    ).mark_layout_dynamic(leading_dim=0)
     q_tensor.element_type = cutlass.Float8E4M3FN
     k_tensor.element_type = cutlass.Float8E4M3FN
     v_tensor.element_type = cutlass.Float8E4M3FN
