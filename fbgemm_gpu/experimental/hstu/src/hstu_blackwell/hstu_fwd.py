@@ -253,12 +253,18 @@ class HSTUAttentionForwardSm100:
             for t in (mQ, mO)
         ]
         KV_layout_transpose = [0, 2, 1]
-        mK, mV = [
-            cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
-            for t in (mK, mV)
-        ]
+        mK = cute.make_tensor(
+            mK.iterator, cute.select(mK.layout, mode=KV_layout_transpose)
+        )
+        if const_expr(not self.is_mxfp8):
+            mV = cute.make_tensor(
+                mV.iterator, cute.select(mV.layout, mode=KV_layout_transpose)
+            )
         V_layout_transpose = [1, 0, 2]
-        mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
+        if const_expr(not self.is_mxfp8):
+            mV = cute.make_tensor(
+                mV.iterator, cute.select(mV.layout, mode=V_layout_transpose)
+            )
 
         if const_expr(self.is_mxfp8):
             mQScale = cute.make_tensor(
@@ -567,7 +573,7 @@ class HSTUAttentionForwardSm100:
             self.tma_copy_v_bytes = cute.size_in_bytes(
                 self.v_dtype,
                 cute.select(sV_layout, mode=[0, 1, 2]),
-            ) * 2
+            )
 
         TileScheduler = SingleTileVarlenScheduler
         # TileScheduler = SingleTileScheduler
