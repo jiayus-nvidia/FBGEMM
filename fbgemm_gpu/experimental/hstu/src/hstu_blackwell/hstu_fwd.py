@@ -2317,6 +2317,10 @@ class HSTUAttentionForwardSm100:
                 with cute.arch.elect_one():
                     tcgen05.commit(mbar_ptr + self.mbar_S_full_offset)
                 cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset, 0)
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + self.mbar_P_full_2_offset,
+                    P_full_O_rescaled_phase[0],
+                )
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
                         mbar_ptr + self.mbar_load_q_empty_offset
