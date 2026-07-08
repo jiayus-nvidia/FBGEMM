@@ -2004,7 +2004,7 @@ def _run_fused_forward(
     ]
     v_tensor = from_dlpack(
         v_values.detach(), assumed_align=16
-    ).mark_layout_dynamic(leading_dim=0)
+    ).mark_layout_dynamic(leading_dim=1)
     q_tensor.element_type = cutlass.Float8E4M3FN
     k_tensor.element_type = cutlass.Float8E4M3FN
     v_tensor.element_type = cutlass.Float8E4M3FN
