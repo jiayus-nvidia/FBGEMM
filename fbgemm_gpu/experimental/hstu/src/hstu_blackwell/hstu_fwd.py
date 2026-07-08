@@ -1124,6 +1124,55 @@ class HSTUAttentionForwardSm100:
                 cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
                 cute.arch.sync_warp()
 
+            if const_expr(self.is_mxfp8):
+                runtime_tmem_ptr = cute.arch.retrieve_tmem_ptr(
+                    Float32,
+                    alignment=16,
+                    ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
+                )
+                runtime_tStSs = tuple(
+                    cute.make_tensor(
+                        runtime_tmem_ptr + self.tmem_s_offset[stage],
+                        tStSs[stage].layout,
+                    )
+                    for stage in range(self.s_stage)
+                )
+                runtime_tOtOs = tuple(
+                    cute.make_tensor(
+                        runtime_tmem_ptr + self.tmem_o_offset[stage],
+                        tOtOs[stage].layout,
+                    )
+                    for stage in range(self.q_stage)
+                )
+                runtime_scale_base = runtime_tmem_ptr + (
+                    256 if self.debug else self.tmem_total
+                )
+                runtime_tQScale = cute.make_tensor(
+                    cute.recast_ptr(runtime_scale_base, dtype=self.sf_dtype),
+                    tQScale.layout,
+                )
+                runtime_scale_base += tcgen05.find_tmem_tensor_col_offset(
+                    runtime_tQScale
+                )
+                runtime_tKScale = cute.make_tensor(
+                    cute.recast_ptr(runtime_scale_base, dtype=self.sf_dtype),
+                    tKScale.layout,
+                )
+                runtime_scale_base += tcgen05.find_tmem_tensor_col_offset(
+                    runtime_tKScale
+                )
+                runtime_tPScale = cute.make_tensor(
+                    cute.recast_ptr(runtime_scale_base, dtype=self.sf_dtype),
+                    tPScale.layout,
+                )
+                runtime_scale_base += tcgen05.find_tmem_tensor_col_offset(
+                    runtime_tPScale
+                )
+                runtime_tVScale = cute.make_tensor(
+                    cute.recast_ptr(runtime_scale_base, dtype=self.sf_dtype),
+                    tVScale.layout,
+                )
+
             if const_expr(self.q_stage == 2):
                 self.mma(
                     tiled_mma_qk,
@@ -1156,8 +1205,8 @@ class HSTUAttentionForwardSm100:
                         sK_layout.inner,
                         sV_layout.inner,
                         sP_layout.inner,
-                        tStSs,
-                        tOtOs,
+                        runtime_tStSs,
+                        runtime_tOtOs,
                         tOrPs,
                         pipeline_kv,
                         mbar_ptr,
@@ -1168,10 +1217,10 @@ class HSTUAttentionForwardSm100:
                         sKScale=sKScale,
                         sPScale=sPScale,
                         sVScale=sVScale,
-                        tQScale=tQScale,
-                        tKScale=tKScale,
-                        tPScale=tPScale,
-                        tVScale=tVScale,
+                        tQScale=runtime_tQScale,
+                        tKScale=runtime_tKScale,
+                        tPScale=runtime_tPScale,
+                        tVScale=runtime_tVScale,
                         is_mxfp8=True,
                     )
                 else:
@@ -2033,7 +2082,7 @@ class HSTUAttentionForwardSm100:
                 partial(
                     sm100_utils.gemm_ptx_blockscaled_ss,
                     tiled_mma_qk.op,
-                    self.tmem_s_offset[stage],
+                    tStSs[stage].iterator.toint(),
                     tSrQs[stage],
                     sA=sQ[None, None, None, stage],
                     sA_swizzle=sQ_swizzle,
@@ -2048,7 +2097,7 @@ class HSTUAttentionForwardSm100:
                 partial(
                     sm100_utils.gemm_ptx_blockscaled_ss,
                     tiled_mma_pv.op,
-                    self.tmem_o_offset[0],
+                    tOtOs[0].iterator.toint(),
                     tOrPs[stage],
                     sA=sP[None, None, None, stage],
                     sA_swizzle=sP_swizzle,
