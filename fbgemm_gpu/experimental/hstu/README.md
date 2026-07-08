@@ -113,7 +113,8 @@ export HSTU_DISABLE_86OR89=TRUE; \
 python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="8.0 9.0"
 
 # Install HSTU-Blackwell
-pip install nvidia-cutlass-dsl && python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="10.0"
+pip install nvidia-cutlass-dsl "apache-tvm-ffi>=0.1.12,<0.2" torch-c-dlpack-ext && \
+python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="10.0"
 
 # If you don't add -DTORCH_CUDA_ARCH_LIST, the default is "8.0 9.0".
 # If you change any environment variables above, please run `python setup.py clean` and delete all *.cu files in src/hstu_hopper/instantiations/ and/or src/hstu_ampere/instantiations/ before compiling again.
