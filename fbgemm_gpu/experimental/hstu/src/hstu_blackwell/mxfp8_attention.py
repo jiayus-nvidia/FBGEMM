@@ -2002,7 +2002,7 @@ def _run_fused_forward(
         q_mx.scales, element_type=cutlass.Float8E8M0FNU
     )
     k_scale_tensor = _cute_tensor(
-        q_mx.scales, element_type=cutlass.Float8E8M0FNU
+        k_mx.scales, element_type=cutlass.Float8E8M0FNU
     )
     v_scale_tensor = _cute_tensor(
         v_mx.scales, element_type=cutlass.Float8E8M0FNU

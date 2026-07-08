@@ -409,7 +409,7 @@ class HSTUAttentionForwardSm100:
                 self.sf_vec_size,
                 self.q_stage,
             )
-            sKScale_layout = blockscaled_utils.make_smem_layout_sfa(
+            sKScale_layout = blockscaled_utils.make_smem_layout_sfb(
                 tiled_mma_qk,
                 self.mma_tiler_qk,
                 self.sf_vec_size,
@@ -486,7 +486,7 @@ class HSTUAttentionForwardSm100:
                 self.cluster_layout_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
-            tma_atom_KScale, tma_tensor_KScale = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_atom_KScale, tma_tensor_KScale = cute.nvgpu.make_tiled_tma_atom_B(
                 tma_load_op,
                 mKScale,
                 cute.slice_(sKScale_layout, (None, None, None, 0)),
@@ -1321,7 +1321,7 @@ class HSTUAttentionForwardSm100:
                 )
                 gKScale = cute.local_tile(
                     mKScale_cur,
-                    cute.select(self.mma_tiler_qk, mode=[0, 2]),
+                    cute.select(self.mma_tiler_qk, mode=[1, 2]),
                     (None, 0),
                 )
                 gVScale = cute.local_tile(
@@ -1356,7 +1356,7 @@ class HSTUAttentionForwardSm100:
             )
             if const_expr(self.is_mxfp8):
                 tSgQScale = thr_mma_qk.partition_A(gQScale)
-                tSgKScale = thr_mma_qk.partition_A(gKScale)
+                tSgKScale = thr_mma_qk.partition_B(gKScale)
                 tOgVScale = thr_mma_pv.partition_B(gVScale)
                 tQsQScale, tQgQScale = cpasync.tma_partition(
                     tma_atom_QScale,
