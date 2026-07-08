@@ -1374,7 +1374,16 @@ class HSTUAttentionForwardSm100:
                     silu_loop(stage=0, tStSi=silu_tStSs[0])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
-                if const_expr(not self.debug):
+                if const_expr(self.debug and self.is_mxfp8):
+                    store_O(
+                        seqlen=SeqlenInfoCls(Int32(0)),
+                        scale=cute.arch.rcp_approx(Float32(128.0)),
+                        m_block=Int32(0),
+                        head_idx=Int32(0),
+                        stage=0,
+                        epi_consumer_phase=Int32(0),
+                    )
+                elif const_expr(not self.debug):
                     silu_loop(stage=1, tStSi=silu_tStSs[1])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
@@ -2356,6 +2365,27 @@ class HSTUAttentionForwardSm100:
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                Vi_index, Vi_phase = (
+                    mma_kv_consumer_state.index,
+                    mma_kv_consumer_state.phase,
+                )
+                tOrVi = tOrV[None, None, None, Vi_index]
+                sV_cur = sV[None, None, None, Vi_index]
+                if const_expr(self.uneven_kv_smem):
+                    sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                cute.copy(
+                    p_scale_copy,
+                    p_scale_s[(None, None, None, None, 0)],
+                    p_scale_t,
+                )
+                cute.copy(
+                    v_scale_copy,
+                    v_scale_s[(None, None, None, None, Vi_index)],
+                    v_scale_t,
+                )
+                gemm_Pi[0](tCrB=tOrVi, sB=sV_cur, zero_init=True)
+                with cute.arch.elect_one():
+                    tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
@@ -3075,6 +3105,7 @@ class HSTUAttentionForwardSm100:
             if stage == 0:
                 cute.arch.mbarrier_wait(mbar_empty_ptr + 1, phase)
         if const_expr(self.is_mxfp8 and self.debug and K_or_V == "V"):
+            self.load_scale_g2s(raw_scale, sScale, block, stage)
             s_linear = cute.group_modes(sData, 0, 3)
             lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
             for i in cutlass.range(
@@ -3118,11 +3149,7 @@ class HSTUAttentionForwardSm100:
             if const_expr(self.debug)
             else cute.domain_offset((0, 0, block), g_scale)
         )
-        s_origin = (
-            s_scale
-            if const_expr(self.debug)
-            else cute.domain_offset((0, 0, 0, stage), s_scale)
-        )
+        s_origin = cute.domain_offset((0, 0, 0, stage), s_scale)
         tile_size = cute.cosize(
             cute.slice_(s_scale.layout, (None, None, None, 0))
         )
