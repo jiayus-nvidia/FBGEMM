@@ -3077,7 +3077,7 @@ class HSTUAttentionForwardSm100:
             for subtile in cutlass.range_constexpr(
                 self.head_dim_v_padded // async_copy_elems
             ):
-                if subtile % len(self.silu1_warp_ids) == warp_group:
+                if subtile == 0 and warp_group == 0:
                     output_source = tOtO_t2r[None, 0, 0, subtile]
                     output_destination = tOsO_r2s[
                         None, 0, 0, subtile
