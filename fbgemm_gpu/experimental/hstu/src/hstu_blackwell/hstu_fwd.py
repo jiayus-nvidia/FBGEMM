@@ -68,7 +68,7 @@ class HSTUAttentionForwardSm100:
         self.is_mxfp8 = is_mxfp8
         self.q_stage = 1 if self.head_dim_padded >= 256 or is_mxfp8 else 2
         self.s_stage = 2 # score stage for intra-warp overlap
-        self.debug = False
+        self.debug = True
         assert self.q_stage in [1, 2]
         assert self.s_stage in [2]
 
@@ -81,6 +81,8 @@ class HSTUAttentionForwardSm100:
         self.pv_acc_dtype = Float32
         self.cluster_shape_mn = (1, 1)
         self.is_persistent = is_persistent
+        if self.debug:
+            self.is_persistent = False
         self.is_causal = is_causal
         self.is_local = is_local
         self.is_context = is_context
@@ -1227,12 +1229,14 @@ class HSTUAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
             )
             if warp_idx <= self.silu0_warp_ids[-1] and warp_idx >= self.silu0_warp_ids[0]:
-                tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
-                silu_loop(stage=0, tStSi=tStSi)
+                if const_expr(not self.debug):
+                    tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
+                    silu_loop(stage=0, tStSi=tStSi)
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
-                tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
-                silu_loop(stage=1, tStSi=tStSi)
+                if const_expr(not self.debug):
+                    tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
+                    silu_loop(stage=1, tStSi=tStSi)
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
         return
@@ -2063,7 +2067,51 @@ class HSTUAttentionForwardSm100:
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
-        while work_tile.is_valid_tile:
+        if const_expr(self.debug):
+            if work_tile.is_valid_tile:
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + self.mbar_load_q_full_offset, mma_q_consumer_phase
+                )
+                cute.copy(
+                    q_scale_copy,
+                    q_scale_s[(None, None, None, None, 0)],
+                    q_scale_t,
+                )
+                pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                Ki_index, Ki_phase = (
+                    mma_kv_consumer_state.index,
+                    mma_kv_consumer_state.phase,
+                )
+                tSrKi = tSrK[None, None, None, Ki_index]
+                sK_cur = sK[None, None, None, Ki_index]
+                if const_expr(self.uneven_kv_smem):
+                    sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
+                cute.copy(
+                    k_scale_copy,
+                    k_scale_s[(None, None, None, None, Ki_index)],
+                    k_scale_t,
+                )
+                gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
+                with cute.arch.elect_one():
+                    tcgen05.commit(mbar_ptr + self.mbar_S_full_offset)
+                cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset, 0)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(
+                        mbar_ptr + self.mbar_load_q_empty_offset
+                    )
+                    cute.arch.mbarrier_arrive(
+                        mbar_ptr + self.mbar_load_kv_empty_offset + Ki_index
+                    )
+                mma_kv_consumer_state.advance()
+                pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                Vi_index = mma_kv_consumer_state.index
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(
+                        mbar_ptr + self.mbar_load_kv_empty_offset + Vi_index
+                    )
+                mma_kv_consumer_state.advance()
+
+        while work_tile.is_valid_tile and not self.debug:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             offset_dynamic = (self.cta_tiler[0] - (seqlen.seqlen_q & (self.cta_tiler[0] - 1))) & (self.cta_tiler[0] - 1)
