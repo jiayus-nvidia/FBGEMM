@@ -734,6 +734,7 @@ class HSTUAttentionForwardSm100:
             tma_tensor_QScale,
             tma_tensor_KScale,
             tma_tensor_VScale,
+            mKScale,
             tma_atom_QScale,
             tma_atom_KScale,
             tma_atom_VScale,
@@ -794,6 +795,7 @@ class HSTUAttentionForwardSm100:
         mQScale: Optional[cute.Tensor] = None,
         mKScale: Optional[cute.Tensor] = None,
         mVScale: Optional[cute.Tensor] = None,
+        raw_mKScale: Optional[cute.Tensor] = None,
         tma_atom_QScale: Optional[cute.CopyAtom] = None,
         tma_atom_KScale: Optional[cute.CopyAtom] = None,
         tma_atom_VScale: Optional[cute.CopyAtom] = None,
@@ -1078,6 +1080,7 @@ class HSTUAttentionForwardSm100:
                     mQScale,
                     mKScale,
                     mVScale,
+                    raw_mKScale,
                     sQScale,
                     sKScale,
                     sVScale,
@@ -1271,6 +1274,7 @@ class HSTUAttentionForwardSm100:
         mQScale: Optional[cute.Tensor],
         mKScale: Optional[cute.Tensor],
         mVScale: Optional[cute.Tensor],
+        raw_mKScale: Optional[cute.Tensor],
         sQScale: Optional[cute.Tensor],
         sKScale: Optional[cute.Tensor],
         sVScale: Optional[cute.Tensor],
@@ -1447,7 +1451,7 @@ class HSTUAttentionForwardSm100:
                 q_producer_phase ^= 1
                 if const_expr(self.debug):
                     self.load_scale_g2s(
-                        gKScale,
+                        raw_mKScale,
                         sKScale,
                         n_block_k,
                         kv_producer_state.index,
@@ -2836,14 +2840,12 @@ class HSTUAttentionForwardSm100:
         block: Int32,
         stage: Int32,
     ):
-        g_origin = cute.domain_offset((0, 0, block), g_scale)
-        s_origin = cute.domain_offset((0, 0, 0, stage), s_scale)
         tile_size = cute.cosize(
             cute.slice_(s_scale.layout, (None, None, None, 0))
         )
         linear_layout = cute.make_layout(tile_size)
-        g_linear = cute.make_tensor(g_origin.iterator, linear_layout)
-        s_linear = cute.make_tensor(s_origin.iterator, linear_layout)
+        g_linear = cute.make_tensor(g_scale.iterator, linear_layout)
+        s_linear = cute.make_tensor(s_scale.iterator, linear_layout)
         lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
         for i in cutlass.range(lane, tile_size, cute.arch.WARP_SIZE):
             s_linear[i] = g_linear[i]
