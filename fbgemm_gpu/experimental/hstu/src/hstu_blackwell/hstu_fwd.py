@@ -3160,8 +3160,24 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_wait(mbar_empty_ptr + 1, phase)
         if const_expr(self.is_mxfp8 and self.debug and K_or_V == "V"):
             self.load_scale_g2s(raw_scale, sScale, block, stage)
-            s_linear = cute.group_modes(sData, 0, 3)
+            s_scale_stage = cute.domain_offset((0, 0, 0, stage), sScale)
+            s_scale_linear = cute.make_tensor(
+                cute.recast_ptr(
+                    s_scale_stage.iterator, dtype=cutlass.Uint8
+                ),
+                cute.make_layout(
+                    cute.cosize(
+                        cute.slice_(sScale.layout, (None, None, None, 0))
+                    )
+                ),
+            )
             lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
+            for i in cutlass.range(
+                lane, cute.size(s_scale_linear), cute.arch.WARP_SIZE
+            ):
+                s_scale_linear[i] = cutlass.Uint8(127)
+            cute.arch.sync_warp()
+            s_linear = cute.group_modes(sData, 0, 3)
             for i in cutlass.range(
                 lane, self.kBlockN * self.head_dim_v_padded, cute.arch.WARP_SIZE
             ):
