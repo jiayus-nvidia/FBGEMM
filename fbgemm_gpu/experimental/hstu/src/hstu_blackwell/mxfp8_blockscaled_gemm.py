@@ -170,6 +170,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         broadcast_a_batches: bool = False,
         broadcast_b_batches: bool = False,
         batch_heads: int = 0,
+        broadcast_b_group_size: int = 0,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -197,8 +198,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.broadcast_a_batches = broadcast_a_batches
         self.broadcast_b_batches = broadcast_b_batches
         self.batch_heads = batch_heads
-        if self.broadcast_a_batches and self.batch_heads <= 0:
-            raise ValueError("batch_heads must be positive when broadcasting A batches")
+        self.broadcast_b_group_size = broadcast_b_group_size
+        if (
+            self.broadcast_a_batches or self.broadcast_b_group_size > 0
+        ) and self.batch_heads <= 0:
+            raise ValueError("batch_heads must be positive for grouped batch broadcasting")
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
@@ -992,7 +996,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 ]
                 # ((atom_v, rest_v), RestK)
                 b_batch_coord = output_batch_coord
-                if cutlass.const_expr(self.broadcast_b_batches):
+                if cutlass.const_expr(self.broadcast_b_group_size > 0):
+                    b_batch_coord = (
+                        output_batch_coord // self.broadcast_b_group_size
+                        * self.batch_heads
+                        + output_batch_coord % self.batch_heads
+                    )
+                elif cutlass.const_expr(self.broadcast_b_batches):
                     b_batch_coord = b_batch_coord % cute.size(tBgB.shape[3])
                 tBgB_slice = tBgB[
                     (None, mma_tile_coord_mnl[1], None, b_batch_coord)
