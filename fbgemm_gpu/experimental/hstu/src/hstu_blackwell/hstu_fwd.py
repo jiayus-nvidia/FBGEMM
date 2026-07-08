@@ -3089,6 +3089,7 @@ class HSTUAttentionForwardSm100:
                         tiled_tmem_load, output_source, output_values
                     )
                     cute.arch.fence_view_async_tmem_load()
+                    return
                     for value_idx in cutlass.range_constexpr(
                         cute.size(output_values)
                     ):
