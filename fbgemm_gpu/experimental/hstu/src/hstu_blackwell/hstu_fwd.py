@@ -2439,7 +2439,7 @@ class HSTUAttentionForwardSm100:
                     tmem_copy_atom, tOtO_i[(None, None), 0]
                 )
                 inv_seqlen = Float32(1.0 / 128.0)
-                for warp_group in cutlass.range_constexpr(4):
+                for warp_group in cutlass.range_constexpr(1):
                     virtual_tidx = lane + warp_group * cute.arch.WARP_SIZE
                     thr_tmem_load = tiled_tmem_load.get_slice(virtual_tidx)
                     tOtO_t2r = thr_tmem_load.partition_S(
