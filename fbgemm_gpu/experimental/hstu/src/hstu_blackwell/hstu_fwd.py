@@ -2412,22 +2412,18 @@ class HSTUAttentionForwardSm100:
         thr_tmem_store = tiled_tmem_store.get_slice(tidx)
         tStP_r2t = thr_tmem_store.partition_D(tStP)
         if const_expr(self.is_mxfp8):
-            smem_store_atom = sm100_utils_basic.get_smem_store_op(
-                self.o_layout,
-                self.q_dtype,
-                self.qk_acc_dtype,
-                tiled_tmem_store,
-            )
-            tiled_p_store = cute.make_tiled_copy_D(
-                smem_store_atom, tiled_tmem_store
-            )
-            thr_p_store = tiled_p_store.get_slice(tidx)
-            tPsP_r2s = thr_p_store.partition_D(
-                sP[None, None, None, stage]
+            sP_stage = sP[None, None, None, stage]
+            sP_mn = cute.make_tensor(
+                sP_stage.iterator,
+                cute.composition(
+                    sP_stage.layout,
+                    cute.make_layout(
+                        (self.mma_tiler_pv[0], self.mma_tiler_pv[2])
+                    ),
+                ),
             )
         else:
-            tiled_p_store = None
-            tPsP_r2s = None
+            sP_mn = None
 
         epi_consumer_phase = Int32(0)
         mma_si_consumer_phase = Int32(0)
@@ -2473,8 +2469,7 @@ class HSTUAttentionForwardSm100:
                 thr_tmem_store=thr_tmem_store,
                 tStS_t2r=tStS_t2r,
                 tStP_r2t=tStP_r2t,
-                tiled_p_store=tiled_p_store,
-                tPsP_r2s=tPsP_r2s,
+                sP_mn=sP_mn,
                 stage=stage,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
@@ -2547,8 +2542,7 @@ class HSTUAttentionForwardSm100:
         thr_tmem_store: cute.CopyAtom,
         tStS_t2r: cute.Tensor,
         tStP_r2t: cute.Tensor,
-        tiled_p_store: Optional[cute.TiledCopy],
-        tPsP_r2s: Optional[cute.Tensor],
+        sP_mn: Optional[cute.Tensor],
         stage: int | Int32,
         batch_idx: Int32,
         head_idx: Int32,
@@ -2575,9 +2569,9 @@ class HSTUAttentionForwardSm100:
         tScP_layout = cute.composition(tScS.layout, cute.make_layout((self.kBlockM, tilePlikeFP32)))
         tScP = cute.make_tensor(tScS.iterator, tScP_layout)
 
-        tScS_t2r_shape = thr_tmem_load.partition_D(tScS).shape
-        tSrS_t2r = cute.make_rmem_tensor(tScS_t2r_shape, self.qk_acc_dtype)
-        tSrS_preds = cute.make_rmem_tensor(tScS_t2r_shape, cutlass.Boolean)
+        tScS_t2r = thr_tmem_load.partition_D(tScS)
+        tSrS_t2r = cute.make_rmem_tensor(tScS_t2r.shape, self.qk_acc_dtype)
+        tSrS_preds = cute.make_rmem_tensor(tScS_t2r.shape, cutlass.Boolean)
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_preds, n_block=n_block)
 
@@ -2604,18 +2598,8 @@ class HSTUAttentionForwardSm100:
             cute.arch.mbarrier_wait(mbar_ptr + mbar_s0_s1_sequence_offset + stage, s0_s1_sequence_phase)
         fastsilu.silu_x2(tSrS_t2r, tSrP, tSrS_preds, mask_fn=partial(mask_fn) if mask_fn is not None else None)
         if const_expr(self.is_mxfp8):
-            tPrP = tiled_p_store.retile(tSrP)
-            split_P_arrive_idx = (
-                cute.size(tPsP_r2s.shape[3])
-                * self.split_P_arrive
-                // self.kBlockN
-            )
-            for i in cutlass.range_constexpr(split_P_arrive_idx):
-                cute.copy(
-                    tiled_p_store,
-                    tPrP[None, None, None, i],
-                    tPsP_r2s[None, None, None, i],
-                )
+            for i in cutlass.range_constexpr(cute.size(tSrP)):
+                sP_mn[tScS_t2r[i]] = tSrP[i]
             cute.arch.fence_view_async_shared()
         else:
             split_P_arrive_idx = cute.size(tStP_r2t.shape[2]) * self.split_P_arrive // self.kBlockN
@@ -2632,17 +2616,7 @@ class HSTUAttentionForwardSm100:
         # Notify mma warp that first portion of P is ready — MMA can start PV
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
         # Write remaining P columns
-        if const_expr(self.is_mxfp8):
-            for i in cutlass.range_constexpr(
-                split_P_arrive_idx, cute.size(tPsP_r2s.shape[3])
-            ):
-                cute.copy(
-                    tiled_p_store,
-                    tPrP[None, None, None, i],
-                    tPsP_r2s[None, None, None, i],
-                )
-            cute.arch.fence_view_async_shared()
-        else:
+        if const_expr(not self.is_mxfp8):
             for i in cutlass.range_constexpr(
                 split_P_arrive_idx, cute.size(tStP_r2t.shape[2])
             ):
