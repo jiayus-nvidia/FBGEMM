@@ -2075,11 +2075,6 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_load_q_full_offset, mma_q_consumer_phase
                 )
-                cute.copy(
-                    q_scale_copy,
-                    q_scale_s[(None, None, None, None, 0)],
-                    q_scale_t,
-                )
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 Ki_index, Ki_phase = (
                     mma_kv_consumer_state.index,
@@ -2089,15 +2084,6 @@ class HSTUAttentionForwardSm100:
                 sK_cur = sK[None, None, None, Ki_index]
                 if const_expr(self.uneven_kv_smem):
                     sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                cute.copy(
-                    k_scale_copy,
-                    k_scale_s[(None, None, None, None, Ki_index)],
-                    k_scale_t,
-                )
-                gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
-                with cute.arch.elect_one():
-                    tcgen05.commit(mbar_ptr + self.mbar_S_full_offset)
-                cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset, 0)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
                         mbar_ptr + self.mbar_load_q_empty_offset
