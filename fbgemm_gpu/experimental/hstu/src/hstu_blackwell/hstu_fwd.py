@@ -2976,7 +2976,11 @@ class HSTUAttentionForwardSm100:
             if const_expr(self.debug)
             else cute.domain_offset((0, 0, block), g_scale)
         )
-        s_origin = cute.domain_offset((0, 0, 0, stage), s_scale)
+        s_origin = (
+            s_scale
+            if const_expr(self.debug)
+            else cute.domain_offset((0, 0, 0, stage), s_scale)
+        )
         tile_size = cute.cosize(
             cute.slice_(s_scale.layout, (None, None, None, 0))
         )
