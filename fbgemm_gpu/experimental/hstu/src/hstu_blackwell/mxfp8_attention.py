@@ -23,6 +23,10 @@ from .mxfp8_quantize import (
 )
 
 MXFP8_QUANT_MODE = 6
+_MIN_PAIR_WORKSPACE_BATCHES = 512
+_FORWARD_PAIR_WORKSPACE_BUDGET_BYTES = 640 * 1024 * 1024
+_BACKWARD_PAIR_WORKSPACE_BUDGET_BYTES = 1024 * 1024 * 1024
+_FP32_BYTES = 4
 
 
 class VarlenPackSm100:
@@ -972,6 +976,28 @@ _compile_cache = {
 
 def _round_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
+
+
+def _pair_workspace_capacity(
+    batch_heads: int,
+    head_dim: int,
+    *,
+    backward: bool,
+) -> int:
+    score_bytes = 128 * 128 * _FP32_BYTES
+    mx_tile_bytes = 128 * 128 + scale_factor_storage_size(128, 128, 1)
+    gradient_bytes = 128 * head_dim * _FP32_BYTES
+    if backward:
+        bytes_per_batch = 2 * score_bytes + 3 * mx_tile_bytes + gradient_bytes
+        budget_bytes = _BACKWARD_PAIR_WORKSPACE_BUDGET_BYTES
+    else:
+        bytes_per_batch = score_bytes + mx_tile_bytes + gradient_bytes
+        budget_bytes = _FORWARD_PAIR_WORKSPACE_BUDGET_BYTES
+    workspace_batches = max(
+        _MIN_PAIR_WORKSPACE_BATCHES,
+        budget_bytes // bytes_per_batch,
+    )
+    return max(1, workspace_batches // batch_heads)
 
 
 def _leading_dim(tensor: torch.Tensor) -> int:
@@ -2022,8 +2048,11 @@ def hstu_varlen_fwd_mxfp8_100(
         dtype=torch.int32,
         device=q.device,
     )
-    max_workspace_batches = 512
-    pair_capacity = max(1, max_workspace_batches // batch_heads)
+    pair_capacity = _pair_workspace_capacity(
+        batch_heads,
+        head_dim,
+        backward=False,
+    )
     query_chunk_size = min(q_tile_count, 16, pair_capacity)
     key_chunk_size = min(
         len(k_mx_tiles), max(1, pair_capacity // query_chunk_size)
@@ -2221,8 +2250,11 @@ def hstu_varlen_bwd_mxfp8_100(
         dtype=torch.int32,
         device=q.device,
     )
-    max_workspace_batches = 512
-    pair_capacity = max(1, max_workspace_batches // batch_heads)
+    pair_capacity = _pair_workspace_capacity(
+        batch_heads,
+        head_dim,
+        backward=True,
+    )
     query_chunk_size = min(q_tile_count, 16, pair_capacity)
     key_chunk_size = min(
         k_tile_count, max(1, pair_capacity // query_chunk_size)
