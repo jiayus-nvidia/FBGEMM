@@ -3080,6 +3080,13 @@ class HSTUAttentionForwardSm100:
             tOsO_r2s = cute.group_modes(
                 tOsO_r2s, 3, cute.rank(tOsO_r2s)
             )
+            print(
+                "MXFP8_EPI_SHAPES",
+                tOtO.shape,
+                tOtO_epi.shape,
+                tOtO_t2r.shape,
+                tOsO_r2s.shape,
+            )
             inv_seqlen = Float32(1.0 / 128.0)
             for subtile in cutlass.range_constexpr(
                 cute.size(tOtO_t2r, mode=[3])
