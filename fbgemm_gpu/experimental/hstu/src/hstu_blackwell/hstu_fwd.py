@@ -3034,9 +3034,50 @@ class HSTUAttentionForwardSm100:
         gO = cute.local_tile(mO_cur, (self.kBlockM, self.head_dim_v_padded), (0, 0))
         cO = cute.make_identity_tensor((self.kBlockM, self.head_dim_v_padded))
         tOtO = tOtOs[stage]
-        tOsO = thr_mma_pv.partition_C(sO[None, None, stage])
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // self.o_dtype.width
+
+        if const_expr(self.debug):
+            epi_subtile = (self.epi_tile[0], async_copy_elems)
+            tOtO_epi = cute.flat_divide(
+                tOtO[((None, None), 0, 0)], epi_subtile
+            )
+            cO_epi = cute.flat_divide(cO, epi_subtile)
+            tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
+                self.mma_tiler_pv,
+                self.o_layout,
+                self.o_dtype,
+                self.pv_acc_dtype,
+                epi_subtile,
+                use_2cta_instrs=False,
+            )
+            tiled_tmem_load = tcgen05.make_tmem_copy(
+                tmem_copy_atom, tOtO_epi[(None, None, 0, 0)]
+            )
+            thr_tmem_load = tiled_tmem_load.get_slice(tidx)
+            tOtO_t2r = thr_tmem_load.partition_S(tOtO_epi)
+            tOcO_t2r = thr_tmem_load.partition_D(cO_epi)
+            inv_seqlen = Float32(1.0 / 128.0)
+            for subtile in cutlass.range_constexpr(
+                cute.size(tOtO_t2r, mode=[4])
+            ):
+                output_source = tOtO_t2r[None, None, None, 0, subtile]
+                output_coord = tOcO_t2r[None, None, None, 0, subtile]
+                output_values = cute.make_rmem_tensor(
+                    output_source.shape, self.pv_acc_dtype
+                )
+                cute.copy(tiled_tmem_load, output_source, output_values)
+                cute.arch.fence_view_async_tmem_load()
+                for value_idx in cutlass.range_constexpr(
+                    cute.size(output_values)
+                ):
+                    coord = output_coord[value_idx]
+                    mO[coord[0], coord[1], head_idx] = self.o_dtype(
+                        output_values[value_idx] * inv_seqlen
+                    )
+            return
+
+        tOsO = thr_mma_pv.partition_C(sO[None, None, stage])
 
         tOtO_i = cute.logical_divide(tOtO, cute.make_layout((self.kBlockM, async_copy_elems)))
         tOsO_i = cute.logical_divide(tOsO, cute.make_layout((self.kBlockM, async_copy_elems)))
