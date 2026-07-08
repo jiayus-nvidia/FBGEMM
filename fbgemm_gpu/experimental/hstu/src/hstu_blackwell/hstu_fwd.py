@@ -308,7 +308,14 @@ class HSTUAttentionForwardSm100:
             raise RuntimeError("The layout of mQ is not supported")
         if const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
             raise RuntimeError("The layout of mK is not supported")
-        if const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
+        if const_expr(
+            self.v_major_mode
+            != (
+                tcgen05.OperandMajorMode.K
+                if self.is_mxfp8
+                else tcgen05.OperandMajorMode.MN
+            )
+        ):
             raise RuntimeError("The layout of mV is not supported")
 
         # check type consistency
