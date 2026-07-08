@@ -546,6 +546,13 @@ class HSTUAttentionForwardSm100:
         self.tma_copy_q_bytes = cute.size_in_bytes(self.q_dtype, cute.select(sQ_layout, mode=[0, 1, 2]))
         self.tma_copy_k_bytes = cute.size_in_bytes(self.k_dtype, cute.select(sK_layout, mode=[0, 1, 2]))
         self.tma_copy_v_bytes = cute.size_in_bytes(self.v_dtype, cute.select(sV_layout, mode=[0, 1, 2]))
+        if const_expr(self.debug):
+            self.tma_copy_q_bytes = (
+                self.mma_tiler_qk[0]
+                * self.mma_tiler_qk[2]
+                * self.q_dtype.width
+                // 8
+            )
         if const_expr(self.is_mxfp8 and not self.debug):
             self.tma_copy_q_bytes += cute.size_in_bytes(
                 self.sf_dtype,
