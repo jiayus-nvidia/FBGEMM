@@ -9,11 +9,17 @@ import torch
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32
 
 from .mxfp8_blockscaled_gemm import Sm100BlockScaledPersistentDenseGemmKernel
-from .mxfp8_quantize import MxFp8QuantizeSm100, scale_factor_storage_size
+from .mxfp8_quantize import (
+    E4M3_MAX,
+    MXFP8_BLOCK_SIZE,
+    MxFp8QuantizeSm100,
+    scale_factor_storage_size,
+)
 
 MXFP8_QUANT_MODE = 6
 
@@ -126,14 +132,15 @@ def _valid_attention_position(
     )
 
 
-class SiluMaskSm100:
+class SiluMaskQuantizeSm100:
     @cute.jit
     def __call__(
         self,
         scores: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
-        probabilities: cute.Tensor,
+        quantized: cute.Tensor,
+        scale_storage: cute.Tensor,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -143,12 +150,25 @@ class SiluMaskSm100:
         key_start: Int32,
         stream: cuda.CUstream,
     ):
+        if cutlass.const_expr(quantized.element_type != cutlass.Float8E4M3FN):
+            raise TypeError("MXFP8 values must use Float8E4M3FN")
+        if cutlass.const_expr(scale_storage.element_type != cutlass.Float8E8M0FNU):
+            raise TypeError("MXFP8 scale factors must use Float8E8M0FNU")
+        scale_layout = blockscaled_utils.tile_atom_to_shape_SF(
+            scores.shape, MXFP8_BLOCK_SIZE
+        )
+        scales = cute.make_tensor(
+            cute.recast_ptr(scale_storage.iterator, dtype=cutlass.Uint8),
+            scale_layout,
+        )
         query_len, key_len, batch_heads = scores.shape
+        blocks_per_row = cute.ceil_div(key_len, MXFP8_BLOCK_SIZE)
         self.kernel(
             scores,
             cu_seqlens_q,
             cu_seqlens_k,
-            probabilities,
+            quantized,
+            scales,
             num_heads,
             normalization,
             alpha,
@@ -157,8 +177,8 @@ class SiluMaskSm100:
             query_start,
             key_start,
         ).launch(
-            grid=(cute.ceil_div(query_len * key_len, 256), batch_heads, 1),
-            block=(256, 1, 1),
+            grid=(query_len * blocks_per_row, batch_heads, 1),
+            block=(cute.arch.WARP_SIZE, 1, 1),
             stream=stream,
         )
 
@@ -168,7 +188,8 @@ class SiluMaskSm100:
         scores: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
-        probabilities: cute.Tensor,
+        quantized: cute.Tensor,
+        scales: cute.Tensor,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -177,20 +198,25 @@ class SiluMaskSm100:
         query_start: Int32,
         key_start: Int32,
     ):
-        thread, _, _ = cute.arch.thread_idx()
+        lane, _, _ = cute.arch.thread_idx()
         block, batch_head, _ = cute.arch.block_idx()
         query_len, key_len, _ = scores.shape
-        linear_idx = block * 256 + thread
-        if linear_idx < query_len * key_len:
-            query_idx_local = linear_idx // key_len
-            key_idx_local = linear_idx - query_idx_local * key_len
-            query_idx = query_start + query_idx_local
+        blocks_per_row = cute.ceil_div(key_len, MXFP8_BLOCK_SIZE)
+        query_idx_local = block // blocks_per_row
+        reduction_block = block - query_idx_local * blocks_per_row
+        first_key_idx_local = reduction_block * MXFP8_BLOCK_SIZE + lane * 4
+        query_idx = query_start + query_idx_local
+        batch = batch_head // num_heads
+        query_length = Int32(cu_seqlens_q[batch + 1]) - Int32(cu_seqlens_q[batch])
+        key_length = Int32(cu_seqlens_k[batch + 1]) - Int32(cu_seqlens_k[batch])
+
+        values = cute.make_rmem_tensor((4,), Float32)
+        local_amax = Float32(0.0)
+        for value_idx in cutlass.range_constexpr(4):
+            key_idx_local = first_key_idx_local + value_idx
             key_idx = key_start + key_idx_local
-            batch = batch_head // num_heads
-            query_length = Int32(cu_seqlens_q[batch + 1]) - Int32(cu_seqlens_q[batch])
-            key_length = Int32(cu_seqlens_k[batch + 1]) - Int32(cu_seqlens_k[batch])
             value = Float32(0.0)
-            if _valid_attention_position(
+            if lane < 8 and key_idx_local < key_len and _valid_attention_position(
                 query_idx,
                 key_idx,
                 query_length,
@@ -203,10 +229,36 @@ class SiluMaskSm100:
                 )
                 sigmoid = 1.0 / (1.0 + cute.math.exp(-scaled_score))
                 value = scaled_score * sigmoid / Float32(normalization)
-            probabilities[query_idx_local, key_idx_local, batch_head] = value
+            values[value_idx] = value
+            local_amax = cute.arch.fmax(local_amax, cute.arch.fmax(value, -value))
+
+        block_amax = cute.arch.warp_reduction_max(local_amax)
+        ratio = cute.arch.fmax(block_amax, 2.0**-126 * E4M3_MAX) / E4M3_MAX
+        log_scale = cute.math.log2(ratio)
+        scale_exponent = Int32(log_scale)
+        if log_scale > Float32(scale_exponent):
+            scale_exponent += 1
+        scale_exponent = cutlass.max(-126, cutlass.min(scale_exponent, 127))
+        scale = cute.math.exp2(Float32(scale_exponent))
+
+        if lane == 0:
+            scales[
+                query_idx_local,
+                reduction_block * MXFP8_BLOCK_SIZE,
+                batch_head,
+            ] = cutlass.Uint8(scale_exponent + 127)
+        quantized_values = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
+        quantized_values.store((values.load() / scale).to(cutlass.Float8E4M3FN))
+        if lane < 8:
+            for value_idx in cutlass.range_constexpr(4):
+                key_idx_local = first_key_idx_local + value_idx
+                if key_idx_local < key_len:
+                    quantized[query_idx_local, key_idx_local, batch_head] = (
+                        quantized_values[value_idx]
+                    )
 
 
-class SiluBackwardMaskSm100:
+class SiluBackwardMaskQuantizeSm100:
     @cute.jit
     def __call__(
         self,
@@ -216,6 +268,8 @@ class SiluBackwardMaskSm100:
         cu_seqlens_k: cute.Tensor,
         probabilities: cute.Tensor,
         dscores: cute.Tensor,
+        quantized_dscores: cute.Tensor,
+        dscore_scale_storage: cute.Tensor,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -225,7 +279,15 @@ class SiluBackwardMaskSm100:
         key_start: Int32,
         stream: cuda.CUstream,
     ):
+        scale_layout = blockscaled_utils.tile_atom_to_shape_SF(
+            scores.shape, MXFP8_BLOCK_SIZE
+        )
+        dscore_scales = cute.make_tensor(
+            cute.recast_ptr(dscore_scale_storage.iterator, dtype=cutlass.Uint8),
+            scale_layout,
+        )
         query_len, key_len, batch_heads = scores.shape
+        blocks_per_row = cute.ceil_div(key_len, MXFP8_BLOCK_SIZE)
         self.kernel(
             scores,
             dprobabilities,
@@ -233,6 +295,8 @@ class SiluBackwardMaskSm100:
             cu_seqlens_k,
             probabilities,
             dscores,
+            quantized_dscores,
+            dscore_scales,
             num_heads,
             normalization,
             alpha,
@@ -241,8 +305,8 @@ class SiluBackwardMaskSm100:
             query_start,
             key_start,
         ).launch(
-            grid=(cute.ceil_div(query_len * key_len, 256), batch_heads, 1),
-            block=(256, 1, 1),
+            grid=(query_len * blocks_per_row, batch_heads, 1),
+            block=(cute.arch.WARP_SIZE, 1, 1),
             stream=stream,
         )
 
@@ -255,6 +319,8 @@ class SiluBackwardMaskSm100:
         cu_seqlens_k: cute.Tensor,
         probabilities: cute.Tensor,
         dscores: cute.Tensor,
+        quantized_dscores: cute.Tensor,
+        dscore_scales: cute.Tensor,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -263,21 +329,26 @@ class SiluBackwardMaskSm100:
         query_start: Int32,
         key_start: Int32,
     ):
-        thread, _, _ = cute.arch.thread_idx()
+        lane, _, _ = cute.arch.thread_idx()
         block, batch_head, _ = cute.arch.block_idx()
         query_len, key_len, _ = scores.shape
-        linear_idx = block * 256 + thread
-        if linear_idx < query_len * key_len:
-            query_idx_local = linear_idx // key_len
-            key_idx_local = linear_idx - query_idx_local * key_len
-            query_idx = query_start + query_idx_local
+        blocks_per_row = cute.ceil_div(key_len, MXFP8_BLOCK_SIZE)
+        query_idx_local = block // blocks_per_row
+        reduction_block = block - query_idx_local * blocks_per_row
+        first_key_idx_local = reduction_block * MXFP8_BLOCK_SIZE + lane * 4
+        query_idx = query_start + query_idx_local
+        batch = batch_head // num_heads
+        query_length = Int32(cu_seqlens_q[batch + 1]) - Int32(cu_seqlens_q[batch])
+        key_length = Int32(cu_seqlens_k[batch + 1]) - Int32(cu_seqlens_k[batch])
+
+        dscore_values = cute.make_rmem_tensor((4,), Float32)
+        local_amax = Float32(0.0)
+        for value_idx in cutlass.range_constexpr(4):
+            key_idx_local = first_key_idx_local + value_idx
             key_idx = key_start + key_idx_local
-            batch = batch_head // num_heads
-            query_length = Int32(cu_seqlens_q[batch + 1]) - Int32(cu_seqlens_q[batch])
-            key_length = Int32(cu_seqlens_k[batch + 1]) - Int32(cu_seqlens_k[batch])
             probability = Float32(0.0)
             dscore = Float32(0.0)
-            if _valid_attention_position(
+            if lane < 8 and key_idx_local < key_len and _valid_attention_position(
                 query_idx,
                 key_idx,
                 query_length,
@@ -297,8 +368,38 @@ class SiluBackwardMaskSm100:
                     * alpha
                     / Float32(normalization)
                 )
-            probabilities[query_idx_local, key_idx_local, batch_head] = probability
-            dscores[query_idx_local, key_idx_local, batch_head] = dscore
+            if lane < 8 and key_idx_local < key_len:
+                probabilities[query_idx_local, key_idx_local, batch_head] = probability
+                dscores[query_idx_local, key_idx_local, batch_head] = dscore
+            dscore_values[value_idx] = dscore
+            local_amax = cute.arch.fmax(local_amax, cute.arch.fmax(dscore, -dscore))
+
+        block_amax = cute.arch.warp_reduction_max(local_amax)
+        ratio = cute.arch.fmax(block_amax, 2.0**-126 * E4M3_MAX) / E4M3_MAX
+        log_scale = cute.math.log2(ratio)
+        scale_exponent = Int32(log_scale)
+        if log_scale > Float32(scale_exponent):
+            scale_exponent += 1
+        scale_exponent = cutlass.max(-126, cutlass.min(scale_exponent, 127))
+        scale = cute.math.exp2(Float32(scale_exponent))
+
+        if lane == 0:
+            dscore_scales[
+                query_idx_local,
+                reduction_block * MXFP8_BLOCK_SIZE,
+                batch_head,
+            ] = cutlass.Uint8(scale_exponent + 127)
+        quantized_values = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
+        quantized_values.store(
+            (dscore_values.load() / scale).to(cutlass.Float8E4M3FN)
+        )
+        if lane < 8:
+            for value_idx in cutlass.range_constexpr(4):
+                key_idx_local = first_key_idx_local + value_idx
+                if key_idx_local < key_len:
+                    quantized_dscores[
+                        query_idx_local, key_idx_local, batch_head
+                    ] = quantized_values[value_idx]
 
 
 @dataclass
@@ -310,8 +411,8 @@ class _MxMatrix:
 _compile_cache = {
     "pack": {},
     "unpack": {},
-    "silu": {},
-    "silu_bwd": {},
+    "silu_quantize": {},
+    "silu_bwd_quantize": {},
     "quantize": {},
     "gemm": {},
 }
@@ -659,12 +760,20 @@ def _run_silu(
     window_right: int,
     query_start: int = 0,
     key_start: int = 0,
-    output: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    probabilities = torch.empty_like(scores) if output is None else output
-    if probabilities.shape != scores.shape or probabilities.dtype != torch.float32:
-        raise ValueError("SiLU output must be an FP32 tensor matching the score tile")
-    args = tuple(_cute_tensor(t) for t in (scores, probabilities))
+) -> _MxMatrix:
+    if scores.shape[:2] != (128, 128) or scores.dtype != torch.float32:
+        raise ValueError("fused SiLU quantization requires a 128x128 FP32 score tile")
+    values = _matrix(*scores.shape, torch.uint8, scores.device)
+    scales = torch.empty(
+        scale_factor_storage_size(*scores.shape),
+        dtype=torch.uint8,
+        device=scores.device,
+    )
+    scores_tensor = _cute_tensor(scores)
+    values_tensor = _mark_matrix(
+        _cute_tensor(values, element_type=cutlass.Float8E4M3FN), 1
+    )
+    scales_tensor = _cute_tensor(scales, element_type=cutlass.Float8E8M0FNU)
     offsets_q = from_dlpack(
         cu_seqlens_q.detach(), assumed_align=16
     ).mark_layout_dynamic(leading_dim=0)
@@ -672,14 +781,15 @@ def _run_silu(
         cu_seqlens_k.detach(), assumed_align=16
     ).mark_layout_dynamic(leading_dim=0)
     stream = cutlass_torch.default_stream()
-    key = (tuple(scores.shape), num_heads)
-    if key not in _compile_cache["silu"]:
-        _compile_cache["silu"][key] = cute.compile(
-            SiluMaskSm100(),
-            args[0],
+    key = (tuple(scores.shape), tuple(scores.stride()), num_heads)
+    if key not in _compile_cache["silu_quantize"]:
+        _compile_cache["silu_quantize"][key] = cute.compile(
+            SiluMaskQuantizeSm100(),
+            scores_tensor,
             offsets_q,
             offsets_k,
-            args[1],
+            values_tensor,
+            scales_tensor,
             Int32(num_heads),
             Int32(normalization),
             Float32(alpha),
@@ -689,11 +799,12 @@ def _run_silu(
             Int32(key_start),
             stream,
         )
-    _compile_cache["silu"][key](
-        args[0],
+    _compile_cache["silu_quantize"][key](
+        scores_tensor,
         offsets_q,
         offsets_k,
-        args[1],
+        values_tensor,
+        scales_tensor,
         Int32(num_heads),
         Int32(normalization),
         Float32(alpha),
@@ -703,7 +814,7 @@ def _run_silu(
         Int32(key_start),
         stream,
     )
-    return probabilities
+    return _MxMatrix(values, scales)
 
 
 def _run_silu_backward(
@@ -727,8 +838,22 @@ def _run_silu_backward(
         raise ValueError("SiLU backward outputs must match the score tile")
     if probabilities.dtype != torch.float32 or dscores.dtype != torch.float32:
         raise ValueError("SiLU backward outputs must use FP32")
+    if scores.shape[:2] != (128, 128):
+        raise ValueError("fused SiLU backward quantization requires 128x128 tiles")
+    dscore_values = _matrix(*scores.shape, torch.uint8, scores.device)
+    dscore_scales = torch.empty(
+        scale_factor_storage_size(*scores.shape),
+        dtype=torch.uint8,
+        device=scores.device,
+    )
     tensors = tuple(
         _cute_tensor(t) for t in (scores, dprobabilities, probabilities, dscores)
+    )
+    dscore_values_tensor = _mark_matrix(
+        _cute_tensor(dscore_values, element_type=cutlass.Float8E4M3FN), 1
+    )
+    dscore_scales_tensor = _cute_tensor(
+        dscore_scales, element_type=cutlass.Float8E8M0FNU
     )
     offsets_q = from_dlpack(
         cu_seqlens_q.detach(), assumed_align=16
@@ -738,15 +863,17 @@ def _run_silu_backward(
     ).mark_layout_dynamic(leading_dim=0)
     stream = cutlass_torch.default_stream()
     key = (tuple(scores.shape), num_heads)
-    if key not in _compile_cache["silu_bwd"]:
-        _compile_cache["silu_bwd"][key] = cute.compile(
-            SiluBackwardMaskSm100(),
+    if key not in _compile_cache["silu_bwd_quantize"]:
+        _compile_cache["silu_bwd_quantize"][key] = cute.compile(
+            SiluBackwardMaskQuantizeSm100(),
             tensors[0],
             tensors[1],
             offsets_q,
             offsets_k,
             tensors[2],
             tensors[3],
+            dscore_values_tensor,
+            dscore_scales_tensor,
             Int32(num_heads),
             Int32(normalization),
             Float32(alpha),
@@ -756,13 +883,15 @@ def _run_silu_backward(
             Int32(key_start),
             stream,
         )
-    _compile_cache["silu_bwd"][key](
+    _compile_cache["silu_bwd_quantize"][key](
         tensors[0],
         tensors[1],
         offsets_q,
         offsets_k,
         tensors[2],
         tensors[3],
+        dscore_values_tensor,
+        dscore_scales_tensor,
         Int32(num_heads),
         Int32(normalization),
         Float32(alpha),
@@ -772,7 +901,7 @@ def _run_silu_backward(
         Int32(key_start),
         stream,
     )
-    return probabilities, dscores
+    return probabilities, dscores, _MxMatrix(dscore_values, dscore_scales)
 
 
 def hstu_varlen_fwd_mxfp8_100(
@@ -843,7 +972,7 @@ def hstu_varlen_fwd_mxfp8_100(
         for key_tile_idx, (key_mx, value_mx) in enumerate(zip(k_mx_tiles, v_mx_tiles)):
             key_start = key_tile_idx * 128
             scores = _gemm(query_mx, key_mx, torch.float32)
-            _run_silu(
+            probabilities_mx = _run_silu(
                 scores,
                 cu_seqlens_q,
                 cu_seqlens_k,
@@ -854,7 +983,6 @@ def hstu_varlen_fwd_mxfp8_100(
                 window_size_right,
                 query_start=query_start,
                 key_start=key_start,
-                output=scores,
             )
             is_last_key_tile = key_tile_idx + 1 == len(k_mx_tiles)
             output = (
@@ -863,7 +991,7 @@ def hstu_varlen_fwd_mxfp8_100(
                 else output_accumulator
             )
             _gemm(
-                _quantize(scores),
+                probabilities_mx,
                 value_mx,
                 torch.bfloat16 if is_last_key_tile else torch.float32,
                 output=output,
@@ -971,7 +1099,7 @@ def hstu_varlen_bwd_mxfp8_100(
             query_start = query_tile_idx * 128
             scores = _gemm(query_mx, key_mx, torch.float32)
             dprobabilities = _gemm(dout_mx, value_mx, torch.float32)
-            _run_silu_backward(
+            _, _, dscores_mx = _run_silu_backward(
                 scores,
                 dprobabilities,
                 cu_seqlens_q,
@@ -1015,7 +1143,7 @@ def hstu_varlen_bwd_mxfp8_100(
             )
             is_last_key_tile = key_tile_idx + 1 == len(k_mx_tiles)
             _gemm(
-                _quantize(dprobabilities),
+                dscores_mx,
                 keyt_mx,
                 torch.bfloat16 if is_last_key_tile else torch.float32,
                 output=(
