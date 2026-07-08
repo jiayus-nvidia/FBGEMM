@@ -18,6 +18,11 @@ from cutlass.cute.typing import Float32, Int32, Float16, BFloat16
 
 from .hstu_fwd import HSTUAttentionForwardSm100
 from .hstu_bwd import HSTUAttentionBackwardSm100
+from .mxfp8_attention import (
+    MXFP8_QUANT_MODE,
+    hstu_varlen_bwd_mxfp8_100,
+    hstu_varlen_fwd_mxfp8_100,
+)
 
 def hstu_varlen_fwd_100(
     q: torch.Tensor,

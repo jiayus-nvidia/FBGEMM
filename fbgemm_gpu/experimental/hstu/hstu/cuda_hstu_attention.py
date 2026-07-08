@@ -400,7 +400,12 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             assert seqused_q is None and seqused_k is None, \
                 "HSTU-Blackwell does not support seqused_q and seqused_k"
             _sm100 = _import_sm100()
-            out, rab_padded = _sm100.hstu_varlen_fwd_100(
+            sm100_forward = (
+                _sm100.hstu_varlen_fwd_mxfp8_100
+                if quant_mode == _sm100.MXFP8_QUANT_MODE
+                else _sm100.hstu_varlen_fwd_100
+            )
+            out, rab_padded = sm100_forward(
                 q,
                 k,
                 v,
@@ -619,7 +624,12 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
             assert seqused_q is None and seqused_k is None, \
                 "HSTU-Blackwell does not support seqused_q and seqused_k"
             _sm100 = _import_sm100()
-            dq, dk, dv, dRab = _sm100.hstu_varlen_bwd_100(
+            sm100_backward = (
+                _sm100.hstu_varlen_bwd_mxfp8_100
+                if quant_mode == _sm100.MXFP8_QUANT_MODE
+                else _sm100.hstu_varlen_bwd_100
+            )
+            dq, dk, dv, dRab = sm100_backward(
                 dout,
                 q,
                 k,
@@ -723,7 +733,7 @@ def hstu_attn_varlen_func(
         page_ids: (page_offsets[-1],). The ids of the pages in the batch.
         last_page_lens: (batch_size,). The lengths of the last pages in the batch.
         func: (nheads, total_q + 256). Function to describe the mask shape in arbitrary mask.
-        quant_mode: int. Quantization mode.
+        quant_mode: int. Quantization mode. Mode 6 selects OCP MXFP8 on SM100.
     Return:
         out: (total, nheads, headdim).
     """

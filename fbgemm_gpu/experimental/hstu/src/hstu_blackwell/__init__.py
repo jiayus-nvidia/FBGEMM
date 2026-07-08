@@ -12,10 +12,19 @@ try:
 except ImportError:
     from . import hstu_ops_gpu as hstu_ops_gpu_sm100
 
-from .hstu_ops_gpu import hstu_varlen_fwd_100, hstu_varlen_bwd_100
+from .hstu_ops_gpu import (
+    MXFP8_QUANT_MODE,
+    hstu_varlen_bwd_100,
+    hstu_varlen_bwd_mxfp8_100,
+    hstu_varlen_fwd_100,
+    hstu_varlen_fwd_mxfp8_100,
+)
 
 __all__ = [
     "hstu_ops_gpu_sm100",
     "hstu_varlen_fwd_100",
     "hstu_varlen_bwd_100",
+    "hstu_varlen_fwd_mxfp8_100",
+    "hstu_varlen_bwd_mxfp8_100",
+    "MXFP8_QUANT_MODE",
 ]
