@@ -1446,7 +1446,7 @@ class HSTUAttentionForwardSm100:
         )
         tScO_t2r = thr_tmem_load.partition_D(tScS)
         output_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(4)),
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)),
             Float32,
         )
         output_tmem_load = tcgen05.make_tmem_copy(
