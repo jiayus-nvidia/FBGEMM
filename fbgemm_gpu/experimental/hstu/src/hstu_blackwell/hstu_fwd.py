@@ -3083,9 +3083,7 @@ class HSTUAttentionForwardSm100:
                 tOsO_r2s, 3, cute.rank(tOsO_r2s)
             )
             inv_seqlen = Float32(1.0 / 128.0)
-            for subtile in cutlass.range_constexpr(
-                cute.size(tOtO_t2r, mode=[3])
-            ):
+            for subtile in cutlass.range_constexpr(1):
                 output_source = tOtO_t2r[None, None, None, subtile]
                 output_destination = tOsO_r2s[
                     None, None, None, subtile
@@ -3096,6 +3094,7 @@ class HSTUAttentionForwardSm100:
                 )
                 cute.copy(tiled_tmem_load, output_source, output_values)
                 cute.arch.fence_view_async_tmem_load()
+                return
                 for value_idx in cutlass.range_constexpr(
                     cute.size(output_values)
                 ):
