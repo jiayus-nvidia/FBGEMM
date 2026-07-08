@@ -2426,6 +2426,11 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_O_full_offset, Int32(0)
                 )
+                if const_expr(self.debug):
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(
+                            mbar_ptr + self.mbar_O_full_offset + 1
+                        )
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
@@ -3047,7 +3052,11 @@ class HSTUAttentionForwardSm100:
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_r2s = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
 
-        cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, epi_consumer_phase)
+        ready_stage = 1 if const_expr(self.debug) else stage
+        cute.arch.mbarrier_wait(
+            mbar_ptr + self.mbar_O_full_offset + ready_stage,
+            epi_consumer_phase,
+        )
         if const_expr(self.debug):
             return
         for i in cutlass.range_constexpr(self.head_dim_v_padded // async_copy_elems):
