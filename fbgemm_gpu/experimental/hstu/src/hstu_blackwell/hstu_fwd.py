@@ -1961,7 +1961,7 @@ class HSTUAttentionForwardSm100:
         accumulate: Boolean | bool,
     ):
         tiled_mma.set(tcgen05.Field.ACCUMULATE, accumulate)
-        for kblock in cutlass.range_constexpr(cute.size(operand_a, mode=[2])):
+        for kblock in cutlass.range_constexpr(1):
             scale_coord = (None, None, kblock)
             tiled_mma.set(tcgen05.Field.SFA, scale_a[scale_coord].iterator)
             tiled_mma.set(tcgen05.Field.SFB, scale_b[scale_coord].iterator)
@@ -2110,7 +2110,15 @@ class HSTUAttentionForwardSm100:
                     k_scale_s[(None, None, None, None, Ki_index)],
                     k_scale_t,
                 )
-                gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
+                self.blockscaled_gemm(
+                    tiled_mma_qk,
+                    tStSs[0],
+                    tSrQs[0],
+                    tSrKi,
+                    tQScale,
+                    tKScale,
+                    False,
+                )
                 with cute.arch.elect_one():
                     tcgen05.commit(mbar_ptr + self.mbar_S_full_offset)
                 cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset, 0)
