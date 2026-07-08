@@ -245,7 +245,15 @@ class HSTUAttentionForwardSm100:
                 raise TypeError("MXFP8 forward requires E8M0 scale factors")
             self.sf_vec_size = 32
         # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
+        new_stride = lambda t: (
+            *(
+                s
+                if isinstance(s, int)
+                else cute.assume(s, divby=128 // t.element_type.width)
+                for s in t.stride[:-1]
+            ),
+            t.stride[-1],
+        )
         mQ, mK, mV, mO = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [0, 2, 1]
         mQ, mO = [
