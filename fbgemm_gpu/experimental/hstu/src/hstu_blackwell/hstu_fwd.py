@@ -2361,6 +2361,9 @@ class HSTUAttentionForwardSm100:
                     v_scale_s[(None, None, None, None, Vi_index)],
                     v_scale_t,
                 )
+                debug_tOtO = cute.make_tensor(
+                    tStSs[0].iterator, tOtOs[0].layout
+                )
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
                 for kblock_idx in cutlass.range_constexpr(
                     cute.size(tOrPs[0], mode=[2])
@@ -2374,10 +2377,10 @@ class HSTUAttentionForwardSm100:
                     )
                     cute.gemm(
                         tiled_mma_pv,
-                        tOtOs[0],
+                        debug_tOtO,
                         tOrPs[0][sf_coord],
                         tOrVi[sf_coord],
-                        tOtOs[0],
+                        debug_tOtO,
                     )
                     tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
                 with cute.arch.elect_one():
