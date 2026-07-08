@@ -2739,6 +2739,8 @@ class HSTUAttentionForwardSm100:
         3. Computing SiLU
         4. Coordinating pipeline synchronization between different processing stages
         """
+        if const_expr(self.debug):
+            return mma_si_consumer_phase ^ 1, s0_s1_sequence_phase ^ 1
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor((self.mma_tiler_qk[0], self.mma_tiler_qk[1])))
         tScS_vec_layout = cute.composition(tScS.layout, cute.make_layout((self.kBlockM, 1)))
@@ -2755,8 +2757,6 @@ class HSTUAttentionForwardSm100:
 
         # Wait for Si
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
-        if const_expr(self.debug):
-            return mma_si_consumer_phase ^ 1, s0_s1_sequence_phase ^ 1
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)  # copy from tmem to rmem
         cute.arch.fence_view_async_tmem_load()
 
