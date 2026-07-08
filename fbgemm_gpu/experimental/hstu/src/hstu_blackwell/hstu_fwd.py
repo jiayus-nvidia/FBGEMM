@@ -967,7 +967,7 @@ class HSTUAttentionForwardSm100:
                 self.sf_vec_size,
                 cute.slice_(sVScale_layout, (None, None, None, 0)),
             )
-            scale_base = tStS.iterator + self.tmem_total
+            scale_base = tStS.iterator + (256 if self.debug else self.tmem_total)
             tQScale = cute.make_tensor(
                 cute.recast_ptr(scale_base, dtype=self.sf_dtype),
                 tQScale_layout,
