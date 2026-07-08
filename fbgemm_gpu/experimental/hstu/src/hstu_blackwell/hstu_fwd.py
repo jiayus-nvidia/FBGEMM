@@ -1891,6 +1891,7 @@ class HSTUAttentionForwardSm100:
         scale_b: cute.Tensor,
         accumulate: Boolean | bool,
     ):
+        tiled_mma = cute.make_tiled_mma(cute.make_mma_atom(tiled_mma.op))
         tiled_mma.set(tcgen05.Field.ACCUMULATE, accumulate)
         for kblock in cutlass.range_constexpr(cute.size(operand_a, mode=[2])):
             scale_coord = (None, None, kblock)
