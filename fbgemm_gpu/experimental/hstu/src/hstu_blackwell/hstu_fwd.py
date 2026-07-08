@@ -3044,7 +3044,9 @@ class HSTUAttentionForwardSm100:
             tOtO_epi = cute.flat_divide(
                 tOtO[((None, None), 0, 0, None)], epi_subtile
             )
-            cO_epi = cute.flat_divide(cO, epi_subtile)
+            sO_epi = cute.flat_divide(
+                sO[None, None, stage], epi_subtile
+            )
             tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
                 self.mma_tiler_pv,
                 self.o_layout,
@@ -3058,22 +3060,31 @@ class HSTUAttentionForwardSm100:
             )
             thr_tmem_load = tiled_tmem_load.get_slice(tidx)
             tOtO_t2r = thr_tmem_load.partition_S(tOtO_epi)
-            tOcO_t2r = thr_tmem_load.partition_D(cO_epi)
             tOtO_t2r = tOtO_t2r[
                 None, None, None, None, None, 0
             ]
             tOtO_t2r = cute.group_modes(
                 tOtO_t2r, 3, cute.rank(tOtO_t2r)
             )
-            tOcO_t2r = cute.group_modes(
-                tOcO_t2r, 3, cute.rank(tOcO_t2r)
+            smem_copy_atom = sm100_utils_basic.get_smem_store_op(
+                self.o_layout,
+                self.o_dtype,
+                self.pv_acc_dtype,
+                tiled_tmem_load,
+            )
+            tiled_smem_store = cute.make_tiled_copy_D(
+                smem_copy_atom, tiled_tmem_load
+            )
+            thr_smem_store = tiled_smem_store.get_slice(tidx)
+            tOsO_r2s = thr_smem_store.partition_D(sO_epi)
+            tOsO_r2s = cute.group_modes(
+                tOsO_r2s, 3, cute.rank(tOsO_r2s)
             )
             inv_seqlen = Float32(1.0 / 128.0)
             for subtile in cutlass.range_constexpr(
                 cute.size(tOtO_t2r, mode=[3])
             ):
                 output_source = tOtO_t2r[None, None, None, subtile]
-                output_coord = tOcO_t2r[None, None, None, subtile]
                 output_values = cute.make_rmem_tensor(
                     output_source.shape, self.pv_acc_dtype
                 )
@@ -3082,10 +3093,44 @@ class HSTUAttentionForwardSm100:
                 for value_idx in cutlass.range_constexpr(
                     cute.size(output_values)
                 ):
-                    coord = output_coord[value_idx]
-                    mO[coord[0], coord[1], head_idx] = self.o_dtype(
+                    output_values[value_idx] = (
                         output_values[value_idx] * inv_seqlen
                     )
+                output_converted = cute.make_rmem_tensor(
+                    output_values.shape, self.o_dtype
+                )
+                output_converted.store(
+                    output_values.load().to(self.o_dtype)
+                )
+                cute.copy(
+                    tiled_smem_store,
+                    tiled_smem_store.retile(output_converted),
+                    tOsO_r2s[None, None, None, subtile],
+                )
+            cute.arch.fence_view_async_shared()
+            cute.arch.barrier(
+                barrier_id=NamedBarrierFwd.Epilogue + stage,
+                number_of_threads=cute.arch.WARP_SIZE
+                * len(self.silu1_warp_ids),
+            )
+            gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+            tOsO_g2r = gmem_thr_copy_O.partition_S(
+                sO[None, None, stage]
+            )
+            tOrO = cute.make_fragment_like(tOsO_g2r, self.o_dtype)
+            tOgO = gmem_thr_copy_O.partition_D(gO)
+            for rest_m in cutlass.range_constexpr(
+                cute.size(tOrO.shape[1])
+            ):
+                cute.autovec_copy(
+                    tOsO_g2r[None, rest_m, None],
+                    tOrO[None, rest_m, None],
+                )
+                cute.copy(
+                    gmem_tiled_copy_O,
+                    tOrO[None, rest_m, None],
+                    tOgO[None, rest_m, None],
+                )
             return
 
         tOsO = thr_mma_pv.partition_C(sO[None, None, stage])
