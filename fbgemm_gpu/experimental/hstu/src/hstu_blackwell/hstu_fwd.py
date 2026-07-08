@@ -2403,15 +2403,15 @@ class HSTUAttentionForwardSm100:
                 cO = cute.make_identity_tensor(
                     (self.mma_tiler_pv[0], self.mma_tiler_pv[1])
                 )
-                tCcO = thr_mma_pv.partition_C(cO)
+                tCcO = thr_mma_qk.partition_C(cO)
                 output_load_atom = cute.make_copy_atom(
                     tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)),
                     Float32,
                 )
                 output_tmem_load = tcgen05.make_tmem_copy(
-                    output_load_atom, debug_tOtO
+                    output_load_atom, tStSs[0]
                 ).get_slice(lane)
-                output_tmem = output_tmem_load.partition_S(debug_tOtO)
+                output_tmem = output_tmem_load.partition_S(tStSs[0])
                 output_coords = output_tmem_load.partition_D(tCcO)
                 inv_seqlen = Float32(1.0 / 128.0)
                 for chunk_idx in cutlass.range_constexpr(
