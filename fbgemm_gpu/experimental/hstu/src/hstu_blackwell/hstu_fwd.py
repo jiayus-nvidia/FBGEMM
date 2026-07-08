@@ -2633,9 +2633,10 @@ class HSTUAttentionForwardSm100:
             cute.arch.mbarrier_wait(mbar_ptr + mbar_s0_s1_sequence_offset + stage, s0_s1_sequence_phase)
         fastsilu.silu_x2(tSrS_t2r, tSrP, tSrS_preds, mask_fn=partial(mask_fn) if mask_fn is not None else None)
         if const_expr(self.is_mxfp8):
-            for i in cutlass.range_constexpr(cute.size(tSrP)):
-                sP_mn[tScS_t2r[i]] = tSrP[i]
-            cute.arch.fence_view_async_shared()
+            if const_expr(not self.debug):
+                for i in cutlass.range_constexpr(cute.size(tSrP)):
+                    sP_mn[tScS_t2r[i]] = tSrP[i]
+                cute.arch.fence_view_async_shared()
         else:
             split_P_arrive_idx = cute.size(tStP_r2t.shape[2]) * self.split_P_arrive // self.kBlockN
             for i in cutlass.range_constexpr(split_P_arrive_idx):
