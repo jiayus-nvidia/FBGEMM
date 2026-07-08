@@ -68,7 +68,7 @@ class HSTUAttentionForwardSm100:
         self.is_mxfp8 = is_mxfp8
         self.q_stage = 1 if self.head_dim_padded >= 256 or is_mxfp8 else 2
         self.s_stage = 2 # score stage for intra-warp overlap
-        self.debug = False
+        self.debug = True
         assert self.q_stage in [1, 2]
         assert self.s_stage in [2]
 
