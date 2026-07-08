@@ -446,6 +446,114 @@ def gemm_ptx_partial(
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
 
+
+def gemm_ptx_blockscaled_ss(
+    op: cute.nvgpu.tcgen05.mma.MmaOp,
+    acc_tmem_addr: cutlass.Constexpr[int],
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    sA: cute.Tensor,
+    sB: cute.Tensor,
+    sA_swizzle: cute.Swizzle,
+    sB_swizzle: cute.Swizzle,
+    tSFA: cute.Tensor,
+    tSFB: cute.Tensor,
+    zero_init: bool | cutlass.Boolean = False,
+) -> None:
+    assert op.a_src == cute.nvgpu.tcgen05.OperandSource.SMEM
+    sA_layout = sA.layout
+    sB_layout = sB.layout
+    idesc: int = cutlass.const_expr(sm100_desc.mma_op_to_idesc(op))
+    smem_desc_base_a: int = cutlass.const_expr(
+        sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
+            sA_swizzle,
+            sm100_desc.Major.K
+            if cutlass.const_expr(
+                op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
+            )
+            else sm100_desc.Major.MN,
+        )
+    )
+    smem_desc_base_b: int = cutlass.const_expr(
+        sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
+            sB_swizzle,
+            sm100_desc.Major.K
+            if cutlass.const_expr(
+                op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
+            )
+            else sm100_desc.Major.MN,
+        )
+    )
+    smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+    smem_desc_base_a_lo = cutlass.const_expr(smem_desc_base_a_lo)
+    smem_desc_a_hi = cutlass.const_expr(smem_desc_a_hi)
+    smem_desc_base_b_lo = cutlass.const_expr(smem_desc_base_b_lo)
+    smem_desc_b_hi = cutlass.const_expr(smem_desc_b_hi)
+
+    smem_desc_start_a_lo = cutlass.Int32(
+        smem_desc_base_a_lo
+        | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
+    )
+    smem_desc_start_b_lo = cutlass.Int32(
+        smem_desc_base_b_lo
+        | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
+    )
+    offset_a = [
+        cute.crd2idx((0, 0, k), tCrA.layout)
+        for k in range(cute.size(tCrA.shape[2]))
+    ]
+    offset_b = [
+        cute.crd2idx((0, 0, k), tCrB.layout)
+        for k in range(cute.size(tCrB.shape[2]))
+    ]
+
+    for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+        smem_desc_a_lo = smem_desc_start_a_lo + offset_a[k]
+        smem_desc_b_lo = smem_desc_start_b_lo + offset_b[k]
+        llvm.inline_asm(
+            None,
+            [
+                cutlass.Int32(smem_desc_a_lo).ir_value(),
+                cutlass.Int32(smem_desc_b_lo).ir_value(),
+                cutlass.Int32(not zero_init or k != 0).ir_value(),
+                cutlass.Int32(
+                    tSFA[None, None, k].iterator.toint()
+                ).ir_value(),
+                cutlass.Int32(
+                    tSFB[None, None, k].iterator.toint()
+                ).ir_value(),
+            ],
+            "{\n\t"
+            ".reg .pred leader_thread;\n\t"
+            ".reg .pred p;\n\t"
+            ".reg .b32 idesc;\n\t"
+            ".reg .b32 tmem_acc, tmem_sfa, tmem_sfb;\n\t"
+            ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+            ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
+            "elect.sync _|leader_thread, -1;\n\t"
+            f"mov.b32 idesc, {hex(idesc)};\n\t"
+            f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
+            "mov.b32 smem_desc_a_lo, $0;\n\t"
+            "mov.b32 smem_desc_b_lo, $1;\n\t"
+            f"mov.b64 smem_desc_a, {{smem_desc_a_lo, {hex(smem_desc_a_hi)}}};\n\t"
+            f"mov.b64 smem_desc_b, {{smem_desc_b_lo, {hex(smem_desc_b_hi)}}};\n\t"
+            "mov.b32 tmem_sfa, $3;\n\t"
+            "mov.b32 tmem_sfb, $4;\n\t"
+            "setp.ne.b32 p, $2, 0;\n\t"
+            "@leader_thread tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale "
+            "[tmem_acc], smem_desc_a, smem_desc_b, idesc, "
+            "[tmem_sfa], [tmem_sfb], p;\n\t"
+            "}\n",
+            "r,r,r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+
 @cute.jit
 def gemm_ptx_partial1(
     op: cute.nvgpu.tcgen05.mma.MmaOp,

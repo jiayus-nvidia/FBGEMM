@@ -1946,9 +1946,6 @@ class HSTUAttentionForwardSm100:
         tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 0])
 
         if const_expr(is_mxfp8):
-            tiled_mma_qk = cute.make_tiled_mma(
-                cute.make_mma_atom(tiled_mma_qk.op)
-            )
             tiled_mma_pv = cute.make_tiled_mma(
                 cute.make_mma_atom(tiled_mma_pv.op)
             )
@@ -1969,7 +1966,21 @@ class HSTUAttentionForwardSm100:
                 p_scale_s[(None, None, None, None, 0)],
                 p_scale_t,
             )
-            gemm_Si = None
+            gemm_Si = [
+                partial(
+                    sm100_utils.gemm_ptx_blockscaled_ss,
+                    tiled_mma_qk.op,
+                    self.tmem_s_offset[stage],
+                    tSrQs[stage],
+                    sA=sQ[None, None, None, stage],
+                    sA_swizzle=sQ_swizzle,
+                    sB_swizzle=sK_swizzle,
+                    tSFA=tQScale,
+                    tSFB=tKScale,
+                    zero_init=True,
+                )
+                for stage in range(self.s_stage)
+            ]
             gemm_Pi = None
         else:
             qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
@@ -2034,15 +2045,7 @@ class HSTUAttentionForwardSm100:
                     k_scale_s[(None, None, None, None, Ki_index)],
                     k_scale_t,
                 )
-                tiled_mma_qk = self.blockscaled_gemm(
-                    tiled_mma_qk,
-                    tStSs[0],
-                    tSrQs[0],
-                    tSrKi,
-                    tQScale,
-                    tKScale,
-                    Boolean(False),
-                )
+                gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
             else:
                 gemm_Si[0](tCrB=tSrKi, sB=sK_cur)
             # 4. release S0
@@ -2066,15 +2069,7 @@ class HSTUAttentionForwardSm100:
                         k_scale_s[(None, None, None, None, Ki_index)],
                         k_scale_t,
                     )
-                    tiled_mma_qk = self.blockscaled_gemm(
-                        tiled_mma_qk,
-                        tStSs[1],
-                        tSrQs[1],
-                        tSrKi,
-                        tQScale,
-                        tKScale,
-                        Boolean(False),
-                    )
+                    gemm_Si[1](tCrB=tSrKi, sB=sK_cur)
                 else:
                     gemm_Si[1](tCrB=tSrKi, sB=sK_cur)
                 with cute.arch.elect_one():
@@ -2162,24 +2157,12 @@ class HSTUAttentionForwardSm100:
                         k_scale_t,
                     )
                     if i & (self.s_stage - 1) == 0:
-                        tiled_mma_qk = self.blockscaled_gemm(
-                            tiled_mma_qk,
-                            tStSs[0],
-                            tSrQs[0],
-                            tSrK[None, None, None, Ki_index],
-                            tQScale,
-                            tKScale,
-                            False,
+                        gemm_Si[0](
+                            tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur
                         )
                     else:
-                        tiled_mma_qk = self.blockscaled_gemm(
-                            tiled_mma_qk,
-                            tStSs[1],
-                            tSrQs[1],
-                            tSrK[None, None, None, Ki_index],
-                            tQScale,
-                            tKScale,
-                            False,
+                        gemm_Si[1](
+                            tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur
                         )
                 elif i & (self.s_stage - 1) == 0:
                     gemm_Si[0](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
