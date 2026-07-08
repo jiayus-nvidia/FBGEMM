@@ -3035,6 +3035,37 @@ class HSTUAttentionForwardSm100:
         async_copy_elems = universal_copy_bits // self.o_dtype.width
 
         if const_expr(self.debug):
+            if tidx < cute.arch.WARP_SIZE:
+                tOtO_stage = tOtO[None, None, None, 0]
+                tOtO_i = cute.logical_divide(
+                    tOtO_stage,
+                    cute.make_layout((self.kBlockM, async_copy_elems)),
+                )
+                scalar_tmem_atom = sm100_utils_basic.get_tmem_load_op(
+                    self.mma_tiler_pv,
+                    self.o_layout,
+                    self.o_dtype,
+                    self.pv_acc_dtype,
+                    (self.epi_tile[0], async_copy_elems),
+                    use_2cta_instrs=False,
+                )
+                scalar_tmem_load = tcgen05.make_tmem_copy(
+                    scalar_tmem_atom, tOtO_i[(None, None), 0]
+                )
+                scalar_thread = scalar_tmem_load.get_slice(tidx)
+                scalar_source = scalar_thread.partition_S(
+                    tOtO_i[(None, None), None]
+                )[None, 0, 0, 0]
+                scalar_value = cute.make_rmem_tensor(
+                    scalar_source.shape, self.pv_acc_dtype
+                )
+                cute.copy(scalar_tmem_load, scalar_source, scalar_value)
+                cute.arch.fence_view_async_tmem_load()
+                if tidx == 0:
+                    mO[0, 0, head_idx] = self.o_dtype(
+                        scalar_value[0] * Float32(1.0 / 128.0)
+                    )
+            return
             epi_subtile = sm100_utils_basic.compute_epilogue_tile_shape(
                 self.mma_tiler_pv,
                 False,
