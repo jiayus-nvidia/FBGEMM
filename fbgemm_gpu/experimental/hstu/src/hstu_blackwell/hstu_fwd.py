@@ -2597,20 +2597,27 @@ class HSTUAttentionForwardSm100:
             cute.arch.mbarrier_wait(mbar_ptr + mbar_s0_s1_sequence_offset + stage, s0_s1_sequence_phase)
         fastsilu.silu_x2(tSrS_t2r, tSrP_r2t, tSrS_preds, mask_fn=partial(mask_fn) if mask_fn is not None else None)
         if const_expr(self.is_mxfp8):
-            p_store = tiled_p_store
             tPrP = tiled_p_store.retile(tSrP_r2t)
-            tPdP = tPsP_r2s
-        else:
-            p_store = thr_tmem_store
-            tPrP = tSrP_r2t_f32
-            tPdP = tStP_r2t
-        # Write first portion of P (split_P_arrive columns), then signal MMA to start PV
-        split_P_arrive_idx = cute.size(tPdP.shape[2]) * self.split_P_arrive // self.kBlockN
-        for i in cutlass.range_constexpr(split_P_arrive_idx):
-            cute.copy(p_store, tPrP[None, None, i], tPdP[None, None, i])
-        if const_expr(self.is_mxfp8):
+            split_P_arrive_idx = (
+                cute.size(tPsP_r2s.shape[3])
+                * self.split_P_arrive
+                // self.kBlockN
+            )
+            for i in cutlass.range_constexpr(split_P_arrive_idx):
+                cute.copy(
+                    tiled_p_store,
+                    tPrP[None, None, None, i],
+                    tPsP_r2s[None, None, None, i],
+                )
             cute.arch.fence_view_async_shared()
         else:
+            split_P_arrive_idx = cute.size(tStP_r2t.shape[2]) * self.split_P_arrive // self.kBlockN
+            for i in cutlass.range_constexpr(split_P_arrive_idx):
+                cute.copy(
+                    thr_tmem_store,
+                    tSrP_r2t_f32[None, None, i],
+                    tStP_r2t[None, None, i],
+                )
             cute.arch.fence_view_async_tmem_store()
 
         if const_expr(self.s0_s1_barrier):
@@ -2618,11 +2625,25 @@ class HSTUAttentionForwardSm100:
         # Notify mma warp that first portion of P is ready — MMA can start PV
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
         # Write remaining P columns
-        for i in cutlass.range_constexpr(split_P_arrive_idx, cute.size(tPdP.shape[2])):
-            cute.copy(p_store, tPrP[None, None, i], tPdP[None, None, i])
         if const_expr(self.is_mxfp8):
+            for i in cutlass.range_constexpr(
+                split_P_arrive_idx, cute.size(tPsP_r2s.shape[3])
+            ):
+                cute.copy(
+                    tiled_p_store,
+                    tPrP[None, None, None, i],
+                    tPsP_r2s[None, None, None, i],
+                )
             cute.arch.fence_view_async_shared()
         else:
+            for i in cutlass.range_constexpr(
+                split_P_arrive_idx, cute.size(tStP_r2t.shape[2])
+            ):
+                cute.copy(
+                    thr_tmem_store,
+                    tSrP_r2t_f32[None, None, i],
+                    tStP_r2t[None, None, i],
+                )
             cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that all P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
