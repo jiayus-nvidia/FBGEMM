@@ -18,6 +18,7 @@ from .mxfp8_quantize import (
     E4M3_MAX,
     MXFP8_BLOCK_SIZE,
     MxFp8QuantizeSm100,
+    initialize_scale_storage_kernel,
     scale_factor_storage_size,
 )
 
@@ -68,6 +69,124 @@ class VarlenPackSm100:
             if row < length:
                 value = source[offset + row, head, dim]
             dense[tile_idx, row_in_tile, dim, batch_head] = value
+
+
+class VarlenPackQuantizeSm100:
+    def __init__(self, transpose: bool, initialize_padding: bool):
+        self.transpose = transpose
+        self.initialize_padding = initialize_padding
+
+    @cute.jit
+    def __call__(
+        self,
+        source: cute.Tensor,
+        cu_seqlens: cute.Tensor,
+        quantized: cute.Tensor,
+        scale_storage: cute.Tensor,
+        num_heads: Int32,
+        stream: cuda.CUstream,
+    ):
+        scale_layout = blockscaled_utils.tile_atom_to_shape_SF(
+            quantized.shape, MXFP8_BLOCK_SIZE
+        )
+        scales = cute.make_tensor(
+            cute.recast_ptr(scale_storage.iterator, dtype=cutlass.Uint8),
+            scale_layout,
+        )
+        raw_scales = cute.make_tensor(
+            cute.recast_ptr(scale_storage.iterator, dtype=cutlass.Uint8),
+            scale_storage.layout,
+        )
+        rows, reduction, batches = quantized.shape
+        blocks_per_row = cute.ceil_div(reduction, MXFP8_BLOCK_SIZE)
+        if cutlass.const_expr(self.initialize_padding):
+            initialize_scale_storage_kernel(raw_scales).launch(
+                grid=(cute.ceil_div(cute.size(raw_scales), 256), 1, 1),
+                block=(256, 1, 1),
+                stream=stream,
+            )
+        self.kernel(
+            source,
+            cu_seqlens,
+            quantized,
+            scales,
+            num_heads,
+            rows,
+            reduction,
+        ).launch(
+            grid=(rows * blocks_per_row, batches, 1),
+            block=(cute.arch.WARP_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        source: cute.Tensor,
+        cu_seqlens: cute.Tensor,
+        quantized: cute.Tensor,
+        scales: cute.Tensor,
+        num_heads: Int32,
+        rows: Int32,
+        reduction: Int32,
+    ):
+        lane, _, _ = cute.arch.thread_idx()
+        block, output_batch, _ = cute.arch.block_idx()
+        blocks_per_row = cute.ceil_div(reduction, MXFP8_BLOCK_SIZE)
+        row = block // blocks_per_row
+        reduction_block = block - row * blocks_per_row
+        first_reduction_idx = reduction_block * MXFP8_BLOCK_SIZE + lane * 4
+
+        batch_heads = (cute.size(cu_seqlens) - 1) * num_heads
+        tile_idx = output_batch // batch_heads
+        batch_head = output_batch - tile_idx * batch_heads
+        batch = batch_head // num_heads
+        head = batch_head - batch * num_heads
+        offset = Int32(cu_seqlens[batch])
+        length = Int32(cu_seqlens[batch + 1]) - offset
+
+        values = cute.make_rmem_tensor((4,), Float32)
+        local_amax = Float32(0.0)
+        for value_idx in cutlass.range_constexpr(4):
+            reduction_idx = first_reduction_idx + value_idx
+            token_idx = tile_idx * 128 + row
+            dim = reduction_idx
+            if cutlass.const_expr(self.transpose):
+                token_idx = tile_idx * 128 + reduction_idx
+                dim = row
+            value = Float32(0.0)
+            if lane < 8 and reduction_idx < reduction and token_idx < length:
+                value = Float32(source[offset + token_idx, head, dim])
+            values[value_idx] = value
+            local_amax = cute.arch.fmax(
+                local_amax, cute.arch.fmax(value, -value)
+            )
+
+        block_amax = cute.arch.warp_reduction_max(local_amax)
+        min_amax = 2.0**-126 * E4M3_MAX
+        ratio = cute.arch.fmax(block_amax, min_amax) / E4M3_MAX
+        log_scale = cute.math.log2(ratio)
+        scale_exponent = Int32(log_scale)
+        if log_scale > Float32(scale_exponent):
+            scale_exponent += 1
+        scale_exponent = cutlass.max(-126, cutlass.min(scale_exponent, 127))
+        scale = cute.math.exp2(Float32(scale_exponent))
+
+        if lane == 0:
+            scales[row, reduction_block * MXFP8_BLOCK_SIZE, output_batch] = (
+                cutlass.Uint8(scale_exponent + 127)
+            )
+        quantized_values = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
+        quantized_values.store(
+            (values.load() / scale).to(cutlass.Float8E4M3FN)
+        )
+        if lane < 8:
+            for value_idx in cutlass.range_constexpr(4):
+                reduction_idx = first_reduction_idx + value_idx
+                if reduction_idx < reduction:
+                    quantized[row, reduction_idx, output_batch] = (
+                        quantized_values[value_idx]
+                    )
 
 
 class VarlenUnpackSm100:
@@ -677,6 +796,7 @@ class _MxMatrix:
 
 _compile_cache = {
     "pack": {},
+    "pack_quantize": {},
     "unpack": {},
     "silu_quantize": {},
     "silu_bwd_quantize": {},
@@ -832,6 +952,77 @@ def _pack(
         stream,
     )
     return dense
+
+
+def _pack_quantize(
+    source: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    padded_seqlen: int,
+    *,
+    transpose: bool = False,
+) -> tuple[_MxMatrix, list[_MxMatrix]]:
+    batches = cu_seqlens.numel() - 1
+    num_heads, head_dim = source.shape[1:]
+    tile_count = padded_seqlen // 128
+    batch_heads = batches * num_heads
+    rows, columns = (head_dim, 128) if transpose else (128, head_dim)
+    combined_batches = tile_count * batch_heads
+    values = _matrix(rows, columns, combined_batches, torch.uint8, source.device)
+    scales = torch.empty(
+        scale_factor_storage_size(rows, columns, combined_batches),
+        dtype=torch.uint8,
+        device=source.device,
+    )
+    source_tensor = from_dlpack(source.detach(), assumed_align=16).mark_layout_dynamic(
+        leading_dim=source.ndim - 1
+    )
+    offsets_tensor = from_dlpack(
+        cu_seqlens.detach(), assumed_align=16
+    ).mark_layout_dynamic(leading_dim=0)
+    values_tensor = _mark_matrix(
+        _cute_tensor(values, element_type=cutlass.Float8E4M3FN), 1
+    )
+    scales_tensor = _cute_tensor(scales, element_type=cutlass.Float8E8M0FNU)
+    stream = cutlass_torch.default_stream()
+    blocks_per_row = _round_up(columns, MXFP8_BLOCK_SIZE) // MXFP8_BLOCK_SIZE
+    initialize_padding = rows % 128 != 0 or blocks_per_row % 4 != 0
+    key = (
+        source.dtype,
+        padded_seqlen,
+        head_dim,
+        num_heads,
+        batches,
+        transpose,
+        initialize_padding,
+    )
+    if key not in _compile_cache["pack_quantize"]:
+        _compile_cache["pack_quantize"][key] = cute.compile(
+            VarlenPackQuantizeSm100(transpose, initialize_padding),
+            source_tensor,
+            offsets_tensor,
+            values_tensor,
+            scales_tensor,
+            Int32(num_heads),
+            stream,
+        )
+    _compile_cache["pack_quantize"][key](
+        source_tensor,
+        offsets_tensor,
+        values_tensor,
+        scales_tensor,
+        Int32(num_heads),
+        stream,
+    )
+    combined = _MxMatrix(values, scales)
+    scale_count = scale_factor_storage_size(rows, columns, batch_heads)
+    tiles = [
+        _MxMatrix(
+            values[:, :, tile_idx * batch_heads : (tile_idx + 1) * batch_heads],
+            scales[tile_idx * scale_count : (tile_idx + 1) * scale_count],
+        )
+        for tile_idx in range(tile_count)
+    ]
+    return combined, tiles
 
 
 def _unpack(
@@ -1434,24 +1625,20 @@ def hstu_varlen_fwd_mxfp8_100(
     num_heads = q.shape[1]
     padded_q = _round_up(max_seqlen_q, 128)
     padded_k = _round_up(max_seqlen_k, 128)
-    dense_q = _pack(q, cu_seqlens_q, padded_q)
-    dense_k = _pack(k, cu_seqlens_k, padded_k)
-    dense_v = _pack(v, cu_seqlens_k, padded_k)
 
     window_size_left = _normalize_window(window_size_left, max_seqlen_k)
     window_size_right = _normalize_window(window_size_right, max_seqlen_k)
     batch_heads = (cu_seqlens_q.numel() - 1) * num_heads
     head_dim = q.shape[2]
-    q_tiles = _tiles(dense_q)
-    k_tiles = _tiles(dense_k)
-    v_tiles = _tiles(dense_v)
+    q_tile_count = padded_q // 128
     dense_output = _tiled_matrix(
-        len(q_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
+        q_tile_count, 128, head_dim, batch_heads, torch.bfloat16, q.device
     )
-    q_mx_collection, _ = _quantize_tile_collection(dense_q)
-    k_mx_tiles = _quantize_tiles(dense_k)
-    v_mx_tiles = _quantize_tiles(dense_v, transpose=True)
-    q_tile_count = len(q_tiles)
+    q_mx_collection, _ = _pack_quantize(q, cu_seqlens_q, padded_q)
+    _, k_mx_tiles = _pack_quantize(k, cu_seqlens_k, padded_k)
+    _, v_mx_tiles = _pack_quantize(
+        v, cu_seqlens_k, padded_k, transpose=True
+    )
     combined_batches = q_tile_count * batch_heads
     dense_output_matrix = dense_output.permute(1, 2, 0, 3).reshape(
         128, head_dim, combined_batches
@@ -1578,42 +1765,37 @@ def hstu_varlen_bwd_mxfp8_100(
     num_heads = q.shape[1]
     padded_q = _round_up(max_seqlen_q, 128)
     padded_k = _round_up(max_seqlen_k, 128)
-    dense_q = _pack(q, cu_seqlens_q, padded_q)
-    dense_k = _pack(k, cu_seqlens_k, padded_k)
-    dense_v = _pack(v, cu_seqlens_k, padded_k)
-    dense_dout = _pack(dout, cu_seqlens_q, padded_q)
 
     window_size_left = _normalize_window(window_size_left, max_seqlen_k)
     window_size_right = _normalize_window(window_size_right, max_seqlen_k)
     batch_heads = (cu_seqlens_q.numel() - 1) * num_heads
     head_dim = q.shape[2]
-    q_tiles = _tiles(dense_q)
-    k_tiles = _tiles(dense_k)
-    v_tiles = _tiles(dense_v)
-    dout_tiles = _tiles(dense_dout)
+    q_tile_count = padded_q // 128
+    k_tile_count = padded_k // 128
 
-    q_mx_collection, _ = _quantize_tile_collection(dense_q)
-    qt_mx_collection, qt_mx_tiles = _quantize_tile_collection(
-        dense_q, transpose=True
+    q_mx_collection, _ = _pack_quantize(q, cu_seqlens_q, padded_q)
+    qt_mx_collection, qt_mx_tiles = _pack_quantize(
+        q, cu_seqlens_q, padded_q, transpose=True
     )
-    k_mx_tiles = _quantize_tiles(dense_k)
-    kt_mx_tiles = _quantize_tiles(dense_k, transpose=True)
-    v_mx_tiles = _quantize_tiles(dense_v)
-    dout_mx_collection, _ = _quantize_tile_collection(dense_dout)
-    doutt_mx_collection, doutt_mx_tiles = _quantize_tile_collection(
-        dense_dout, transpose=True
+    _, k_mx_tiles = _pack_quantize(k, cu_seqlens_k, padded_k)
+    _, kt_mx_tiles = _pack_quantize(
+        k, cu_seqlens_k, padded_k, transpose=True
+    )
+    _, v_mx_tiles = _pack_quantize(v, cu_seqlens_k, padded_k)
+    dout_mx_collection, _ = _pack_quantize(dout, cu_seqlens_q, padded_q)
+    doutt_mx_collection, doutt_mx_tiles = _pack_quantize(
+        dout, cu_seqlens_q, padded_q, transpose=True
     )
 
-    q_tile_count = len(q_tiles)
     combined_batches = q_tile_count * batch_heads
     dense_dq = _tiled_matrix(
         q_tile_count, 128, head_dim, batch_heads, torch.bfloat16, q.device
     )
     dense_dk = _tiled_matrix(
-        len(k_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
+        k_tile_count, 128, head_dim, batch_heads, torch.bfloat16, q.device
     )
     dense_dv = _tiled_matrix(
-        len(k_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
+        k_tile_count, 128, head_dim, batch_heads, torch.bfloat16, q.device
     )
     dense_dq_matrix = dense_dq.permute(1, 2, 0, 3).reshape(
         128, head_dim, combined_batches
