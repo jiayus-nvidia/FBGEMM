@@ -3080,20 +3080,16 @@ class HSTUAttentionForwardSm100:
             tOsO_r2s = cute.group_modes(
                 tOsO_r2s, 3, cute.rank(tOsO_r2s)
             )
-            print(
-                "MXFP8_EPI_SHAPES",
-                tOtO.shape,
-                tOtO_epi.shape,
-                tOtO_t2r.shape,
-                tOsO_r2s.shape,
-            )
             inv_seqlen = Float32(1.0 / 128.0)
             for subtile in cutlass.range_constexpr(
                 cute.size(tOtO_t2r, mode=[3])
             ):
                 output_source = tOtO_t2r[None, None, None, subtile]
+                output_destination = tOsO_r2s[
+                    None, None, None, subtile
+                ]
                 output_values = cute.make_rmem_tensor(
-                    output_source.shape, self.pv_acc_dtype
+                    output_destination.shape, self.pv_acc_dtype
                 )
                 cute.copy(tiled_tmem_load, output_source, output_values)
                 cute.arch.fence_view_async_tmem_load()
@@ -3112,7 +3108,7 @@ class HSTUAttentionForwardSm100:
                 cute.copy(
                     tiled_smem_store,
                     tiled_smem_store.retile(output_converted),
-                    tOsO_r2s[None, None, None, subtile],
+                    output_destination,
                 )
             cute.arch.fence_view_async_shared()
             cute.arch.barrier(

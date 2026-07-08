@@ -1628,13 +1628,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tTR_rAcc = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
-        print(
-            "MXFP8_GEMM_EPI_SHAPES",
-            tAcc.shape,
-            tAcc_epi.shape,
-            tTR_tAcc.shape,
-            tTR_rAcc.shape,
-        )
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
 
     def epilog_smem_copy_and_partition(
