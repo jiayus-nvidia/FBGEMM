@@ -268,6 +268,8 @@ class SiluMaskQuantizeSm100:
         scale_storage: cute.Tensor,
         batch_heads_per_pair: Int32,
         key_tiles_per_query: Int32,
+        query_starts_offset: Int32,
+        key_starts_offset: Int32,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -299,6 +301,8 @@ class SiluMaskQuantizeSm100:
             scales,
             batch_heads_per_pair,
             key_tiles_per_query,
+            query_starts_offset,
+            key_starts_offset,
             num_heads,
             normalization,
             alpha,
@@ -324,6 +328,8 @@ class SiluMaskQuantizeSm100:
         scales: cute.Tensor,
         batch_heads_per_pair: Int32,
         key_tiles_per_query: Int32,
+        query_starts_offset: Int32,
+        key_starts_offset: Int32,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -347,8 +353,12 @@ class SiluMaskQuantizeSm100:
             if cutlass.const_expr(key_starts is not None):
                 query_idx_in_chunk = pair_idx // key_tiles_per_query
                 key_idx_in_chunk = pair_idx - query_idx_in_chunk * key_tiles_per_query
-                key_start = Int32(key_starts[key_idx_in_chunk])
-            query_tile_start = Int32(query_starts[query_idx_in_chunk])
+                key_start = Int32(
+                    key_starts[key_starts_offset + key_idx_in_chunk]
+                )
+            query_tile_start = Int32(
+                query_starts[query_starts_offset + query_idx_in_chunk]
+            )
         query_idx = query_tile_start + query_idx_local
         batch = batch_head // num_heads
         query_length = Int32(cu_seqlens_q[batch + 1]) - Int32(cu_seqlens_q[batch])
@@ -1406,6 +1416,8 @@ def _run_silu(
     key_start: int = 0,
     query_starts: Optional[torch.Tensor] = None,
     key_starts: Optional[torch.Tensor] = None,
+    query_starts_offset: int = 0,
+    key_starts_offset: int = 0,
     batch_heads_per_pair: Optional[int] = None,
     output: Optional[_MxMatrix] = None,
 ) -> _MxMatrix:
@@ -1472,6 +1484,8 @@ def _run_silu(
             scales_tensor,
             Int32(batch_heads_per_pair),
             Int32(key_tiles_per_query),
+            Int32(query_starts_offset),
+            Int32(key_starts_offset),
             Int32(num_heads),
             Int32(normalization),
             Float32(alpha),
@@ -1491,6 +1505,8 @@ def _run_silu(
         scales_tensor,
         Int32(batch_heads_per_pair),
         Int32(key_tiles_per_query),
+        Int32(query_starts_offset),
+        Int32(key_starts_offset),
         Int32(num_heads),
         Int32(normalization),
         Float32(alpha),
@@ -1888,8 +1904,10 @@ def hstu_varlen_fwd_mxfp8_100(
                 alpha,
                 window_size_left,
                 window_size_right,
-                query_starts=query_starts[query_tile_idx:query_tile_end],
-                key_starts=key_starts[key_tile_idx:key_tile_end],
+                query_starts=query_starts,
+                key_starts=key_starts,
+                query_starts_offset=query_tile_idx,
+                key_starts_offset=key_tile_idx,
                 batch_heads_per_pair=batch_heads,
                 output=probability_workspace,
             )
