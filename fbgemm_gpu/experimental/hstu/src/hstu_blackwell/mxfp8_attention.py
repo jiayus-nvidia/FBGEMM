@@ -1496,6 +1496,20 @@ def _normalize_window(window: int, max_seqlen_k: int) -> int:
     return max_seqlen_k if window < 0 or window > max_seqlen_k else window
 
 
+def _is_causal_self_attention(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    window_right: int,
+) -> bool:
+    return (
+        window_right == 0
+        and max_seqlen_q == max_seqlen_k
+        and cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr()
+    )
+
+
 def _check_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2053,11 +2067,40 @@ def hstu_varlen_fwd_mxfp8_100(
         head_dim,
         backward=False,
     )
-    query_chunk_size = min(q_tile_count, 16, pair_capacity)
+    causal_self_attention = _is_causal_self_attention(
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        window_size_right,
+    )
+    query_chunk_size = (
+        1
+        if causal_self_attention
+        else min(q_tile_count, 16, pair_capacity)
+    )
     key_chunk_size = min(
         len(k_mx_tiles), max(1, pair_capacity // query_chunk_size)
     )
-    workspaces = {}
+    max_pair_batches = query_chunk_size * key_chunk_size * batch_heads
+    score_storage = _matrix(
+        128, 128, max_pair_batches, torch.float32, q.device
+    )
+    probability_storage = _mx_workspace(
+        (128, 128, max_pair_batches), q.device
+    )
+    partial_output_storage = (
+        _matrix(
+            128,
+            head_dim,
+            max_pair_batches,
+            torch.float32,
+            q.device,
+        )
+        if len(k_mx_tiles) > 1
+        else None
+    )
+    workspace_views = {}
 
     for query_tile_idx in range(0, q_tile_count, query_chunk_size):
         query_tile_end = min(query_tile_idx + query_chunk_size, q_tile_count)
@@ -2065,8 +2108,13 @@ def hstu_varlen_fwd_mxfp8_100(
         batch_start = query_tile_idx * batch_heads
         batch_end = query_tile_end * batch_heads
         query_mx = _slice_mx_batches(q_mx_collection, batch_start, batch_end)
-        for key_tile_idx in range(0, len(k_mx_tiles), key_chunk_size):
-            key_tile_end = min(key_tile_idx + key_chunk_size, len(k_mx_tiles))
+        key_tile_limit = (
+            min(query_tile_end, len(k_mx_tiles))
+            if causal_self_attention
+            else len(k_mx_tiles)
+        )
+        for key_tile_idx in range(0, key_tile_limit, key_chunk_size):
+            key_tile_end = min(key_tile_idx + key_chunk_size, key_tile_limit)
             key_count = key_tile_end - key_tile_idx
             pair_count = query_count * key_count
             pair_batches = pair_count * batch_heads
@@ -2078,25 +2126,20 @@ def hstu_varlen_fwd_mxfp8_100(
             value_mx = _slice_mx_batches(
                 v_mx_collection, key_batch_start, key_batch_end
             )
-            workspace_key = (query_count, key_count)
-            if workspace_key not in workspaces:
-                workspaces[workspace_key] = (
-                    _matrix(128, 128, pair_batches, torch.float32, q.device),
-                    _mx_workspace((128, 128, pair_batches), q.device),
+            if pair_batches not in workspace_views:
+                workspace_views[pair_batches] = (
+                    score_storage[:, :, :pair_batches],
+                    _slice_mx_batches(
+                        probability_storage, 0, pair_batches
+                    ),
                     (
-                        _matrix(
-                            128,
-                            head_dim,
-                            pair_batches,
-                            torch.float32,
-                            q.device,
-                        )
-                        if len(k_mx_tiles) > 1
+                        partial_output_storage[:, :, :pair_batches]
+                        if partial_output_storage is not None
                         else None
                     ),
                 )
             score_workspace, probability_workspace, partial_output_workspace = (
-                workspaces[workspace_key]
+                workspace_views[pair_batches]
             )
             scores = _gemm(
                 query_mx,
@@ -2140,25 +2183,20 @@ def hstu_varlen_fwd_mxfp8_100(
                 output=partial_output_workspace,
                 broadcast_b_batches=query_count > 1,
             )
-            is_last_key_chunk = key_tile_end == len(k_mx_tiles)
-            output = (
-                dense_output_matrix[:, :, batch_start:batch_end]
-                if is_last_key_chunk
-                else output_accumulator[:, :, batch_start:batch_end]
-            )
-            addend = (
-                output_accumulator[:, :, batch_start:batch_end]
-                if key_tile_idx > 0
-                else None
-            )
             _reduce_pair_outputs(
                 partial_outputs,
                 batch_heads,
                 key_count,
-                output,
-                addend=addend,
+                output_accumulator[:, :, batch_start:batch_end],
+                addend=(
+                    output_accumulator[:, :, batch_start:batch_end]
+                    if key_tile_idx > 0
+                    else None
+                ),
             )
 
+    if output_accumulator is not None:
+        dense_output_matrix.copy_(output_accumulator)
     return _unpack(dense_output, cu_seqlens_q, q.shape[0], num_heads), None
 
 
@@ -2255,11 +2293,37 @@ def hstu_varlen_bwd_mxfp8_100(
         head_dim,
         backward=True,
     )
-    query_chunk_size = min(q_tile_count, 16, pair_capacity)
-    key_chunk_size = min(
-        k_tile_count, max(1, pair_capacity // query_chunk_size)
+    causal_self_attention = _is_causal_self_attention(
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        window_size_right,
     )
-    workspaces = {}
+    if causal_self_attention:
+        key_chunk_size = 1
+        query_chunk_size = min(q_tile_count, pair_capacity)
+    else:
+        query_chunk_size = min(q_tile_count, 16, pair_capacity)
+        key_chunk_size = min(
+            k_tile_count, max(1, pair_capacity // query_chunk_size)
+        )
+    max_pair_batches = query_chunk_size * key_chunk_size * batch_heads
+    score_storage = _matrix(
+        128, 128, max_pair_batches, torch.float32, q.device
+    )
+    dprobability_storage = _matrix(
+        128, 128, max_pair_batches, torch.float32, q.device
+    )
+    silu_storage = tuple(
+        _mx_workspace((128, 128, max_pair_batches), q.device)
+        for _ in range(3)
+    )
+    pair_gradient_storage = _matrix(
+        128, head_dim, max_pair_batches, torch.float32, q.device
+    )
+    workspace_views = {}
+    gradient_accumulators = {}
 
     for key_tile_idx in range(0, k_tile_count, key_chunk_size):
         key_tile_end = min(key_tile_idx + key_chunk_size, k_tile_count)
@@ -2276,7 +2340,10 @@ def hstu_varlen_bwd_mxfp8_100(
             v_mx_collection, key_batch_start, key_batch_end
         )
 
-        for query_tile_idx in range(0, q_tile_count, query_chunk_size):
+        query_tile_start = key_tile_idx if causal_self_attention else 0
+        for query_tile_idx in range(
+            query_tile_start, q_tile_count, query_chunk_size
+        ):
             query_tile_end = min(
                 query_tile_idx + query_chunk_size, q_tile_count
             )
@@ -2285,18 +2352,24 @@ def hstu_varlen_bwd_mxfp8_100(
             pair_batches = pair_count * batch_heads
             batch_start = query_tile_idx * batch_heads
             batch_end = query_tile_end * batch_heads
-            workspace_key = (query_count, key_count)
-            if workspace_key not in workspaces:
-                workspaces[workspace_key] = (
-                    _matrix(128, 128, pair_batches, torch.float32, q.device),
-                    _matrix(128, 128, pair_batches, torch.float32, q.device),
+            if pair_batches not in workspace_views:
+                workspace_views[pair_batches] = (
+                    score_storage[:, :, :pair_batches],
+                    dprobability_storage[:, :, :pair_batches],
                     tuple(
-                        _mx_workspace((128, 128, pair_batches), q.device)
-                        for _ in range(3)
+                        _slice_mx_batches(storage, 0, pair_batches)
+                        for storage in silu_storage
                     ),
-                    _matrix(
-                        128, head_dim, pair_batches, torch.float32, q.device
-                    ),
+                    pair_gradient_storage[:, :, :pair_batches],
+                )
+            (
+                score_workspace,
+                dprobability_workspace,
+                silu_workspaces,
+                pair_gradient_workspace,
+            ) = workspace_views[pair_batches]
+            if key_count not in gradient_accumulators:
+                gradient_accumulators[key_count] = (
                     _matrix(
                         128,
                         head_dim,
@@ -2312,14 +2385,7 @@ def hstu_varlen_bwd_mxfp8_100(
                         q.device,
                     ),
                 )
-            (
-                score_workspace,
-                dprobability_workspace,
-                silu_workspaces,
-                pair_gradient_workspace,
-                dk_accumulator,
-                dv_accumulator,
-            ) = workspaces[workspace_key]
+            dk_accumulator, dv_accumulator = gradient_accumulators[key_count]
             query_mx = _slice_mx_batches(
                 q_mx_collection, batch_start, batch_end
             )
@@ -2391,17 +2457,11 @@ def hstu_varlen_bwd_mxfp8_100(
                 output=pair_gradient_workspace,
                 broadcast_b_batches=query_count > 1,
             )
-            is_last_key_chunk = key_tile_end == k_tile_count
-            dq_output = (
-                dense_dq_matrix[:, :, batch_start:batch_end]
-                if is_last_key_chunk
-                else dq_accumulator[:, :, batch_start:batch_end]
-            )
             _reduce_pair_outputs(
                 pair_gradient_workspace,
                 batch_heads,
                 key_count,
-                dq_output,
+                dq_accumulator[:, :, batch_start:batch_end],
                 addend=(
                     dq_accumulator[:, :, batch_start:batch_end]
                     if key_tile_idx > 0
@@ -2441,7 +2501,11 @@ def hstu_varlen_bwd_mxfp8_100(
             _reduce_linear_pairs(
                 pair_gradient_workspace,
                 dv_output,
-                addend=dv_accumulator if query_tile_idx > 0 else None,
+                addend=(
+                    dv_accumulator
+                    if query_tile_idx > query_tile_start
+                    else None
+                ),
             )
             _gemm(
                 dscores_t_mx,
@@ -2454,9 +2518,15 @@ def hstu_varlen_bwd_mxfp8_100(
             _reduce_linear_pairs(
                 pair_gradient_workspace,
                 dk_output,
-                addend=dk_accumulator if query_tile_idx > 0 else None,
+                addend=(
+                    dk_accumulator
+                    if query_tile_idx > query_tile_start
+                    else None
+                ),
             )
 
+    if dq_accumulator is not None:
+        dense_dq_matrix.copy_(dq_accumulator)
     dq_result = _unpack(dense_dq, cu_seqlens_q, q.shape[0], num_heads, output=dq)
     dk_result = _unpack(dense_dk, cu_seqlens_k, k.shape[0], num_heads, output=dk)
     dv_result = _unpack(dense_dv, cu_seqlens_k, v.shape[0], num_heads, output=dv)
