@@ -2334,7 +2334,6 @@ class HSTUAttentionForwardSm100:
                 )
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
-                pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
