@@ -1357,18 +1357,14 @@ class HSTUAttentionForwardSm100:
                         SeqlenInfoCls,
                         AttentionMaskCls,
                         sP,
+                        mO,
                     )
                 elif const_expr(not self.debug):
                     silu_loop(stage=0, tStSi=silu_tStSs[0])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
                 if const_expr(self.debug and self.is_mxfp8):
-                    self.store_O_fixed_debug(
-                        thr_mma_pv,
-                        silu_tOtOs[0],
-                        mO,
-                        mbar_ptr,
-                    )
+                    pass
                 elif const_expr(not self.debug):
                     silu_loop(stage=1, tStSi=silu_tStSs[1])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
@@ -1385,6 +1381,7 @@ class HSTUAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         sP: cute.Tensor,
+        mO: cute.Tensor,
     ):
         tidx = cute.arch.thread_idx()[0] % (
             cute.arch.WARP_SIZE * len(self.silu0_warp_ids)
@@ -1447,6 +1444,19 @@ class HSTUAttentionForwardSm100:
             seqlen,
             mask_fn=mask_fn,
         )
+        tScO_t2r = thr_tmem_load.partition_D(tScS)
+        output_values = cute.make_rmem_tensor(tStS_t2r.shape, Float32)
+        cute.arch.mbarrier_wait(
+            mbar_ptr + self.mbar_O_full_offset, Int32(0)
+        )
+        cute.copy(thr_tmem_load, tStS_t2r, output_values)
+        cute.arch.fence_view_async_tmem_load()
+        inv_seqlen = Float32(1.0 / 128.0)
+        for i in cutlass.range_constexpr(cute.size(output_values)):
+            coord = tScO_t2r[i]
+            mO[coord[0], coord[1], 0] = self.o_dtype(
+                output_values[i] * inv_seqlen
+            )
 
     @cute.jit
     def store_O_fixed_debug(
