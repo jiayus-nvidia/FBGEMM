@@ -143,8 +143,10 @@ class SiluMaskQuantizeSm100:
         scores: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
+        query_starts: Optional[cute.Tensor],
         quantized: cute.Tensor,
         scale_storage: cute.Tensor,
+        batch_heads_per_pair: Int32,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -171,8 +173,10 @@ class SiluMaskQuantizeSm100:
             scores,
             cu_seqlens_q,
             cu_seqlens_k,
+            query_starts,
             quantized,
             scales,
+            batch_heads_per_pair,
             num_heads,
             normalization,
             alpha,
@@ -192,8 +196,10 @@ class SiluMaskQuantizeSm100:
         scores: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
+        query_starts: Optional[cute.Tensor],
         quantized: cute.Tensor,
         scales: cute.Tensor,
+        batch_heads_per_pair: Int32,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -203,13 +209,19 @@ class SiluMaskQuantizeSm100:
         key_start: Int32,
     ):
         lane, _, _ = cute.arch.thread_idx()
-        block, batch_head, _ = cute.arch.block_idx()
+        block, output_batch, _ = cute.arch.block_idx()
         query_len, key_len, _ = scores.shape
         blocks_per_row = cute.ceil_div(key_len, MXFP8_BLOCK_SIZE)
         query_idx_local = block // blocks_per_row
         reduction_block = block - query_idx_local * blocks_per_row
         first_key_idx_local = reduction_block * MXFP8_BLOCK_SIZE + lane * 4
-        query_idx = query_start + query_idx_local
+        batch_head = output_batch
+        query_tile_start = query_start
+        if cutlass.const_expr(query_starts is not None):
+            pair_idx = output_batch // batch_heads_per_pair
+            batch_head = output_batch - pair_idx * batch_heads_per_pair
+            query_tile_start = Int32(query_starts[pair_idx])
+        query_idx = query_tile_start + query_idx_local
         batch = batch_head // num_heads
         query_length = Int32(cu_seqlens_q[batch + 1]) - Int32(cu_seqlens_q[batch])
         key_length = Int32(cu_seqlens_k[batch + 1]) - Int32(cu_seqlens_k[batch])
@@ -229,7 +241,8 @@ class SiluMaskQuantizeSm100:
                 window_right,
             ):
                 scaled_score = (
-                    Float32(scores[query_idx_local, key_idx_local, batch_head]) * alpha
+                    Float32(scores[query_idx_local, key_idx_local, output_batch])
+                    * alpha
                 )
                 sigmoid = 1.0 / (1.0 + cute.math.exp(-scaled_score))
                 value = scaled_score * sigmoid / Float32(normalization)
@@ -249,7 +262,7 @@ class SiluMaskQuantizeSm100:
             scales[
                 query_idx_local,
                 reduction_block * MXFP8_BLOCK_SIZE,
-                batch_head,
+                output_batch,
             ] = cutlass.Uint8(scale_exponent + 127)
         quantized_values = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
         quantized_values.store((values.load() / scale).to(cutlass.Float8E4M3FN))
@@ -257,7 +270,7 @@ class SiluMaskQuantizeSm100:
             for value_idx in cutlass.range_constexpr(4):
                 key_idx_local = first_key_idx_local + value_idx
                 if key_idx_local < key_len:
-                    quantized[query_idx_local, key_idx_local, batch_head] = (
+                    quantized[query_idx_local, key_idx_local, output_batch] = (
                         quantized_values[value_idx]
                     )
 
@@ -812,9 +825,9 @@ def _quantize(matrix: torch.Tensor) -> _MxMatrix:
     return _MxMatrix(values, scales)
 
 
-def _quantize_tiles(
+def _quantize_tile_collection(
     tiled_matrix: torch.Tensor, *, transpose: bool = False
-) -> list[_MxMatrix]:
+) -> tuple[_MxMatrix, list[_MxMatrix]]:
     if tiled_matrix.ndim != 4 or tiled_matrix.shape[1] != 128:
         raise ValueError(
             f"tile collection must have shape (tiles, 128, columns, batches), "
@@ -836,7 +849,7 @@ def _quantize_tiles(
     )
     if combined.scales.numel() != tile_count * scale_count:
         raise RuntimeError("batched quantization produced an invalid scale layout")
-    return [
+    tiles = [
         _MxMatrix(
             combined.values[:, :, tile_idx * batches : (tile_idx + 1) * batches],
             combined.scales[
@@ -845,6 +858,39 @@ def _quantize_tiles(
         )
         for tile_idx in range(tile_count)
     ]
+    return combined, tiles
+
+
+def _quantize_tiles(
+    tiled_matrix: torch.Tensor, *, transpose: bool = False
+) -> list[_MxMatrix]:
+    return _quantize_tile_collection(tiled_matrix, transpose=transpose)[1]
+
+
+def _slice_mx_batches(matrix: _MxMatrix, start: int, end: int) -> _MxMatrix:
+    batches = matrix.values.shape[2]
+    if start < 0 or end > batches or start >= end:
+        raise ValueError(f"invalid MXFP8 batch slice [{start}, {end})/{batches}")
+    scales_per_batch = matrix.scales.numel() // batches
+    return _MxMatrix(
+        matrix.values[:, :, start:end],
+        matrix.scales[start * scales_per_batch : end * scales_per_batch],
+    )
+
+
+def _repeat_mx_batches(matrix: _MxMatrix, repeats: int) -> _MxMatrix:
+    if repeats <= 0:
+        raise ValueError("MXFP8 batch repeat count must be positive")
+    if repeats == 1:
+        return matrix
+    leading_dim = _leading_dim(matrix.values)
+    if leading_dim == 1:
+        storage = matrix.values.permute(2, 0, 1).repeat(repeats, 1, 1)
+        values = storage.permute(1, 2, 0)
+    else:
+        storage = matrix.values.permute(2, 1, 0).repeat(repeats, 1, 1)
+        values = storage.permute(2, 1, 0)
+    return _MxMatrix(values, matrix.scales.repeat(repeats))
 
 
 def _gemm(
@@ -981,6 +1027,8 @@ def _run_silu(
     window_right: int,
     query_start: int = 0,
     key_start: int = 0,
+    query_starts: Optional[torch.Tensor] = None,
+    batch_heads_per_pair: Optional[int] = None,
     output: Optional[_MxMatrix] = None,
 ) -> _MxMatrix:
     if scores.shape[:2] != (128, 128) or scores.dtype != torch.float32:
@@ -999,16 +1047,35 @@ def _run_silu(
     offsets_k = from_dlpack(
         cu_seqlens_k.detach(), assumed_align=16
     ).mark_layout_dynamic(leading_dim=0)
+    if query_starts is None:
+        query_starts_tensor = None
+        batch_heads_per_pair = scores.shape[2]
+    else:
+        if query_starts.dtype != torch.int32 or query_starts.ndim != 1:
+            raise ValueError("query_starts must be a 1-D int32 tensor")
+        if batch_heads_per_pair is None or batch_heads_per_pair <= 0:
+            raise ValueError("batched SiLU requires batch_heads_per_pair")
+        query_starts_tensor = from_dlpack(
+            query_starts.detach(), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=0)
     stream = cutlass_torch.default_stream()
-    key = (tuple(scores.shape), tuple(scores.stride()), num_heads)
+    key = (
+        tuple(scores.shape),
+        tuple(scores.stride()),
+        num_heads,
+        query_starts is not None,
+        batch_heads_per_pair,
+    )
     if key not in _compile_cache["silu_quantize"]:
         _compile_cache["silu_quantize"][key] = cute.compile(
             SiluMaskQuantizeSm100(),
             scores_tensor,
             offsets_q,
             offsets_k,
+            query_starts_tensor,
             values_tensor,
             scales_tensor,
+            Int32(batch_heads_per_pair),
             Int32(num_heads),
             Int32(normalization),
             Float32(alpha),
@@ -1022,8 +1089,10 @@ def _run_silu(
         scores_tensor,
         offsets_q,
         offsets_k,
+        query_starts_tensor,
         values_tensor,
         scales_tensor,
+        Int32(batch_heads_per_pair),
         Int32(num_heads),
         Int32(normalization),
         Float32(alpha),
@@ -1170,22 +1239,61 @@ def hstu_varlen_fwd_mxfp8_100(
     dense_output = _tiled_matrix(
         len(q_tiles), 128, head_dim, batch_heads, torch.bfloat16, q.device
     )
-    q_mx_tiles = _quantize_tiles(dense_q)
+    q_mx_collection, _ = _quantize_tile_collection(dense_q)
     k_mx_tiles = _quantize_tiles(dense_k)
     v_mx_tiles = _quantize_tiles(dense_v, transpose=True)
-    score_workspace = _matrix(128, 128, batch_heads, torch.float32, q.device)
-    probability_workspace = _mx_workspace((128, 128, batch_heads), q.device)
+    q_tile_count = len(q_tiles)
+    combined_batches = q_tile_count * batch_heads
+    dense_output_matrix = dense_output.permute(1, 2, 0, 3).reshape(
+        128, head_dim, combined_batches
+    )
     output_accumulator = (
-        _matrix(128, head_dim, batch_heads, torch.float32, q.device)
+        _matrix(128, head_dim, combined_batches, torch.float32, q.device)
         if len(k_mx_tiles) > 1
         else None
     )
+    query_starts = torch.arange(
+        0,
+        q_tile_count * 128,
+        128,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    chunk_size = 16
+    workspaces = {}
 
-    for query_tile_idx, query_mx in enumerate(q_mx_tiles):
-        query_start = query_tile_idx * 128
-        for key_tile_idx, (key_mx, value_mx) in enumerate(zip(k_mx_tiles, v_mx_tiles)):
+    for key_tile_idx, (key_mx, value_mx) in enumerate(zip(k_mx_tiles, v_mx_tiles)):
+        repeated_key = _repeat_mx_batches(key_mx, q_tile_count)
+        repeated_value = _repeat_mx_batches(value_mx, q_tile_count)
+        for query_tile_idx in range(0, q_tile_count, chunk_size):
+            query_tile_end = min(query_tile_idx + chunk_size, q_tile_count)
+            pair_count = query_tile_end - query_tile_idx
+            batch_start = query_tile_idx * batch_heads
+            batch_end = query_tile_end * batch_heads
+            if pair_count not in workspaces:
+                workspace_batches = pair_count * batch_heads
+                workspaces[pair_count] = (
+                    _matrix(
+                        128,
+                        128,
+                        workspace_batches,
+                        torch.float32,
+                        q.device,
+                    ),
+                    _mx_workspace((128, 128, workspace_batches), q.device),
+                )
+            score_workspace, probability_workspace = workspaces[pair_count]
+            query_mx = _slice_mx_batches(
+                q_mx_collection, batch_start, batch_end
+            )
+            key_chunk = _slice_mx_batches(repeated_key, batch_start, batch_end)
+            value_chunk = _slice_mx_batches(
+                repeated_value, batch_start, batch_end
+            )
             key_start = key_tile_idx * 128
-            scores = _gemm(query_mx, key_mx, torch.float32, output=score_workspace)
+            scores = _gemm(
+                query_mx, key_chunk, torch.float32, output=score_workspace
+            )
             probabilities_mx = _run_silu(
                 scores,
                 cu_seqlens_q,
@@ -1195,22 +1303,26 @@ def hstu_varlen_fwd_mxfp8_100(
                 alpha,
                 window_size_left,
                 window_size_right,
-                query_start=query_start,
                 key_start=key_start,
+                query_starts=query_starts[query_tile_idx:query_tile_end],
+                batch_heads_per_pair=batch_heads,
                 output=probability_workspace,
             )
             is_last_key_tile = key_tile_idx + 1 == len(k_mx_tiles)
-            output = (
-                dense_output[query_tile_idx]
-                if is_last_key_tile
-                else output_accumulator
+            output = dense_output_matrix[:, :, batch_start:batch_end]
+            if not is_last_key_tile:
+                output = output_accumulator[:, :, batch_start:batch_end]
+            addend = (
+                output_accumulator[:, :, batch_start:batch_end]
+                if key_tile_idx > 0
+                else None
             )
             _gemm(
                 probabilities_mx,
-                value_mx,
+                value_chunk,
                 torch.bfloat16 if is_last_key_tile else torch.float32,
                 output=output,
-                addend=output_accumulator if key_tile_idx > 0 else None,
+                addend=addend,
             )
 
     return _unpack(dense_output, cu_seqlens_q, q.shape[0], num_heads), None
