@@ -1989,10 +1989,15 @@ def _run_fused_forward(
     v_values = v_mx.values.permute(1, 2, 0)
     output = torch.empty_like(q)
 
-    q_tensor = _cute_tensor(q_values, element_type=cutlass.Float8E4M3FN)
-    k_tensor = _cute_tensor(k_values, element_type=cutlass.Float8E4M3FN)
-    v_tensor = _cute_tensor(v_values, element_type=cutlass.Float8E4M3FN)
-    output_tensor = _cute_tensor(output)
+    q_tensor, k_tensor, v_tensor, output_tensor = [
+        from_dlpack(tensor.detach(), assumed_align=16).mark_layout_dynamic(
+            leading_dim=2
+        )
+        for tensor in (q_values, k_values, v_values, output)
+    ]
+    q_tensor.element_type = cutlass.Float8E4M3FN
+    k_tensor.element_type = cutlass.Float8E4M3FN
+    v_tensor.element_type = cutlass.Float8E4M3FN
     q_scale_tensor = _cute_tensor(
         q_mx.scales, element_type=cutlass.Float8E8M0FNU
     )
