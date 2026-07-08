@@ -566,7 +566,7 @@ class HSTUAttentionForwardSm100:
                 self.tma_copy_k_bytes = cute.size_in_bytes(
                     self.k_dtype,
                     cute.select(sK_layout, mode=[0, 1, 2]),
-                ) * cute.size(tiled_mma_qk.thr_id.shape)
+                )
 
         TileScheduler = SingleTileVarlenScheduler
         # TileScheduler = SingleTileScheduler
