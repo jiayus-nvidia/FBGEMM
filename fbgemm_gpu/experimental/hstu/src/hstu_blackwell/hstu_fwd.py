@@ -1449,7 +1449,7 @@ class HSTUAttentionForwardSm100:
                 n_block_k = sValidBlockIds[n_block_valid_k] if self.is_arbitrary else n_block_valid_k
                 load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
                 q_producer_phase ^= 1
-                if const_expr(self.debug):
+                if const_expr(self.debug and False):
                     self.load_scale_g2s(
                         raw_mKScale,
                         sKScale,
