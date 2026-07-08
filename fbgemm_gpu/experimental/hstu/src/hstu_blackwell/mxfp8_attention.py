@@ -412,47 +412,39 @@ class SiluBackwardMaskQuantizeSm100:
         if block < row_block_count:
             query_idx_local = block // blocks_per_row
             reduction_block = block - query_idx_local * blocks_per_row
-            first_key_idx_local = reduction_block * MXFP8_BLOCK_SIZE + lane * 4
+            key_idx_local = reduction_block * MXFP8_BLOCK_SIZE + lane
+            key_idx = key_start + key_idx_local
             query_idx = query_tile_start + query_idx_local
-            dscore_values = cute.make_rmem_tensor((4,), Float32)
-            local_amax = Float32(0.0)
-            for value_idx in cutlass.range_constexpr(4):
-                key_idx_local = first_key_idx_local + value_idx
-                key_idx = key_start + key_idx_local
-                dscore = Float32(0.0)
-                if (
-                    lane < 8
-                    and key_idx_local < key_len
-                    and _valid_attention_position(
-                        query_idx,
-                        key_idx,
-                        query_length,
-                        key_length,
-                        window_left,
-                        window_right,
+            dscore = Float32(0.0)
+            if key_idx_local < key_len and _valid_attention_position(
+                query_idx,
+                key_idx,
+                query_length,
+                key_length,
+                window_left,
+                window_right,
+            ):
+                scaled_score = (
+                    Float32(
+                        scores[query_idx_local, key_idx_local, output_batch]
                     )
-                ):
-                    scaled_score = (
-                        Float32(scores[query_idx_local, key_idx_local, output_batch])
-                        * alpha
-                    )
-                    sigmoid = 1.0 / (1.0 + cute.math.exp(-scaled_score))
-                    derivative = sigmoid * (1.0 + scaled_score * (1.0 - sigmoid))
-                    dscore = (
-                        Float32(
-                            dprobabilities[
-                                query_idx_local, key_idx_local, output_batch
-                            ]
-                        )
-                        * derivative
-                        * alpha
-                        / Float32(normalization)
-                    )
-                dscore_values[value_idx] = dscore
-                local_amax = cute.arch.fmax(
-                    local_amax, cute.arch.fmax(dscore, -dscore)
+                    * alpha
                 )
-            block_amax = cute.arch.warp_reduction_max(local_amax)
+                sigmoid = 1.0 / (1.0 + cute.math.exp(-scaled_score))
+                derivative = sigmoid * (1.0 + scaled_score * (1.0 - sigmoid))
+                dscore = (
+                    Float32(
+                        dprobabilities[
+                            query_idx_local, key_idx_local, output_batch
+                        ]
+                    )
+                    * derivative
+                    * alpha
+                    / Float32(normalization)
+                )
+            block_amax = cute.arch.warp_reduction_max(
+                cute.arch.fmax(dscore, -dscore)
+            )
             ratio = cute.arch.fmax(block_amax, 2.0**-126 * E4M3_MAX) / E4M3_MAX
             log_scale = cute.math.log2(ratio)
             scale_exponent = Int32(log_scale)
@@ -467,16 +459,31 @@ class SiluBackwardMaskQuantizeSm100:
                     reduction_block * MXFP8_BLOCK_SIZE,
                     output_batch,
                 ] = cutlass.Uint8(scale_exponent + 127)
-            quantized_values = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
-            quantized_values.store(
-                (dscore_values.load() / scale).to(cutlass.Float8E4M3FN)
-            )
-            for value_idx in cutlass.range_constexpr(4):
-                key_idx_local = first_key_idx_local + value_idx
-                if lane < 8 and key_idx_local < key_len:
-                    quantized_dscores[
-                        query_idx_local, key_idx_local, output_batch
-                    ] = quantized_values[value_idx]
+            first_lane = (lane // 4) * 4
+            packed_dscore_0 = cute.arch.shuffle_sync(dscore, first_lane)
+            packed_dscore_1 = cute.arch.shuffle_sync(dscore, first_lane + 1)
+            packed_dscore_2 = cute.arch.shuffle_sync(dscore, first_lane + 2)
+            packed_dscore_3 = cute.arch.shuffle_sync(dscore, first_lane + 3)
+            if lane % 4 == 0:
+                packed_dscores = cute.make_rmem_tensor((4,), Float32)
+                packed_dscores[0] = packed_dscore_0
+                packed_dscores[1] = packed_dscore_1
+                packed_dscores[2] = packed_dscore_2
+                packed_dscores[3] = packed_dscore_3
+                quantized_values = cute.make_rmem_tensor(
+                    (4,), cutlass.Float8E4M3FN
+                )
+                quantized_values.store(
+                    (packed_dscores.load() / scale).to(cutlass.Float8E4M3FN)
+                )
+                for value_idx in cutlass.range_constexpr(4):
+                    output_key_idx_local = key_idx_local + value_idx
+                    if output_key_idx_local < key_len:
+                        quantized_dscores[
+                            query_idx_local,
+                            output_key_idx_local,
+                            output_batch,
+                        ] = quantized_values[value_idx]
         else:
             transpose_block = block - row_block_count
             transpose_blocks_per_row = cute.ceil_div(query_len, MXFP8_BLOCK_SIZE)
@@ -484,62 +491,45 @@ class SiluBackwardMaskQuantizeSm100:
             reduction_block = (
                 transpose_block - key_idx_local * transpose_blocks_per_row
             )
-            first_query_idx_local = (
-                reduction_block * MXFP8_BLOCK_SIZE + lane * 4
-            )
+            query_idx_local = reduction_block * MXFP8_BLOCK_SIZE + lane
+            query_idx = query_tile_start + query_idx_local
             key_idx = key_start + key_idx_local
-            probability_values = cute.make_rmem_tensor((4,), Float32)
-            dscore_values = cute.make_rmem_tensor((4,), Float32)
-            local_probability_amax = Float32(0.0)
-            local_dscore_amax = Float32(0.0)
-            for value_idx in cutlass.range_constexpr(4):
-                query_idx_local = first_query_idx_local + value_idx
-                query_idx = query_tile_start + query_idx_local
-                probability = Float32(0.0)
-                dscore = Float32(0.0)
-                if (
-                    lane < 8
-                    and query_idx_local < query_len
-                    and _valid_attention_position(
-                        query_idx,
-                        key_idx,
-                        query_length,
-                        key_length,
-                        window_left,
-                        window_right,
+            probability = Float32(0.0)
+            dscore = Float32(0.0)
+            if query_idx_local < query_len and _valid_attention_position(
+                query_idx,
+                key_idx,
+                query_length,
+                key_length,
+                window_left,
+                window_right,
+            ):
+                scaled_score = (
+                    Float32(
+                        scores[query_idx_local, key_idx_local, output_batch]
                     )
-                ):
-                    scaled_score = (
-                        Float32(scores[query_idx_local, key_idx_local, output_batch])
-                        * alpha
-                    )
-                    sigmoid = 1.0 / (1.0 + cute.math.exp(-scaled_score))
-                    probability = (
-                        scaled_score * sigmoid / Float32(normalization)
-                    )
-                    derivative = sigmoid * (1.0 + scaled_score * (1.0 - sigmoid))
-                    dscore = (
-                        Float32(
-                            dprobabilities[
-                                query_idx_local, key_idx_local, output_batch
-                            ]
-                        )
-                        * derivative
-                        * alpha
-                        / Float32(normalization)
-                    )
-                probability_values[value_idx] = probability
-                dscore_values[value_idx] = dscore
-                local_probability_amax = cute.arch.fmax(
-                    local_probability_amax,
-                    cute.arch.fmax(probability, -probability),
+                    * alpha
                 )
-                local_dscore_amax = cute.arch.fmax(
-                    local_dscore_amax, cute.arch.fmax(dscore, -dscore)
+                sigmoid = 1.0 / (1.0 + cute.math.exp(-scaled_score))
+                probability = scaled_score * sigmoid / Float32(normalization)
+                derivative = sigmoid * (1.0 + scaled_score * (1.0 - sigmoid))
+                dscore = (
+                    Float32(
+                        dprobabilities[
+                            query_idx_local, key_idx_local, output_batch
+                        ]
+                    )
+                    * derivative
+                    * alpha
+                    / Float32(normalization)
                 )
 
-            probability_amax = cute.arch.warp_reduction_max(local_probability_amax)
-            dscore_amax = cute.arch.warp_reduction_max(local_dscore_amax)
+            probability_amax = cute.arch.warp_reduction_max(
+                cute.arch.fmax(probability, -probability)
+            )
+            dscore_amax = cute.arch.warp_reduction_max(
+                cute.arch.fmax(dscore, -dscore)
+            )
             min_amax = 2.0**-126 * E4M3_MAX
             probability_log_scale = cute.math.log2(
                 cute.arch.fmax(probability_amax, min_amax) / E4M3_MAX
@@ -571,29 +561,61 @@ class SiluBackwardMaskQuantizeSm100:
                     key_idx_local, scale_idx, output_batch
                 ] = cutlass.Uint8(dscore_scale_exponent + 127)
 
-            quantized_probabilities = cute.make_rmem_tensor(
-                (4,), cutlass.Float8E4M3FN
+            first_lane = (lane // 4) * 4
+            packed_probability_0 = cute.arch.shuffle_sync(probability, first_lane)
+            packed_probability_1 = cute.arch.shuffle_sync(
+                probability, first_lane + 1
             )
-            quantized_dscores_t_values = cute.make_rmem_tensor(
-                (4,), cutlass.Float8E4M3FN
+            packed_probability_2 = cute.arch.shuffle_sync(
+                probability, first_lane + 2
             )
-            quantized_probabilities.store(
-                (probability_values.load() / probability_scale).to(
-                    cutlass.Float8E4M3FN
+            packed_probability_3 = cute.arch.shuffle_sync(
+                probability, first_lane + 3
+            )
+            packed_dscore_0 = cute.arch.shuffle_sync(dscore, first_lane)
+            packed_dscore_1 = cute.arch.shuffle_sync(dscore, first_lane + 1)
+            packed_dscore_2 = cute.arch.shuffle_sync(dscore, first_lane + 2)
+            packed_dscore_3 = cute.arch.shuffle_sync(dscore, first_lane + 3)
+            if lane % 4 == 0:
+                packed_probabilities = cute.make_rmem_tensor((4,), Float32)
+                packed_probabilities[0] = packed_probability_0
+                packed_probabilities[1] = packed_probability_1
+                packed_probabilities[2] = packed_probability_2
+                packed_probabilities[3] = packed_probability_3
+                packed_dscores = cute.make_rmem_tensor((4,), Float32)
+                packed_dscores[0] = packed_dscore_0
+                packed_dscores[1] = packed_dscore_1
+                packed_dscores[2] = packed_dscore_2
+                packed_dscores[3] = packed_dscore_3
+                quantized_probabilities = cute.make_rmem_tensor(
+                    (4,), cutlass.Float8E4M3FN
                 )
-            )
-            quantized_dscores_t_values.store(
-                (dscore_values.load() / dscore_scale).to(cutlass.Float8E4M3FN)
-            )
-            for value_idx in cutlass.range_constexpr(4):
-                query_idx_local = first_query_idx_local + value_idx
-                if lane < 8 and query_idx_local < query_len:
-                    quantized_probabilities_t[
-                        key_idx_local, query_idx_local, output_batch
-                    ] = quantized_probabilities[value_idx]
-                    quantized_dscores_t[
-                        key_idx_local, query_idx_local, output_batch
-                    ] = quantized_dscores_t_values[value_idx]
+                quantized_dscores_t_values = cute.make_rmem_tensor(
+                    (4,), cutlass.Float8E4M3FN
+                )
+                quantized_probabilities.store(
+                    (packed_probabilities.load() / probability_scale).to(
+                        cutlass.Float8E4M3FN
+                    )
+                )
+                quantized_dscores_t_values.store(
+                    (packed_dscores.load() / dscore_scale).to(
+                        cutlass.Float8E4M3FN
+                    )
+                )
+                for value_idx in cutlass.range_constexpr(4):
+                    output_query_idx_local = query_idx_local + value_idx
+                    if output_query_idx_local < query_len:
+                        quantized_probabilities_t[
+                            key_idx_local,
+                            output_query_idx_local,
+                            output_batch,
+                        ] = quantized_probabilities[value_idx]
+                        quantized_dscores_t[
+                            key_idx_local,
+                            output_query_idx_local,
+                            output_batch,
+                        ] = quantized_dscores_t_values[value_idx]
 
 
 class PairGradientReduceSm100:
