@@ -3045,6 +3045,8 @@ class HSTUAttentionForwardSm100:
         tOsO_r2s = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
 
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, epi_consumer_phase)
+        if const_expr(self.debug):
+            return
         for i in cutlass.range_constexpr(self.head_dim_v_padded // async_copy_elems):
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_r2s[None, 0, 0, i]
