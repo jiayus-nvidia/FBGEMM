@@ -308,7 +308,12 @@ class HSTUAttentionForwardSm100:
             raise RuntimeError("The layout of mQ is not supported")
         if const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
             raise RuntimeError("The layout of mK is not supported")
-        if const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
+        expected_v_major = (
+            tcgen05.OperandMajorMode.K
+            if self.is_mxfp8
+            else tcgen05.OperandMajorMode.MN
+        )
+        if const_expr(self.v_major_mode != expected_v_major):
             raise RuntimeError("The layout of mV is not supported")
 
         # check type consistency
@@ -2372,9 +2377,7 @@ class HSTUAttentionForwardSm100:
                     v_scale_s[(None, None, None, None, Vi_index)],
                     v_scale_t,
                 )
-                debug_tOtO = cute.make_tensor(
-                    tStSs[0].iterator, tOtOs[0].layout
-                )
+                debug_tOtO = tStSs[0]
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
                 for kblock_idx in cutlass.range_constexpr(
                     cute.size(tOrPs[0], mode=[2])
@@ -2400,33 +2403,19 @@ class HSTUAttentionForwardSm100:
                     mbar_ptr + self.mbar_O_full_offset, Int32(0)
                 )
                 lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
-                async_copy_elems = 128 // self.o_dtype.width
-                tOtO_i = cute.logical_divide(
-                    debug_tOtO,
-                    cute.make_layout(
-                        (self.kBlockM, async_copy_elems)
-                    ),
+                output_load_atom = cute.make_copy_atom(
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)),
+                    Float32,
                 )
-                tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
-                    self.mma_tiler_pv,
-                    self.o_layout,
-                    self.o_dtype,
-                    self.pv_acc_dtype,
-                    (self.epi_tile[0], async_copy_elems),
-                    use_2cta_instrs=False,
-                )
-                tiled_tmem_load = tcgen05.make_tmem_copy(
-                    tmem_copy_atom, tOtO_i[(None, None), 0]
-                )
-                thr_tmem_load = tiled_tmem_load.get_slice(lane)
-                tOtO_t2r = thr_tmem_load.partition_S(
-                    tOtO_i[(None, None), None]
-                )
-                output_source = tOtO_t2r[None, 0, 0, 0]
+                output_tmem_load = tcgen05.make_tmem_copy(
+                    output_load_atom, debug_tOtO
+                ).get_slice(lane)
+                output_tmem = output_tmem_load.partition_S(debug_tOtO)
+                output_source = output_tmem[None, 0, None, None]
                 output_values = cute.make_rmem_tensor(
-                    output_source.shape, self.pv_acc_dtype
+                    output_source.shape, Float32
                 )
-                cute.copy(tiled_tmem_load, output_source, output_values)
+                cute.copy(output_tmem_load, output_source, output_values)
                 cute.arch.fence_view_async_tmem_load()
                 if lane == 0:
                     mO[0, 0, 0] = self.o_dtype(
