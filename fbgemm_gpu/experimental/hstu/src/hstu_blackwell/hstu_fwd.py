@@ -68,7 +68,7 @@ class HSTUAttentionForwardSm100:
         self.is_mxfp8 = is_mxfp8
         self.q_stage = 1 if self.head_dim_padded >= 256 or is_mxfp8 else 2
         self.s_stage = 2 # score stage for intra-warp overlap
-        self.debug = True
+        self.debug = False
         assert self.q_stage in [1, 2]
         assert self.s_stage in [2]
 
@@ -129,7 +129,7 @@ class HSTUAttentionForwardSm100:
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
-        self.tmem_alloc_sync_bar_id = 1
+        self.tmem_alloc_sync_bar_id = 8
         self.tmem_s_offset = [i*self.kBlockN for i in range(self.s_stage)]
         self.tmem_o_offset = [self.tmem_s_offset[-1] + self.kBlockN + i * self.head_dim_v_padded for i in range(self.q_stage)]  # e.g., 256, 384
         self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
@@ -1125,6 +1125,17 @@ class HSTUAttentionForwardSm100:
                 cute.arch.sync_warp()
 
             if const_expr(self.is_mxfp8):
+                cute.arch.barrier(
+                    barrier_id=self.tmem_alloc_sync_bar_id,
+                    number_of_threads=cute.arch.WARP_SIZE
+                    * (
+                        1
+                        + len(self.silu0_warp_ids)
+                        + len(self.silu1_warp_ids)
+                    ),
+                )
+
+            if const_expr(self.is_mxfp8):
                 runtime_tmem_ptr = cute.arch.retrieve_tmem_ptr(
                     Float32,
                     alignment=16,
@@ -1264,11 +1275,43 @@ class HSTUAttentionForwardSm100:
         if warp_idx >= self.silu0_warp_ids[0] and warp_idx <= self.silu1_warp_ids[-1]:
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.num_regs_silu)
+            if const_expr(self.is_mxfp8):
+                cute.arch.barrier(
+                    barrier_id=self.tmem_alloc_sync_bar_id,
+                    number_of_threads=cute.arch.WARP_SIZE
+                    * (
+                        1
+                        + len(self.silu0_warp_ids)
+                        + len(self.silu1_warp_ids)
+                    ),
+                )
+                silu_tmem_ptr = cute.arch.retrieve_tmem_ptr(
+                    Float32,
+                    alignment=16,
+                    ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
+                )
+                silu_tStSs = tuple(
+                    cute.make_tensor(
+                        silu_tmem_ptr + self.tmem_s_offset[stage],
+                        tStSs[stage].layout,
+                    )
+                    for stage in range(self.s_stage)
+                )
+                silu_tOtOs = tuple(
+                    cute.make_tensor(
+                        silu_tmem_ptr + self.tmem_o_offset[stage],
+                        tOtOs[stage].layout,
+                    )
+                    for stage in range(self.q_stage)
+                )
+            else:
+                silu_tStSs = tStSs
+                silu_tOtOs = tOtOs
             store_O = partial(
                 self.store_O,
                 gmem_tiled_copy_O=gmem_tiled_copy_O,
                 thr_mma_pv=thr_mma_pv,
-                tOtOs=tOtOs,
+                tOtOs=silu_tOtOs,
                 mO=mO,
                 sO=sO,
                 mbar_ptr=mbar_ptr,
@@ -1290,13 +1333,11 @@ class HSTUAttentionForwardSm100:
             )
             if warp_idx <= self.silu0_warp_ids[-1] and warp_idx >= self.silu0_warp_ids[0]:
                 if const_expr(not self.debug):
-                    tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
-                    silu_loop(stage=0, tStSi=tStSi)
+                    silu_loop(stage=0, tStSi=silu_tStSs[0])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
                 if const_expr(not self.debug):
-                    tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
-                    silu_loop(stage=1, tStSi=tStSi)
+                    silu_loop(stage=1, tStSi=silu_tStSs[1])
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
         return
