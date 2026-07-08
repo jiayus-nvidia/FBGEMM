@@ -558,6 +558,8 @@ class SiluBackwardMaskQuantizeSm100:
 class _MxMatrix:
     values: torch.Tensor
     scales: torch.Tensor
+    _cute_values: Optional[object] = None
+    _cute_scales: Optional[object] = None
 
 
 _compile_cache = {
@@ -603,6 +605,19 @@ def _mark_matrix(tensor: cute.Tensor, leading_dim: int) -> cute.Tensor:
         divisibility=16,
     )
     return tensor
+
+
+def _mx_cute_tensors(matrix: _MxMatrix):
+    if matrix._cute_values is None:
+        leading_dim = _leading_dim(matrix.values)
+        matrix._cute_values = _mark_matrix(
+            _cute_tensor(matrix.values, element_type=cutlass.Float8E4M3FN),
+            leading_dim,
+        )
+        matrix._cute_scales = _cute_tensor(
+            matrix.scales, element_type=cutlass.Float8E8M0FNU
+        )
+    return matrix._cute_values, matrix._cute_scales
 
 
 def _matrix(rows: int, columns: int, batches: int, dtype: torch.dtype, device):
@@ -861,16 +876,8 @@ def _gemm(
             f"invalid GEMM addend shape {addend.shape}, expected {expected_shape}"
         )
 
-    a_leading = _leading_dim(a.values)
-    b_leading = _leading_dim(b.values)
-    a_tensor = _mark_matrix(
-        _cute_tensor(a.values, element_type=cutlass.Float8E4M3FN), a_leading
-    )
-    b_tensor = _mark_matrix(
-        _cute_tensor(b.values, element_type=cutlass.Float8E4M3FN), b_leading
-    )
-    a_scales = _cute_tensor(a.scales, element_type=cutlass.Float8E8M0FNU)
-    b_scales = _cute_tensor(b.scales, element_type=cutlass.Float8E8M0FNU)
+    a_tensor, a_scales = _mx_cute_tensors(a)
+    b_tensor, b_scales = _mx_cute_tensors(b)
     output_tensor = _mark_matrix(_cute_tensor(output), 1)
     addend_leading = _leading_dim(addend)
     addend_tensor = _mark_matrix(_cute_tensor(addend), addend_leading)
@@ -984,13 +991,8 @@ def _run_silu(
         else output
     )
     _validate_mx_workspace(output, scores.shape, scores.device)
-    values = output.values
-    scales = output.scales
     scores_tensor = _cute_tensor(scores)
-    values_tensor = _mark_matrix(
-        _cute_tensor(values, element_type=cutlass.Float8E4M3FN), 1
-    )
-    scales_tensor = _cute_tensor(scales, element_type=cutlass.Float8E8M0FNU)
+    values_tensor, scales_tensor = _mx_cute_tensors(output)
     offsets_q = from_dlpack(
         cu_seqlens_q.detach(), assumed_align=16
     ).mark_layout_dynamic(leading_dim=0)
@@ -1058,14 +1060,7 @@ def _run_silu_backward(
     output_tensors = []
     for output in outputs:
         _validate_mx_workspace(output, scores.shape, scores.device)
-        output_tensors.extend(
-            (
-                _mark_matrix(
-                    _cute_tensor(output.values, element_type=cutlass.Float8E4M3FN), 1
-                ),
-                _cute_tensor(output.scales, element_type=cutlass.Float8E8M0FNU),
-            )
-        )
+        output_tensors.extend(_mx_cute_tensors(output))
     score_tensor = _cute_tensor(scores)
     dprobability_tensor = _cute_tensor(dprobabilities)
     offsets_q = from_dlpack(
