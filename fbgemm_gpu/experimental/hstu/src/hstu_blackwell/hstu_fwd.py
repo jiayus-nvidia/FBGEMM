@@ -719,6 +719,7 @@ class HSTUAttentionForwardSm100:
             tma_tensor_Q,
             tma_tensor_K,
             tma_tensor_V,
+            mV,
             mO,
             max_seqlen_q,
             max_seqlen_k,
@@ -781,6 +782,7 @@ class HSTUAttentionForwardSm100:
         mQ: cute.Tensor,  # (s_q, d, h, b) or (total_q, d, h) if there is cu_seqlens_q
         mK: cute.Tensor,  # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there is cu_seqlens_k or (page_size, d, h_k, num_pages) if there is page_table
         mV: cute.Tensor,  # (d, s_k, h_k, b_k) or (d, total_k, h_k) if there is cu_seqlens_k or (d, page_size, h_k, num_pages) if there is page_table
+        mVRaw: cute.Tensor,
         mO: cute.Tensor,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
@@ -1090,6 +1092,7 @@ class HSTUAttentionForwardSm100:
                     mQ,
                     mK,
                     mV,
+                    mVRaw,
                     sQ,
                     sK,
                     sV,
@@ -1458,6 +1461,7 @@ class HSTUAttentionForwardSm100:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        mVRaw: cute.Tensor,
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -1498,8 +1502,16 @@ class HSTUAttentionForwardSm100:
 
             mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
             mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, head_idx_kv])
+            mV_raw_cur = cute.domain_offset(
+                (0, seqlen.offset_k), mVRaw[None, None, head_idx_kv]
+            )
             gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
             gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+            gVRaw = cute.local_tile(
+                mV_raw_cur,
+                cute.select(self.mma_tiler_pv, mode=[1, 2]),
+                (0, None),
+            )
             if const_expr(self.is_mxfp8):
                 mQScale_cur = cute.domain_offset(
                     (offset - offset_dynamic, 0),
@@ -1630,7 +1642,7 @@ class HSTUAttentionForwardSm100:
                 tSScale=tVsVScale,
                 raw_scale=raw_mVScale,
                 sScale=sVScale,
-                raw_data=gV,
+                raw_data=gVRaw,
                 sData=sV,
             )
             n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
