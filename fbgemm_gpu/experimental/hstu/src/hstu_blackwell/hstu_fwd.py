@@ -3089,24 +3089,6 @@ class HSTUAttentionForwardSm100:
                         tiled_tmem_load, output_source, output_values
                     )
                     cute.arch.fence_view_async_tmem_load()
-                    return
-                    for value_idx in cutlass.range_constexpr(
-                        cute.size(output_values)
-                    ):
-                        output_values[value_idx] = (
-                            output_values[value_idx] * Float32(1.0 / 128.0)
-                        )
-                    output_converted = cute.make_rmem_tensor(
-                        output_values.shape, self.o_dtype
-                    )
-                    output_converted.store(
-                        output_values.load().to(self.o_dtype)
-                    )
-                    cute.copy(
-                        tiled_smem_store,
-                        output_converted,
-                        output_destination,
-                    )
             cute.arch.fence_view_async_shared()
             return
             cute.arch.barrier(
