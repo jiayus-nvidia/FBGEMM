@@ -1445,14 +1445,22 @@ class HSTUAttentionForwardSm100:
             mask_fn=mask_fn,
         )
         tScO_t2r = thr_tmem_load.partition_D(tScS)
-        output_values = cute.make_rmem_tensor(tStS_t2r.shape, Float32)
+        output_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(4)),
+            Float32,
+        )
+        output_tmem_load = tcgen05.make_tmem_copy(
+            output_load_atom, tStS
+        ).get_slice(tidx)
+        output_tmem = output_tmem_load.partition_S(tStS)
+        output_values = cute.make_rmem_tensor(output_tmem.shape, Float32)
         cute.arch.mbarrier_wait(
             mbar_ptr + self.mbar_O_full_offset, Int32(0)
         )
-        cute.copy(thr_tmem_load, tStS_t2r, output_values)
+        cute.copy(output_tmem_load, output_tmem, output_values)
         cute.arch.fence_view_async_tmem_load()
         if tidx == 0:
-            mO[0, 0, 0] = self.o_dtype(0.0)
+            mO[0, 0, 0] = self.o_dtype(output_values[0] * Float32(1.0 / 128.0))
 
     @cute.jit
     def store_O_fixed_debug(
