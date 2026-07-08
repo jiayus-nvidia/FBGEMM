@@ -2365,7 +2365,25 @@ class HSTUAttentionForwardSm100:
                     v_scale_s[(None, None, None, None, Vi_index)],
                     v_scale_t,
                 )
-                gemm_Pi[0](tCrB=tOrVi, sB=sV_cur, zero_init=True)
+                tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
+                for kblock_idx in cutlass.range_constexpr(
+                    cute.size(tOrPs[0], mode=[2])
+                ):
+                    sf_coord = (None, None, kblock_idx)
+                    tiled_mma_pv.set(
+                        tcgen05.Field.SFA, tPScale[sf_coord].iterator
+                    )
+                    tiled_mma_pv.set(
+                        tcgen05.Field.SFB, tVScale[sf_coord].iterator
+                    )
+                    cute.gemm(
+                        tiled_mma_pv,
+                        tOtOs[0],
+                        tOrPs[0][sf_coord],
+                        tOrVi[sf_coord],
+                        tOtOs[0],
+                    )
+                    tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
                 with cute.arch.elect_one():
                     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
                 cute.arch.mbarrier_wait(
