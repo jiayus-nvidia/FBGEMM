@@ -1566,6 +1566,13 @@ class HSTUAttentionForwardSm100:
                 n_block_k = sValidBlockIds[n_block_valid_k] if self.is_arbitrary else n_block_valid_k
                 load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
                 q_producer_phase ^= 1
+                if const_expr(self.debug):
+                    self.load_scale_g2s(
+                        raw_mKScale,
+                        sKScale,
+                        n_block_k,
+                        kv_producer_state.index,
+                    )
                 load_K(block=n_block_k, producer_state=kv_producer_state, page_idx=None)  # K0
                 kv_producer_state.advance()
                 if is_jump and masking_step_k == n_masking_steps - 1:
@@ -2937,7 +2944,7 @@ class HSTUAttentionForwardSm100:
         assert K_or_V in ("K", "V")
         tma_copy_bytes = self.tma_copy_k_bytes if const_expr(K_or_V == "K") else self.tma_copy_v_bytes
         stage, phase = producer_state.index, producer_state.phase
-        if const_expr(self.is_mxfp8):
+        if const_expr(self.is_mxfp8 and not self.debug):
             self.load_scale_g2s(raw_scale, sScale, block, stage)
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
         if const_expr(K_or_V == "K" and self.uneven_kv_smem):
