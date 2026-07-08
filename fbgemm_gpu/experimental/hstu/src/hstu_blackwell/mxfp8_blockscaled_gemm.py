@@ -167,7 +167,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         accumulate_output: bool = False,
+        broadcast_a_batches: bool = False,
         broadcast_b_batches: bool = False,
+        batch_heads: int = 0,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -192,7 +194,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.accumulate_output = accumulate_output
+        self.broadcast_a_batches = broadcast_a_batches
         self.broadcast_b_batches = broadcast_b_batches
+        self.batch_heads = batch_heads
+        if self.broadcast_a_batches and self.batch_heads <= 0:
+            raise ValueError("batch_heads must be positive when broadcasting A batches")
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
@@ -973,11 +979,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Slice to per mma tile index
                 #
                 # ((atom_v, rest_v), RestK)
+                output_batch_coord = mma_tile_coord_mnl[2]
+                a_batch_coord = output_batch_coord
+                if cutlass.const_expr(self.broadcast_a_batches):
+                    b_batch_count = cute.size(tBgB.shape[3])
+                    a_batch_coord = (
+                        output_batch_coord // b_batch_count * self.batch_heads
+                        + output_batch_coord % self.batch_heads
+                    )
                 tAgA_slice = tAgA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
+                    (None, mma_tile_coord_mnl[0], None, a_batch_coord)
                 ]
                 # ((atom_v, rest_v), RestK)
-                b_batch_coord = mma_tile_coord_mnl[2]
+                b_batch_coord = output_batch_coord
                 if cutlass.const_expr(self.broadcast_b_batches):
                     b_batch_coord = b_batch_coord % cute.size(tBgB.shape[3])
                 tBgB_slice = tBgB[
@@ -986,7 +1000,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                 # ((atom_v, rest_v), RestK)
                 tAgSFA_slice = tAgSFA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
+                    (None, mma_tile_coord_mnl[0], None, a_batch_coord)
                 ]
 
                 slice_n = mma_tile_coord_mnl[1]

@@ -263,9 +263,11 @@ class SiluMaskQuantizeSm100:
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
         query_starts: Optional[cute.Tensor],
+        key_starts: Optional[cute.Tensor],
         quantized: cute.Tensor,
         scale_storage: cute.Tensor,
         batch_heads_per_pair: Int32,
+        key_tiles_per_query: Int32,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -292,9 +294,11 @@ class SiluMaskQuantizeSm100:
             cu_seqlens_q,
             cu_seqlens_k,
             query_starts,
+            key_starts,
             quantized,
             scales,
             batch_heads_per_pair,
+            key_tiles_per_query,
             num_heads,
             normalization,
             alpha,
@@ -315,9 +319,11 @@ class SiluMaskQuantizeSm100:
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
         query_starts: Optional[cute.Tensor],
+        key_starts: Optional[cute.Tensor],
         quantized: cute.Tensor,
         scales: cute.Tensor,
         batch_heads_per_pair: Int32,
+        key_tiles_per_query: Int32,
         num_heads: Int32,
         normalization: Int32,
         alpha: Float32,
@@ -336,7 +342,13 @@ class SiluMaskQuantizeSm100:
         if cutlass.const_expr(query_starts is not None):
             pair_idx = output_batch // batch_heads_per_pair
             batch_head = output_batch - pair_idx * batch_heads_per_pair
-            query_tile_start = Int32(query_starts[pair_idx])
+            query_idx_in_chunk = pair_idx
+            key_idx_in_chunk = Int32(0)
+            if cutlass.const_expr(key_starts is not None):
+                query_idx_in_chunk = pair_idx // key_tiles_per_query
+                key_idx_in_chunk = pair_idx - query_idx_in_chunk * key_tiles_per_query
+                key_start = Int32(key_starts[key_idx_in_chunk])
+            query_tile_start = Int32(query_starts[query_idx_in_chunk])
         query_idx = query_tile_start + query_idx_local
         batch = batch_head // num_heads
         query_length = Int32(cu_seqlens_q[batch + 1]) - Int32(cu_seqlens_q[batch])
@@ -715,6 +727,67 @@ class SiluBackwardMaskQuantizeSm100:
                     ] = quantized_dscores_t_values[value_idx]
 
 
+class PairOutputReduceSm100:
+    @cute.jit
+    def __call__(
+        self,
+        partials: cute.Tensor,
+        addend: cute.Tensor,
+        output: cute.Tensor,
+        batch_heads: Int32,
+        key_tiles: Int32,
+        accumulate: Int32,
+        stream: cuda.CUstream,
+    ):
+        rows, columns, _ = partials.shape
+        output_batches = cute.size(output.shape[2])
+        self.kernel(
+            partials,
+            addend,
+            output,
+            batch_heads,
+            key_tiles,
+            accumulate,
+        ).launch(
+            grid=(cute.ceil_div(rows * columns, 256), output_batches, 1),
+            block=(256, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        partials: cute.Tensor,
+        addend: cute.Tensor,
+        output: cute.Tensor,
+        batch_heads: Int32,
+        key_tiles: Int32,
+        accumulate: Int32,
+    ):
+        thread, _, _ = cute.arch.thread_idx()
+        block, output_batch, _ = cute.arch.block_idx()
+        rows, columns, _ = partials.shape
+        linear_idx = block * 256 + thread
+        if linear_idx < rows * columns:
+            row = linear_idx // columns
+            column = linear_idx - row * columns
+            value = Float32(0.0)
+            if accumulate != 0:
+                value = Float32(addend[row, column, output_batch])
+            query_idx = output_batch // batch_heads
+            batch_head = output_batch - query_idx * batch_heads
+            pair_base = query_idx * key_tiles * batch_heads + batch_head
+            for key_idx in cutlass.range(key_tiles, unroll=1):
+                value += Float32(
+                    partials[
+                        row,
+                        column,
+                        pair_base + key_idx * batch_heads,
+                    ]
+                )
+            output[row, column, output_batch] = value.to(output.element_type)
+
+
 class PairGradientReduceSm100:
     @cute.jit
     def __call__(
@@ -800,6 +873,7 @@ _compile_cache = {
     "unpack": {},
     "silu_quantize": {},
     "silu_bwd_quantize": {},
+    "pair_output_reduce": {},
     "pair_gradient_reduce": {},
     "quantize": {},
     "gemm": {},
@@ -1181,18 +1255,29 @@ def _gemm(
     output_dtype: torch.dtype,
     output: Optional[torch.Tensor] = None,
     addend: Optional[torch.Tensor] = None,
+    broadcast_a_batches: bool = False,
     broadcast_b_batches: bool = False,
+    batch_heads: int = 0,
 ) -> torch.Tensor:
     m, k, batches = a.values.shape
     n, b_k, b_batches = b.values.shape
-    compatible_batches = (
-        batches % b_batches == 0 if broadcast_b_batches else batches == b_batches
-    )
+    output_batches = batches
+    if broadcast_a_batches:
+        if not broadcast_b_batches or batch_heads <= 0:
+            raise ValueError("broadcasting A requires B broadcasting and batch_heads")
+        if batches % batch_heads != 0 or b_batches % batch_heads != 0:
+            raise ValueError("MXFP8 batch counts must be divisible by batch_heads")
+        output_batches = batches * b_batches // batch_heads
+        compatible_batches = True
+    else:
+        compatible_batches = (
+            batches % b_batches == 0 if broadcast_b_batches else batches == b_batches
+        )
     if k != b_k or not compatible_batches:
         raise ValueError(
             f"incompatible MXFP8 GEMM shapes {a.values.shape} and {b.values.shape}"
         )
-    expected_shape = (m, n, batches)
+    expected_shape = (m, n, output_batches)
     if output is None:
         output = _matrix(m, n, batches, output_dtype, a.values.device)
     elif output.shape != expected_shape or output.dtype != output_dtype:
@@ -1225,7 +1310,9 @@ def _gemm(
         addend.dtype,
         tuple(addend.stride()),
         accumulate_output,
+        broadcast_a_batches,
         broadcast_b_batches,
+        batch_heads,
         mma_n,
     )
     if key not in _compile_cache["gemm"]:
@@ -1234,7 +1321,9 @@ def _gemm(
             (128, mma_n),
             (1, 1),
             accumulate_output=accumulate_output,
+            broadcast_a_batches=broadcast_a_batches,
             broadcast_b_batches=broadcast_b_batches,
+            batch_heads=batch_heads,
         )
         max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
         _compile_cache["gemm"][key] = cute.compile(
@@ -1316,6 +1405,7 @@ def _run_silu(
     query_start: int = 0,
     key_start: int = 0,
     query_starts: Optional[torch.Tensor] = None,
+    key_starts: Optional[torch.Tensor] = None,
     batch_heads_per_pair: Optional[int] = None,
     output: Optional[_MxMatrix] = None,
 ) -> _MxMatrix:
@@ -1336,7 +1426,11 @@ def _run_silu(
         cu_seqlens_k.detach(), assumed_align=16
     ).mark_layout_dynamic(leading_dim=0)
     if query_starts is None:
+        if key_starts is not None:
+            raise ValueError("key_starts requires query_starts")
         query_starts_tensor = None
+        key_starts_tensor = None
+        key_tiles_per_query = 1
         batch_heads_per_pair = scores.shape[2]
     else:
         if query_starts.dtype != torch.int32 or query_starts.ndim != 1:
@@ -1346,13 +1440,25 @@ def _run_silu(
         query_starts_tensor = from_dlpack(
             query_starts.detach(), assumed_align=16
         ).mark_layout_dynamic(leading_dim=0)
+        if key_starts is None:
+            key_starts_tensor = None
+            key_tiles_per_query = 1
+        else:
+            if key_starts.dtype != torch.int32 or key_starts.ndim != 1:
+                raise ValueError("key_starts must be a 1-D int32 tensor")
+            key_starts_tensor = from_dlpack(
+                key_starts.detach(), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=0)
+            key_tiles_per_query = key_starts.numel()
     stream = cutlass_torch.default_stream()
     key = (
         tuple(scores.shape),
         tuple(scores.stride()),
         num_heads,
         query_starts is not None,
+        key_starts is not None,
         batch_heads_per_pair,
+        key_tiles_per_query,
     )
     if key not in _compile_cache["silu_quantize"]:
         _compile_cache["silu_quantize"][key] = cute.compile(
@@ -1361,9 +1467,11 @@ def _run_silu(
             offsets_q,
             offsets_k,
             query_starts_tensor,
+            key_starts_tensor,
             values_tensor,
             scales_tensor,
             Int32(batch_heads_per_pair),
+            Int32(key_tiles_per_query),
             Int32(num_heads),
             Int32(normalization),
             Float32(alpha),
@@ -1378,9 +1486,11 @@ def _run_silu(
         offsets_q,
         offsets_k,
         query_starts_tensor,
+        key_starts_tensor,
         values_tensor,
         scales_tensor,
         Int32(batch_heads_per_pair),
+        Int32(key_tiles_per_query),
         Int32(num_heads),
         Int32(normalization),
         Float32(alpha),
@@ -1500,6 +1610,67 @@ def _run_silu_backward(
         stream,
     )
     return outputs[0], outputs[1], outputs[2]
+
+
+def _reduce_pair_outputs(
+    partials: torch.Tensor,
+    batch_heads: int,
+    key_tiles: int,
+    output: torch.Tensor,
+    addend: Optional[torch.Tensor] = None,
+) -> None:
+    if partials.dtype != torch.float32 or partials.ndim != 3:
+        raise ValueError("partial outputs must be a 3-D FP32 tensor")
+    rows, columns, pair_batches = partials.shape
+    if pair_batches % (batch_heads * key_tiles) != 0:
+        raise ValueError("partial output batches must contain complete key chunks")
+    output_batches = pair_batches // key_tiles
+    expected_shape = (rows, columns, output_batches)
+    if output.shape != expected_shape:
+        raise ValueError(
+            f"invalid reduced output shape {output.shape}, expected {expected_shape}"
+        )
+    accumulate = addend is not None
+    if addend is None:
+        addend = output
+    elif addend.shape != expected_shape or addend.dtype != torch.float32:
+        raise ValueError("partial output addend must be a matching FP32 tensor")
+
+    partials_tensor = _mark_matrix(_cute_tensor(partials), 1)
+    addend_tensor = _mark_matrix(_cute_tensor(addend), 1)
+    output_tensor = _mark_matrix(_cute_tensor(output), 1)
+    stream = cutlass_torch.default_stream()
+    key = (
+        tuple(partials.shape),
+        tuple(partials.stride()),
+        batch_heads,
+        key_tiles,
+        addend.dtype,
+        tuple(addend.stride()),
+        output.dtype,
+        tuple(output.stride()),
+        accumulate,
+    )
+    if key not in _compile_cache["pair_output_reduce"]:
+        _compile_cache["pair_output_reduce"][key] = cute.compile(
+            PairOutputReduceSm100(),
+            partials_tensor,
+            addend_tensor,
+            output_tensor,
+            Int32(batch_heads),
+            Int32(key_tiles),
+            Int32(accumulate),
+            stream,
+        )
+    _compile_cache["pair_output_reduce"][key](
+        partials_tensor,
+        addend_tensor,
+        output_tensor,
+        Int32(batch_heads),
+        Int32(key_tiles),
+        Int32(accumulate),
+        stream,
+    )
 
 
 def _reduce_pair_gradients(
@@ -1635,8 +1806,8 @@ def hstu_varlen_fwd_mxfp8_100(
         q_tile_count, 128, head_dim, batch_heads, torch.bfloat16, q.device
     )
     q_mx_collection, _ = _pack_quantize(q, cu_seqlens_q, padded_q)
-    _, k_mx_tiles = _pack_quantize(k, cu_seqlens_k, padded_k)
-    _, v_mx_tiles = _pack_quantize(
+    k_mx_collection, k_mx_tiles = _pack_quantize(k, cu_seqlens_k, padded_k)
+    v_mx_collection, v_mx_tiles = _pack_quantize(
         v, cu_seqlens_k, padded_k, transpose=True
     )
     combined_batches = q_tile_count * batch_heads
@@ -1648,49 +1819,65 @@ def hstu_varlen_fwd_mxfp8_100(
         if len(k_mx_tiles) > 1
         else None
     )
-    query_starts = (
-        torch.arange(
-            0,
-            q_tile_count * 128,
-            128,
-            dtype=torch.int32,
-            device=q.device,
-        )
-        if q_tile_count > 1
-        else None
+    query_starts = torch.arange(
+        0,
+        q_tile_count * 128,
+        128,
+        dtype=torch.int32,
+        device=q.device,
     )
-    chunk_size = 16
+    key_starts = torch.arange(
+        0,
+        len(k_mx_tiles) * 128,
+        128,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    max_workspace_batches = 512
+    pair_capacity = max(1, max_workspace_batches // batch_heads)
+    query_chunk_size = min(q_tile_count, 16, pair_capacity)
+    key_chunk_size = min(
+        len(k_mx_tiles), max(1, pair_capacity // query_chunk_size)
+    )
     workspaces = {}
 
-    for key_tile_idx, (key_mx, value_mx) in enumerate(zip(k_mx_tiles, v_mx_tiles)):
-        for query_tile_idx in range(0, q_tile_count, chunk_size):
-            query_tile_end = min(query_tile_idx + chunk_size, q_tile_count)
-            pair_count = query_tile_end - query_tile_idx
-            batch_start = query_tile_idx * batch_heads
-            batch_end = query_tile_end * batch_heads
-            if pair_count not in workspaces:
-                workspace_batches = pair_count * batch_heads
-                workspaces[pair_count] = (
-                    _matrix(
-                        128,
-                        128,
-                        workspace_batches,
-                        torch.float32,
-                        q.device,
-                    ),
-                    _mx_workspace((128, 128, workspace_batches), q.device),
-                )
-            score_workspace, probability_workspace = workspaces[pair_count]
-            query_mx = _slice_mx_batches(
-                q_mx_collection, batch_start, batch_end
+    for query_tile_idx in range(0, q_tile_count, query_chunk_size):
+        query_tile_end = min(query_tile_idx + query_chunk_size, q_tile_count)
+        query_count = query_tile_end - query_tile_idx
+        batch_start = query_tile_idx * batch_heads
+        batch_end = query_tile_end * batch_heads
+        query_mx = _slice_mx_batches(q_mx_collection, batch_start, batch_end)
+        for key_tile_idx in range(0, len(k_mx_tiles), key_chunk_size):
+            key_tile_end = min(key_tile_idx + key_chunk_size, len(k_mx_tiles))
+            key_count = key_tile_end - key_tile_idx
+            pair_count = query_count * key_count
+            pair_batches = pair_count * batch_heads
+            key_batch_start = key_tile_idx * batch_heads
+            key_batch_end = key_tile_end * batch_heads
+            key_mx = _slice_mx_batches(
+                k_mx_collection, key_batch_start, key_batch_end
             )
-            key_start = key_tile_idx * 128
+            value_mx = _slice_mx_batches(
+                v_mx_collection, key_batch_start, key_batch_end
+            )
+            workspace_key = (query_count, key_count)
+            if workspace_key not in workspaces:
+                workspaces[workspace_key] = (
+                    _matrix(128, 128, pair_batches, torch.float32, q.device),
+                    _mx_workspace((128, 128, pair_batches), q.device),
+                    _matrix(128, head_dim, pair_batches, torch.float32, q.device),
+                )
+            score_workspace, probability_workspace, partial_output_workspace = (
+                workspaces[workspace_key]
+            )
             scores = _gemm(
                 query_mx,
                 key_mx,
                 torch.float32,
                 output=score_workspace,
-                broadcast_b_batches=pair_count > 1,
+                broadcast_a_batches=True,
+                broadcast_b_batches=True,
+                batch_heads=batch_heads,
             )
             probabilities_mx = _run_silu(
                 scores,
@@ -1701,31 +1888,35 @@ def hstu_varlen_fwd_mxfp8_100(
                 alpha,
                 window_size_left,
                 window_size_right,
-                key_start=key_start,
-                query_starts=(
-                    query_starts[query_tile_idx:query_tile_end]
-                    if query_starts is not None
-                    else None
-                ),
+                query_starts=query_starts[query_tile_idx:query_tile_end],
+                key_starts=key_starts[key_tile_idx:key_tile_end],
                 batch_heads_per_pair=batch_heads,
                 output=probability_workspace,
             )
-            is_last_key_tile = key_tile_idx + 1 == len(k_mx_tiles)
-            output = dense_output_matrix[:, :, batch_start:batch_end]
-            if not is_last_key_tile:
-                output = output_accumulator[:, :, batch_start:batch_end]
+            partial_outputs = _gemm(
+                probabilities_mx,
+                value_mx,
+                torch.float32,
+                output=partial_output_workspace,
+                broadcast_b_batches=query_count > 1,
+            )
+            is_last_key_chunk = key_tile_end == len(k_mx_tiles)
+            output = (
+                dense_output_matrix[:, :, batch_start:batch_end]
+                if is_last_key_chunk
+                else output_accumulator[:, :, batch_start:batch_end]
+            )
             addend = (
                 output_accumulator[:, :, batch_start:batch_end]
                 if key_tile_idx > 0
                 else None
             )
-            _gemm(
-                probabilities_mx,
-                value_mx,
-                torch.bfloat16 if is_last_key_tile else torch.float32,
-                output=output,
+            _reduce_pair_outputs(
+                partial_outputs,
+                batch_heads,
+                key_count,
+                output,
                 addend=addend,
-                broadcast_b_batches=pair_count > 1,
             )
 
     return _unpack(dense_output, cu_seqlens_q, q.shape[0], num_heads), None
