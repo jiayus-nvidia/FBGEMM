@@ -2445,7 +2445,12 @@ class HSTUAttentionForwardSm100:
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
                 for kblock_idx in cutlass.range_constexpr(1, 2):
                     sf_coord = (None, None, 0)
-                    operand_coord = (None, None, kblock_idx)
+                    debug_tOrP_block = tiled_mma_pv.make_fragment_A(
+                        debug_sP[None, None, kblock_idx, 0]
+                    )
+                    debug_tOrV_block = tiled_mma_pv.make_fragment_B(
+                        debug_sV[None, None, kblock_idx, 0]
+                    )
                     tiled_mma_pv.set(
                         tcgen05.Field.SFA, tQScale[sf_coord].iterator
                     )
@@ -2455,8 +2460,8 @@ class HSTUAttentionForwardSm100:
                     cute.gemm(
                         tiled_mma_pv,
                         debug_tOtO,
-                        debug_tOrP[operand_coord],
-                        debug_tOrV[operand_coord],
+                        debug_tOrP_block,
+                        debug_tOrV_block,
                         debug_tOtO,
                     )
                     tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
