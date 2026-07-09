@@ -3056,7 +3056,6 @@ class HSTUAttentionForwardSm100:
                 scalar_source = scalar_thread.partition_S(
                     tOtO_i[(None, None), None]
                 )[None, 0, 0, 0]
-                print("MXFP8_SPLIT_SOURCE_SHAPE", scalar_source.shape)
                 scalar_value = cute.make_rmem_tensor(
                     scalar_source.shape, self.pv_acc_dtype
                 )
