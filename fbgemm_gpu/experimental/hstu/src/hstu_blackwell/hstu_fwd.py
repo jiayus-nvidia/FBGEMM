@@ -2442,6 +2442,24 @@ class HSTUAttentionForwardSm100:
                     tStSs[0].iterator, debug_tOtO_fake.layout
                 )
                 debug_tOtO = debug_tOtO_base[None, None, None, 0]
+                print("debug_sP", debug_sP.layout)
+                print("debug_sV", debug_sV.layout)
+                print("debug_tOrP", debug_tOrP.layout)
+                print("debug_tOrV", debug_tOrV.layout)
+                print(
+                    "debug_tOrP offsets",
+                    tuple(
+                        cute.crd2idx((0, 0, kblock), debug_tOrP.layout)
+                        for kblock in range(cute.size(debug_tOrP, mode=[2]))
+                    ),
+                )
+                print(
+                    "debug_tOrV offsets",
+                    tuple(
+                        cute.crd2idx((0, 0, kblock), debug_tOrV.layout)
+                        for kblock in range(cute.size(debug_tOrV, mode=[2]))
+                    ),
+                )
                 sm100_utils.gemm_ptx_blockscaled_ss(
                     tiled_mma_pv.op,
                     debug_tOtO.iterator.toint(),
