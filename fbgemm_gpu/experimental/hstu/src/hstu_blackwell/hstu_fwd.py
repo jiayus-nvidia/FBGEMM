@@ -2394,7 +2394,10 @@ class HSTUAttentionForwardSm100:
                 debug_sV = cute.make_tensor(
                     cute.recast_ptr(sP.iterator, sV_swizzle), sV.layout
                 )
-                staged_q = cute.group_modes(sQ, 0, 3)
+                debug_sP = cute.make_tensor(
+                    cute.recast_ptr(sQ.iterator, sP_swizzle), sP.layout
+                )
+                staged_q = cute.group_modes(debug_sP, 0, 3)
                 source_p = cute.group_modes(sP, 0, 3)
                 source_v = cute.group_modes(sV, 0, 3)
                 staged_v = cute.group_modes(debug_sV, 0, 3)
@@ -2423,7 +2426,7 @@ class HSTUAttentionForwardSm100:
                     mbar_ptr + self.mbar_s0_s1_sequence_offset,
                     Int32(0),
                 )
-                debug_tOrP = tiled_mma_pv.make_fragment_A(sQ)[
+                debug_tOrP = tiled_mma_pv.make_fragment_A(debug_sP)[
                     None, None, None, 0
                 ]
                 debug_tOrV = tiled_mma_pv.make_fragment_B(debug_sV)[
@@ -2440,7 +2443,9 @@ class HSTUAttentionForwardSm100:
                 )
                 debug_tOtO = debug_tOtO_base[None, None, None, 0]
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
-                for kblock_idx in cutlass.range_constexpr(1, 2):
+                for kblock_idx in cutlass.range_constexpr(
+                    cute.size(debug_tOrP, mode=[2])
+                ):
                     sf_coord = (None, None, kblock_idx)
                     tiled_mma_pv.set(
                         tcgen05.Field.SFA, tQScale[sf_coord].iterator
