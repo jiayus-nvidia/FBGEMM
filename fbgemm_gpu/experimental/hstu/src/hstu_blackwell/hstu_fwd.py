@@ -3093,17 +3093,16 @@ class HSTUAttentionForwardSm100:
                     output_values = cute.make_rmem_tensor(
                         output_source.shape, self.pv_acc_dtype
                     )
+                    print(
+                        "MXFP8_SPLIT_EPI_SHAPES",
+                        output_source.shape,
+                        output_destination.shape,
+                        output_coord.shape,
+                    )
                     cute.copy(
                         tiled_tmem_load, output_source, output_values
                     )
                     cute.arch.fence_view_async_tmem_load()
-                    for value_idx in cutlass.range_constexpr(
-                        cute.size(output_values)
-                    ):
-                        coord = output_coord[value_idx]
-                        sO[coord[0], coord[1], stage] = self.o_dtype(
-                            output_values[value_idx] * Float32(1.0 / 128.0)
-                        )
             cute.arch.fence_view_async_shared()
             return
             cute.arch.barrier(
