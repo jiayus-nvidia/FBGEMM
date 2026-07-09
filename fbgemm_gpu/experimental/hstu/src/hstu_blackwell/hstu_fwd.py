@@ -2382,7 +2382,7 @@ class HSTUAttentionForwardSm100:
                     v_scale_s[(None, None, None, None, Vi_index)],
                     v_scale_t,
                 )
-                debug_tOrP = tiled_mma_pv.make_fragment_A(sP)[
+                debug_tOrP = tiled_mma_pv.make_fragment_A(sQ)[
                     None, None, None, 0
                 ]
                 debug_tOrV = tiled_mma_pv.make_fragment_B(sV)[
