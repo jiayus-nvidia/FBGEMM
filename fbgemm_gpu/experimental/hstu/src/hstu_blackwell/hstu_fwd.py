@@ -2388,8 +2388,14 @@ class HSTUAttentionForwardSm100:
                 debug_tOrV = tiled_mma_pv.make_fragment_B(sV)[
                     None, None, None, Vi_index
                 ]
+                debug_acc_shape = tiled_mma_pv.partition_shape_C(
+                    (self.mma_tiler_pv[0], self.mma_tiler_pv[1])
+                )
+                debug_tOtO_fake = tiled_mma_pv.make_fragment_C(
+                    cute.append(debug_acc_shape, 1)
+                )
                 debug_tOtO_base = cute.make_tensor(
-                    tStSs[0].iterator, tOtOs[0].layout
+                    tStSs[0].iterator, debug_tOtO_fake.layout
                 )
                 debug_tOtO = debug_tOtO_base[None, None, None, 0]
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
