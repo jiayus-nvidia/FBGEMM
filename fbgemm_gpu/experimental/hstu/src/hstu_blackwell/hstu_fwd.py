@@ -2442,23 +2442,19 @@ class HSTUAttentionForwardSm100:
                     tStSs[0].iterator, debug_tOtO_fake.layout
                 )
                 debug_tOtO = debug_tOtO_base[None, None, None, 0]
-                tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
-                for kblock_idx in cutlass.range_constexpr(1, 2):
-                    sf_coord = (None, None, kblock_idx)
-                    tiled_mma_pv.set(
-                        tcgen05.Field.SFA, tQScale[(None, None, 0)].iterator
-                    )
-                    tiled_mma_pv.set(
-                        tcgen05.Field.SFB, tKScale[(None, None, 0)].iterator
-                    )
-                    cute.gemm(
-                        tiled_mma_pv,
-                        debug_tOtO,
-                        debug_tOrP[sf_coord],
-                        debug_tOrV[sf_coord],
-                        debug_tOtO,
-                    )
-                    tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
+                sm100_utils.gemm_ptx_blockscaled_ss(
+                    tiled_mma_pv.op,
+                    debug_tOtO.iterator.toint(),
+                    debug_tOrP,
+                    debug_tOrV,
+                    debug_sP[None, None, None, 0],
+                    debug_sV[None, None, None, 0],
+                    sP_swizzle,
+                    sV_swizzle,
+                    tQScale,
+                    tKScale,
+                    zero_init=True,
+                )
                 with cute.arch.elect_one():
                     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
                 cute.arch.mbarrier_wait(
