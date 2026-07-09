@@ -895,7 +895,7 @@ class HSTUAttentionForwardSm100:
         # (MMA, MMA_K, MMA_D, PIPE)
         sV = cute.make_tensor(
             cute.recast_ptr(
-                storage.sO.data_ptr(), sV_layout.inner, dtype=self.v_dtype
+                storage.sP.data_ptr(), sV_layout.inner, dtype=self.v_dtype
             ),
             sV_layout.outer,
         )
