@@ -900,6 +900,8 @@ class HSTUAttentionForwardSm100:
             if const_expr(self.is_mxfp8)
             else None
         )
+        if const_expr(self.debug and self.is_mxfp8):
+            print("HSTU_PV_SMEM_LAYOUTS", sP.layout, sV.layout)
 
         if const_expr(self.is_mxfp8):
             sQScale = storage.sQScale.get_tensor(sQScale_layout)
