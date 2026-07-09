@@ -797,7 +797,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sB = storage.sB.get_tensor(
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
-        print("GEMM_AB_SMEM_LAYOUTS", sA.layout, sB.layout)
         # (MMA, MMA_M, MMA_K, STAGE)
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         # (MMA, MMA_N, MMA_K, STAGE)

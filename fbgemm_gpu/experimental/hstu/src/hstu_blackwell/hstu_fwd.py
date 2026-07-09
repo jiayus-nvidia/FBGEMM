@@ -651,10 +651,6 @@ class HSTUAttentionForwardSm100:
                 cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
                 self.buffer_align_bytes,
             ]
-            sV: cute.struct.Align[
-                cute.struct.MemRange[self.v_dtype, cute.cosize(sV_layout)],
-                self.buffer_align_bytes,
-            ]
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, sO_size],
                 self.buffer_align_bytes,
@@ -897,16 +893,17 @@ class HSTUAttentionForwardSm100:
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         # sK_pi = storage.sK.get_tensor(sK_layout)
         # (MMA, MMA_K, MMA_D, PIPE)
-        sV = storage.sV.get_tensor(
-            sV_layout.outer, swizzle=sV_layout.inner
+        sV = cute.make_tensor(
+            cute.recast_ptr(
+                storage.sO.data_ptr(), sV_layout.inner, dtype=self.v_dtype
+            ),
+            sV_layout.outer,
         )
         sP = (
             storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
             if const_expr(self.is_mxfp8)
             else None
         )
-        if const_expr(self.debug and self.is_mxfp8):
-            print("HSTU_PV_SMEM_LAYOUTS", sP.layout, sV.layout)
 
         if const_expr(self.is_mxfp8):
             sQScale = storage.sQScale.get_tensor(sQScale_layout)
