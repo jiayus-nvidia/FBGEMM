@@ -2385,8 +2385,7 @@ class HSTUAttentionForwardSm100:
                 debug_tOrP = tiled_mma_pv.make_fragment_A(sQ)[
                     None, None, None, 0
                 ]
-                debug_sV = cute.make_tensor(sQ.iterator, sV.layout)
-                debug_tOrV = tiled_mma_pv.make_fragment_B(debug_sV)[
+                debug_tOrV = tiled_mma_pv.make_fragment_B(sV)[
                     None, None, None, 0
                 ]
                 debug_acc_shape = tiled_mma_pv.partition_shape_C(
