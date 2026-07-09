@@ -868,6 +868,11 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_init(mbar_ptr + self.mbar_P_full_O_rescaled_offset + i, cute.arch.WARP_SIZE * (len(self.silu0_warp_ids)))
                 cute.arch.mbarrier_init(mbar_ptr + self.mbar_S_full_offset + i, len([self.mma_warp_id]))
                 cute.arch.mbarrier_init(mbar_ptr + self.mbar_O_full_offset + i, len([self.mma_warp_id]))
+            if const_expr(self.debug and self.is_mxfp8):
+                cute.arch.mbarrier_init(
+                    mbar_ptr + self.mbar_s0_s1_sequence_offset,
+                    cute.arch.WARP_SIZE,
+                )
         if warp_idx == 4:
             for i in cutlass.range_constexpr(self.s_stage):
                 cute.arch.mbarrier_init(mbar_ptr + self.mbar_P_full_2_offset + i, cute.arch.WARP_SIZE * len(self.silu0_warp_ids))
@@ -2400,9 +2405,12 @@ class HSTUAttentionForwardSm100:
                     staged_q[value_idx, 0] = source_p[value_idx, 0]
                 cute.arch.sync_warp()
                 cute.arch.fence_view_async_shared()
-                cute.arch.barrier(
-                    barrier_id=NamedBarrierFwd.PEmpty,
-                    number_of_threads=cute.arch.WARP_SIZE,
+                cute.arch.mbarrier_arrive(
+                    mbar_ptr + self.mbar_s0_s1_sequence_offset
+                )
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + self.mbar_s0_s1_sequence_offset,
+                    Int32(0),
                 )
                 debug_tOrP = tiled_mma_pv.make_fragment_A(sQ)[
                     None, None, None, 0
