@@ -2400,6 +2400,7 @@ class HSTUAttentionForwardSm100:
                     staged_q[value_idx, 0] = source_p[value_idx, 0]
                 cute.arch.sync_warp()
                 cute.arch.fence_view_async_shared()
+                cute.arch.sync_warp()
                 debug_tOrP = tiled_mma_pv.make_fragment_A(sQ)[
                     None, None, None, 0
                 ]
