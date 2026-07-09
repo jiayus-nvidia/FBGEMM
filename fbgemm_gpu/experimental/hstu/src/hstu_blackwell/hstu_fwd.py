@@ -2440,13 +2440,15 @@ class HSTUAttentionForwardSm100:
                 )
                 debug_tOtO = debug_tOtO_base[None, None, None, 0]
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
-                for kblock_idx in cutlass.range_constexpr(1):
+                for kblock_idx in cutlass.range_constexpr(
+                    cute.size(debug_tOrP, mode=[2])
+                ):
                     sf_coord = (None, None, kblock_idx)
                     tiled_mma_pv.set(
-                        tcgen05.Field.SFA, tQScale[sf_coord].iterator
+                        tcgen05.Field.SFA, tPScale[sf_coord].iterator
                     )
                     tiled_mma_pv.set(
-                        tcgen05.Field.SFB, tKScale[sf_coord].iterator
+                        tcgen05.Field.SFB, tVScale[sf_coord].iterator
                     )
                     cute.gemm(
                         tiled_mma_pv,
