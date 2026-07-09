@@ -2396,6 +2396,8 @@ class HSTUAttentionForwardSm100:
                 )
                 staged_q = cute.group_modes(sQ, 0, 3)
                 source_p = cute.group_modes(sP, 0, 3)
+                source_v = cute.group_modes(sV, 0, 3)
+                staged_v = cute.group_modes(debug_sV, 0, 3)
                 lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
                 for value_idx in cutlass.range(
                     lane,
@@ -2403,6 +2405,15 @@ class HSTUAttentionForwardSm100:
                     cute.arch.WARP_SIZE,
                 ):
                     staged_q[value_idx, 0] = source_p[value_idx, 0]
+                cute.arch.sync_warp()
+                for value_idx in cutlass.range(
+                    lane,
+                    self.kBlockN * self.head_dim_v_padded,
+                    cute.arch.WARP_SIZE,
+                ):
+                    staged_v[value_idx, 0] = source_v[
+                        value_idx, Vi_index
+                    ]
                 cute.arch.sync_warp()
                 cute.arch.fence_view_async_shared()
                 cute.arch.mbarrier_arrive(
