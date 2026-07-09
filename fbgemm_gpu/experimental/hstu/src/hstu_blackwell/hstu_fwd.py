@@ -3035,6 +3035,10 @@ class HSTUAttentionForwardSm100:
         async_copy_elems = universal_copy_bits // self.o_dtype.width
 
         if const_expr(self.debug):
+            cute.arch.mbarrier_wait(
+                mbar_ptr + self.mbar_O_full_offset + stage,
+                epi_consumer_phase,
+            )
             if tidx < cute.arch.WARP_SIZE:
                 tOtO_stage = tOtO[None, None, None, 0]
                 tOtO_i = cute.logical_divide(
