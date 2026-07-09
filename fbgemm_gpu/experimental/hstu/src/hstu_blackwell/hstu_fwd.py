@@ -1376,11 +1376,6 @@ class HSTUAttentionForwardSm100:
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             if warp_idx <= self.silu1_warp_ids[-1] and warp_idx >= self.silu1_warp_ids[0]:
                 if const_expr(self.debug and self.is_mxfp8):
-                    cute.arch.barrier(
-                        barrier_id=NamedBarrierFwd.PEmpty,
-                        number_of_threads=cute.arch.WARP_SIZE
-                        * (1 + len(self.silu1_warp_ids)),
-                    )
                     store_O(
                         seqlen=SeqlenInfoCls(Int32(0)),
                         scale=Float32(1.0 / 128.0),
@@ -2425,15 +2420,6 @@ class HSTUAttentionForwardSm100:
                     tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
                 with cute.arch.elect_one():
                     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
-                cute.arch.mbarrier_wait(
-                    mbar_ptr + self.mbar_O_full_offset, Int32(0)
-                )
-                if const_expr(self.debug):
-                    cute.arch.barrier(
-                        barrier_id=NamedBarrierFwd.PEmpty,
-                        number_of_threads=cute.arch.WARP_SIZE
-                        * (1 + len(self.silu1_warp_ids)),
-                    )
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
