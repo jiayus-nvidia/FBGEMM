@@ -2449,10 +2449,25 @@ class HSTUAttentionForwardSm100:
                 tiled_mma_pv.set(
                     tcgen05.Field.SFB, tKScale[(None, None, 0)].iterator
                 )
+                with cute.arch.elect_one():
+                    cute.printf(
+                        "P blocks: %u %u %u %u",
+                        debug_sP[None, None, 0, 0].iterator.toint(),
+                        debug_sP[None, None, 1, 0].iterator.toint(),
+                        debug_sP[None, None, 2, 0].iterator.toint(),
+                        debug_sP[None, None, 3, 0].iterator.toint(),
+                    )
+                    cute.printf(
+                        "V blocks: %u %u %u %u",
+                        debug_sV[None, None, 0, 0].iterator.toint(),
+                        debug_sV[None, None, 1, 0].iterator.toint(),
+                        debug_sV[None, None, 2, 0].iterator.toint(),
+                        debug_sV[None, None, 3, 0].iterator.toint(),
+                    )
                 cute.gemm(
                     tiled_mma_pv,
                     debug_tOtO,
-                    debug_tOrP[None, None, 1],
+                    debug_tOrP[None, None, 0],
                     debug_tOrV[None, None, 0],
                     debug_tOtO,
                 )
