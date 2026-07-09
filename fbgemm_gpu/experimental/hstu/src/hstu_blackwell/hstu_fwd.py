@@ -2389,32 +2389,11 @@ class HSTUAttentionForwardSm100:
                 debug_sV = cute.make_tensor(
                     cute.recast_ptr(sP.iterator, sV_swizzle), sV.layout
                 )
-                staged_p = cute.group_modes(sP, 0, 3)
-                source_v = cute.group_modes(sV, 0, 3)
-                staged_v = cute.group_modes(debug_sV, 0, 3)
-                lane = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
-                for value_idx in cutlass.range(
-                    lane,
-                    self.kBlockN * self.head_dim_v_padded,
-                    cute.arch.WARP_SIZE,
-                ):
-                    staged_p[value_idx, 1] = staged_p[value_idx, 0]
-                cute.arch.sync_warp()
-                for value_idx in cutlass.range(
-                    lane,
-                    self.kBlockN * self.head_dim_v_padded,
-                    cute.arch.WARP_SIZE,
-                ):
-                    staged_v[value_idx, 0] = source_v[
-                        value_idx, Vi_index
-                    ]
-                cute.arch.sync_warp()
-                cute.arch.fence_view_async_shared()
-                debug_tOrP = tiled_mma_pv.make_fragment_A(sP)[
-                    None, None, None, 1
+                debug_tOrP = tiled_mma_pv.make_fragment_A(sQ)[
+                    None, None, None, 0
                 ]
                 debug_tOrV = tiled_mma_pv.make_fragment_B(debug_sV)[
-                    None, None, None, 0
+                    None, None, None, 1
                 ]
                 debug_acc_shape = tiled_mma_pv.partition_shape_C(
                     (self.mma_tiler_pv[0], self.mma_tiler_pv[1])
