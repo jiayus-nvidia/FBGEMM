@@ -2445,10 +2445,10 @@ class HSTUAttentionForwardSm100:
                 ):
                     sf_coord = (None, None, kblock_idx)
                     tiled_mma_pv.set(
-                        tcgen05.Field.SFA, tPScale[sf_coord].iterator
+                        tcgen05.Field.SFA, tQScale[sf_coord].iterator
                     )
                     tiled_mma_pv.set(
-                        tcgen05.Field.SFB, tVScale[sf_coord].iterator
+                        tcgen05.Field.SFB, tKScale[sf_coord].iterator
                     )
                     cute.gemm(
                         tiled_mma_pv,
