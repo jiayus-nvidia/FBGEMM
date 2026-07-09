@@ -651,6 +651,10 @@ class HSTUAttentionForwardSm100:
                 cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
                 self.buffer_align_bytes,
             ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[self.v_dtype, cute.cosize(sV_layout)],
+                self.buffer_align_bytes,
+            ]
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, sO_size],
                 self.buffer_align_bytes,
@@ -893,8 +897,9 @@ class HSTUAttentionForwardSm100:
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         # sK_pi = storage.sK.get_tensor(sK_layout)
         # (MMA, MMA_K, MMA_D, PIPE)
-        # Strip swizzle info to reuse smem
-        sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+        sV = storage.sV.get_tensor(
+            sV_layout.outer, swizzle=sV_layout.inner
+        )
         sP = (
             storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
             if const_expr(self.is_mxfp8)
@@ -2387,10 +2392,7 @@ class HSTUAttentionForwardSm100:
                 debug_tOrP = tiled_mma_pv.make_fragment_A(sQ)[
                     None, None, None, 0
                 ]
-                debug_sV = cute.make_tensor(
-                    cute.recast_ptr(sP.iterator, sV_swizzle), sV.layout
-                )
-                debug_tOrV = tiled_mma_pv.make_fragment_B(debug_sV)[
+                debug_tOrV = tiled_mma_pv.make_fragment_B(sV)[
                     None, None, None, 0
                 ]
                 debug_acc_shape = tiled_mma_pv.partition_shape_C(
