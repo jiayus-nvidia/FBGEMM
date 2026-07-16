@@ -183,10 +183,7 @@ cmdclass = {}
 ext_modules = []
 
 cmdclass = []
-install_requires = [
-    "apache-tvm-ffi>=0.1.12,<0.2",
-    "torch-c-dlpack-ext",
-]
+install_requires = []
 
 if not SKIP_CUDA_BUILD:
     if not ONLY_COMPILE_SO:
@@ -264,6 +261,8 @@ if not SKIP_CUDA_BUILD:
         if not DISABLE_ARBITRARY and ARBITRARY_NFUNC % 2 == 0:
             raise ValueError("ARBITRARY_NFUNC must be odd")
 
+        blackwell_rtx_enabled = "12.0" in arch_list and not DISABLE_120
+
         torch_cpp_sources = []
         subprocess.run(["rm", "-rf", "src/hstu_ampere/instantiations/*"])
         subprocess.run(["rm", "-rf", "src/hstu_hopper/instantiations/*"])
@@ -273,13 +272,13 @@ if not SKIP_CUDA_BUILD:
         if "9.0" in arch_list:
             torch_cpp_sources.append("src/hstu_hopper/hstu_ops_gpu.cpp")
             generate_kernels_hopper("src/hstu_hopper/instantiations")
-        if "12.0" in arch_list:
+        if blackwell_rtx_enabled:
             torch_cpp_sources.append("src/hstu_blackwell_rtx/hstu_ops_gpu.cpp")
             generate_kernels_blackwell("src/hstu_blackwell_rtx/instantiations")
         cuda_sources = (
             (glob.glob("src/hstu_ampere/instantiations/*.cu") if ("8.0" in arch_list or "12.0" in arch_list) else [])
             + (glob.glob("src/hstu_hopper/instantiations/*.cu") if "9.0" in arch_list else [])
-            + (glob.glob("src/hstu_blackwell_rtx/instantiations/hstu_fwd_hdim*_e4m3*_sm120*.cu") if "12.0" in arch_list else [])
+            + (glob.glob("src/hstu_blackwell_rtx/instantiations/hstu_fwd_hdim*_e4m3*_sm120*.cu") if blackwell_rtx_enabled else [])
         )
 
         nvcc_flags = [
@@ -314,7 +313,7 @@ if not SKIP_CUDA_BUILD:
             include_dirs.append(Path(this_dir) / "src" / "hstu_ampere")
         if "9.0" in arch_list:
             include_dirs.append(Path(this_dir) / "src" / "hstu_hopper")
-        if "12.0" in arch_list:
+        if blackwell_rtx_enabled:
             include_dirs.append(Path(this_dir) / "src" / "hstu_blackwell_rtx")
 
         sources = None
@@ -412,5 +411,5 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
-    install_requires=install_requires,
+    install_requires=[],
 )

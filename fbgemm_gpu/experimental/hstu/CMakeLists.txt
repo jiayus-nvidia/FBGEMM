@@ -127,6 +127,10 @@ file(GLOB hstu_blackwell_rtx_cuda_source_files
 # Initialize the combined source file lists
 set(hstu_cpp_source_files "")
 set(hstu_cpp_source_files_gpu "")
+set(hstu_include_dirs
+  ${fbgemm_sources_include_directories}
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_ampere
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_hopper)
 
 # Conditionally add Ampere sources if arch 8.0 is requested
 # TORCH_CUDA_ARCH_LIST is expected to be set, e.g., by PyTorch's build system or CMake cache
@@ -147,13 +151,20 @@ endif()
 
 # Conditionally add SM120 sources (Blackwell RTX FP8 sources and Ampere BF16/FP16 sources)
 if("12.0" IN_LIST TORCH_CUDA_ARCH_LIST)
-  message(STATUS "HSTU: Selecting Ampere BF16/FP16 and Blackwell RTX FP8 sources for arch 12.0")
+  if(DEFINED ENV{HSTU_DISABLE_120} AND "$ENV{HSTU_DISABLE_120}" STREQUAL "TRUE")
+    message(STATUS "HSTU: Selecting Ampere BF16/FP16 sources only for arch 12.0 because HSTU_DISABLE_120=TRUE")
+  else()
+    message(STATUS "HSTU: Selecting Ampere BF16/FP16 and Blackwell RTX FP8 sources for arch 12.0")
+  endif()
   if(NOT "8.0" IN_LIST TORCH_CUDA_ARCH_LIST)
     list(APPEND hstu_cpp_source_files ${hstu_ampere_cpp_source_files})
     list(APPEND hstu_cuda_source_files ${hstu_ampere_cuda_source_files})
   endif()
-  list(APPEND hstu_cpp_source_files ${hstu_blackwell_rtx_cpp_source_files})
-  list(APPEND hstu_cuda_source_files ${hstu_blackwell_rtx_cuda_source_files})
+  if(NOT (DEFINED ENV{HSTU_DISABLE_120} AND "$ENV{HSTU_DISABLE_120}" STREQUAL "TRUE"))
+    list(APPEND hstu_cpp_source_files ${hstu_blackwell_rtx_cpp_source_files})
+    list(APPEND hstu_cuda_source_files ${hstu_blackwell_rtx_cuda_source_files})
+    list(APPEND hstu_include_dirs ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_blackwell_rtx)
+  endif()
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_120a,code=[sm_120a,compute_120a]")
 endif()
 
@@ -180,10 +191,7 @@ if(hstu_cpp_source_files OR hstu_cpp_source_files_gpu)
     TYPE
       SHARED
     INCLUDE_DIRS
-      ${fbgemm_sources_include_directories}
-      ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_ampere
-      ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_hopper
-      ${CMAKE_CURRENT_SOURCE_DIR}/src/hstu_blackwell_rtx
+      ${hstu_include_dirs}
     CPU_SRCS
       ${hstu_cpp_source_files}
     GPU_SRCS
