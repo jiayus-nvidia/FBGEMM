@@ -67,7 +67,7 @@ def _assert_close(name, a, b, rtol=5e-3):
     assert rel < rtol, f"{name}: rel {rel:.3e} (max_abs {md:.3e}) exceeds {rtol}"
 
 
-@pytest.mark.parametrize("hdim", [64, 128])
+@pytest.mark.parametrize("hdim", [64, 128, 256])
 @pytest.mark.parametrize("layout", ["token_major", "head_major", "noncontiguous"])
 def test_do_layout_compact_vs_original_agree(hdim, layout):
     """original-do path and compact-do path must agree within bf16 tolerance."""
@@ -90,7 +90,7 @@ def test_do_layout_compact_vs_original_agree(hdim, layout):
     _assert_close("dv", dv0, dv1)
 
 
-@pytest.mark.parametrize("hdim", [64, 128])
+@pytest.mark.parametrize("hdim", [64, 128, 256])
 def test_noncontiguous_do_falls_back_and_runs(hdim):
     """A non-128-bit-aligned do must NOT take the original fast path; it must still run."""
     cu, q, k, v, out = _inputs(hdim)
@@ -101,7 +101,7 @@ def test_noncontiguous_do_falls_back_and_runs(hdim):
     assert torch.isfinite(dq.float()).all() and torch.isfinite(dk.float()).all() and torch.isfinite(dv.float()).all()
 
 
-@pytest.mark.parametrize("hdim", [64, 128])
+@pytest.mark.parametrize("hdim", [64, 128, 256])
 def test_workspace_zeroed_between_calls(hdim):
     """Workspace must be zeroed each call: repeated identical calls give identical dq."""
     cu, q, k, v, out = _inputs(hdim)

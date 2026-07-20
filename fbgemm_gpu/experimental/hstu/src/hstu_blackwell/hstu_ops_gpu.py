@@ -7,14 +7,14 @@
 
 # Copyright (c) 2024, NVIDIA Corporation & AFFILIATES.
 
+import os
 from typing import Optional
 
 import torch
 
-import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Float32, Int32, Float16, BFloat16
+from cutlass.cute.typing import Int32, Float16, BFloat16
 
 from .hstu_fwd import HSTUAttentionForwardSm100
 from .hstu_bwd import HSTUAttentionBackwardSm100
@@ -118,7 +118,9 @@ def hstu_varlen_fwd_100(
         v = v.contiguous()
 
     q_dtype = q.dtype
-    assert q_dtype == torch.bfloat16 or q_dtype == torch.float16, "Only support bf16 and fp16"
+    assert q_dtype == torch.bfloat16 or q_dtype == torch.float16, (
+        "Only support bf16 and fp16"
+    )
     assert k.dtype == q_dtype, "k and q must have the same dtype"
     assert v.dtype == q_dtype, "v and q must have the same dtype"
 
@@ -131,32 +133,52 @@ def hstu_varlen_fwd_100(
 
     kBlockM = 128
     kBlockN = 128
-    window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
-    window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
+    window_size_left = (
+        max_seqlen_k
+        if window_size_left < 0 or window_size_left > max_seqlen_k
+        else window_size_left
+    )
+    window_size_right = (
+        max_seqlen_k
+        if window_size_right < 0 or window_size_right > max_seqlen_k
+        else window_size_right
+    )
     is_causal = window_size_left == max_seqlen_k and window_size_right == 0
-    is_local = (window_size_left < max_seqlen_k or window_size_right < max_seqlen_k) and not is_causal
+    is_local = (
+        window_size_left < max_seqlen_k or window_size_right < max_seqlen_k
+    ) and not is_causal
     is_context = num_contexts is not None
     assert not is_context, "HSTU-Blackwell does not support context mask (num_contexts)"
     is_target = num_targets is not None
-    assert not (is_target and not is_causal), "Target mask is True, but causal mask is False, this is undefined behavior."
+    assert not (is_target and not is_causal), (
+        "Target mask is True, but causal mask is False, this is undefined behavior."
+    )
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
     is_paged = paged_kv is not None
     if is_paged:
-        assert is_causal, "Paged KV is True, but causal mask is False, this is not supported."
-        assert (not is_local) and (not is_context), "Paged KV is True, but local/context mask is True, this is not supported."
-        assert not is_arbitrary, "Paged KV is True, but arbitrary mask is True, this is not supported."
-        assert page_ids is not None and page_indptrs is not None, "Paged KV is True, but page metadata is missing."
-        assert paged_kv.dim() == 5 and paged_kv.shape[2] == 128, "Only accept 5-D paged KV table with page_size=512"
+        assert is_causal, (
+            "Paged KV is True, but causal mask is False, this is not supported."
+        )
+        assert (not is_local) and (not is_context), (
+            "Paged KV is True, but local/context mask is True, this is not supported."
+        )
+        assert not is_arbitrary, (
+            "Paged KV is True, but arbitrary mask is True, this is not supported."
+        )
+        assert page_ids is not None and page_indptrs is not None, (
+            "Paged KV is True, but page metadata is missing."
+        )
+        assert paged_kv.dim() == 5 and paged_kv.shape[2] == 128, (
+            "Only accept 5-D paged KV table with page_size=512"
+        )
 
     # Keep the public output in the standard contiguous (T, H, D) layout so
     # downstream callers can flatten it with view() without an extra copy.
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     paged_kv_flat = None
     if is_paged:
-        paged_kv_flat = paged_kv.view(
-            -1, paged_kv.shape[-2], paged_kv.shape[-1]
-        )
+        paged_kv_flat = paged_kv.view(-1, paged_kv.shape[-2], paged_kv.shape[-1])
     compile_key = (
         q_dtype,
         head_dim,
@@ -174,8 +196,7 @@ def hstu_varlen_fwd_100(
 
     if compile_key not in hstu_varlen_fwd_100.compile_cache:
         q_tensor, k_tensor, v_tensor, o_tensor = [
-            _mark_dynamic_tensor(tensor, tensor.ndim - 1)
-            for tensor in (q, k, v, out)
+            _mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, out)
         ]
         cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
             _mark_dynamic_tensor(tensor, tensor.ndim - 1)
@@ -251,6 +272,7 @@ def hstu_varlen_fwd_100(
 
     return out, None
 
+
 hstu_varlen_fwd_100.compile_cache = {}
 
 
@@ -279,7 +301,9 @@ def hstu_varlen_bwd_100(
 ):
     # asserts
     q_dtype = q.dtype
-    assert q_dtype == torch.bfloat16 or q_dtype == torch.float16, "Only support bf16 and fp16"
+    assert q_dtype == torch.bfloat16 or q_dtype == torch.float16, (
+        "Only support bf16 and fp16"
+    )
     assert k.dtype == q_dtype, "k and q must have the same dtype"
     assert v.dtype == q_dtype, "v and q must have the same dtype"
     assert do.dtype == q_dtype, "do and q must have the same dtype"
@@ -287,31 +311,106 @@ def hstu_varlen_bwd_100(
     assert cu_seqlens_k.dtype == torch.int32, "cu_seqlens_k must have dtype int32"
 
     batch_size = cu_seqlens_q.shape[0] - 1
-    total_q = q.shape[0]
     num_heads = q.shape[1]
     head_dim = q.shape[2]
-    total_k = k.shape[0]
     num_heads_k = k.shape[1]
 
-    assert head_dim == 64 or head_dim == 128, "Only support head_dim 64 and 128"
-    assert num_heads == num_heads_k, "Number of heads in key/value and query must be equal"
+    assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
+    assert num_heads == num_heads_k, (
+        "Number of heads in key/value and query must be equal"
+    )
+    assert k.shape[2] == head_dim, "k and q must have the same head_dim"
+    assert v.shape[2] == head_dim, "v and q must have the same head_dim"
+    assert do.shape == q.shape, "do and q must have the same shape"
 
     kBlockM = 128
     kBlockN = 128
-    window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
-    window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
+    window_size_left = (
+        max_seqlen_k
+        if window_size_left < 0 or window_size_left > max_seqlen_k
+        else window_size_left
+    )
+    window_size_right = (
+        max_seqlen_k
+        if window_size_right < 0 or window_size_right > max_seqlen_k
+        else window_size_right
+    )
     is_causal = window_size_left == max_seqlen_k and window_size_right == 0
-    is_local = (window_size_left < max_seqlen_k or window_size_right < max_seqlen_k) and not is_causal
+    is_local = (
+        window_size_left < max_seqlen_k or window_size_right < max_seqlen_k
+    ) and not is_causal
     is_context = num_contexts is not None
     assert not is_context, "HSTU-Blackwell does not support context mask (num_contexts)"
     is_target = num_targets is not None
-    assert not (is_target and not is_causal), "Target mask is True, but causal mask is False, this is undefined behavior."
+    assert not (is_target and not is_causal), (
+        "Target mask is True, but causal mask is False, this is undefined behavior."
+    )
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
 
     assert rab is None, "rab is not supported in Blackwell backward kernel"
     assert not has_drab, "drab is not supported in Blackwell backward kernel"
     drab = None
+
+    if head_dim == 256:
+        # D=256 cannot use the fused one-CTA CuTe kernel below: its live TMEM
+        # ranges exceed the architectural 512-column allocation.  The native
+        # path therefore follows FA4's two-kernel decomposition (DQ, then
+        # DK/DV). Arbitrary interval masks stay on the validated Triton fallback;
+        # causal, local, and target-group predicates are native.
+        d256_cute_selector = os.environ.get("FBGEMM_HSTU_D256_CUTE", "auto").lower()
+        force_d256_cute = d256_cute_selector in ("1", "true", "on", "force")
+        disable_d256_cute = d256_cute_selector in ("0", "false", "off")
+        # On B300, matched A/B measurements show the 2-CTA path reaches parity
+        # at S=2048 and wins decisively after that, while Triton has lower launch
+        # latency for short rows.  Keep the crossover evidence in the selector;
+        # the environment override exists for testing and future tuning.
+        use_d256_cute = force_d256_cute or (
+            not disable_d256_cute and max(max_seqlen_q, max_seqlen_k) >= 2048
+        )
+        if use_d256_cute and not is_arbitrary:
+            from .hstu_bwd_256_cute import hstu_varlen_bwd_256_cute
+
+            return hstu_varlen_bwd_256_cute(
+                do,
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dq,
+                dk,
+                dv,
+                window_size_left,
+                window_size_right,
+                alpha,
+                num_targets=num_targets,
+                target_group_size=target_group_size,
+            )
+
+        from .hstu_bwd_256 import hstu_varlen_bwd_256
+
+        return hstu_varlen_bwd_256(
+            do,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dq,
+            dk,
+            dv,
+            num_targets,
+            target_group_size,
+            window_size_left,
+            window_size_right,
+            alpha,
+            func,
+        )
 
     use_original_qkv_layout = (
         _supports_bwd_original_qkv_layout(q)
@@ -342,10 +441,7 @@ def hstu_varlen_bwd_100(
 
     dq_orig, dk_orig, dv_orig = dq, dk, dv
     use_original_grad_layout = (
-        use_original_qkv_layout
-        and dq is None
-        and dk is None
-        and dv is None
+        use_original_qkv_layout and dq is None and dk is None and dv is None
     )
     if use_original_grad_layout:
         dq_orig, dk_orig, dv_orig = [
@@ -380,7 +476,12 @@ def hstu_varlen_bwd_100(
         dtype=torch.float32,
         device=q.device,
     ).zero_()
-    problem_shape = (Int32(max_seqlen_q), Int32(max_seqlen_k), Int32(head_dim), ((Int32(1), Int32(num_heads)), Int32(batch_size)))
+    problem_shape = (
+        Int32(max_seqlen_q),
+        Int32(max_seqlen_k),
+        Int32(head_dim),
+        ((Int32(1), Int32(num_heads)), Int32(batch_size)),
+    )
     compile_key = (
         q_dtype,
         head_dim,
@@ -510,5 +611,6 @@ def hstu_varlen_bwd_100(
         dv_orig.copy_(dv)
 
     return dq, dk, dv, drab
+
 
 hstu_varlen_bwd_100.compile_cache = {}

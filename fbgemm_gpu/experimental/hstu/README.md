@@ -175,10 +175,16 @@ python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="10.0"
 ### HSTU-Blackwell
 - **Supported GPUs**: Blackwell only (B200)
 - **Data types**: FP16, BF16
-- **Head dimensions**: 64, 128
+- **Head dimensions**: 64, 128, 256
 - **Attention masks**: Almost same as HSTU-Ampere, only without context mask.
 - **Paged attention**: Supported in forward only. Page size is 128.
 - **RAB/dRAB**: Not supported.
 - **Quantization mode**: Not supported. (no FP8)
-- **Note**: Implemented using NVIDIA CUTLASS DSL (cute-dsl), JIT compiled at first call. Only undeterministic backward implementation.
+- **Note**: Forward and the D=64/128 backward paths use NVIDIA CUTLASS DSL
+  (cute-dsl) and are JIT compiled at first call. Only undeterministic backward
+  implementations are available.
+- **D=256 backward**: Uses dedicated native CuTe DSL 2-CTA kernels (dQ followed
+  by dK/dV) for long unmasked, causal, local, and target-group workloads. Short
+  rows and arbitrary interval masks use the tested Triton fallback. Set
+  `FBGEMM_HSTU_D256_CUTE=force` or `=off` to override auto selection.
 - **Note**: HSTU-Blackwell does **not** support `seqused_q` and `seqused_k`, i.e., variable valid token length is not supported.
