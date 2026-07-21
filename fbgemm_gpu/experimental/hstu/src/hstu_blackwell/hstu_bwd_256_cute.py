@@ -72,24 +72,6 @@ def _as_bshkrd_tensor(
     )
 
 
-def _as_dummy_stats_tensor(
-    tensor: cute.Tensor,
-    sequence_extent: Int32,
-    h_k: Int32,
-    h_r: Int32,
-    b: Int32,
-) -> cute.Tensor:
-    """Broadcast one unused scalar over the inherited FA4 stats layout."""
-    assert cutlass.const_expr(cute.rank(tensor.layout) == 1)
-    return cute.make_tensor(
-        tensor.iterator,
-        cute.make_layout(
-            (sequence_extent, ((h_r, h_k), b)),
-            stride=(0, ((0, 0), 0)),
-        ),
-    )
-
-
 class HSTUAttentionBackwardSm100D256:
     """Launch the dedicated DQ kernel followed by the dedicated DK/DV kernel."""
 
@@ -99,9 +81,12 @@ class HSTUAttentionBackwardSm100D256:
         is_causal: bool,
         is_local: bool,
         is_target: bool,
+        is_arbitrary: bool,
+        func_num: int,
         target_group_size: int,
         window_size_left: Optional[int],
         window_size_right: Optional[int],
+        skip_residual_mask: bool,
     ):
         self.is_causal = is_causal
         self.is_local = is_local
@@ -113,11 +98,11 @@ class HSTUAttentionBackwardSm100D256:
             is_causal,
             window_size_left,
             window_size_right,
-            False,
-            False,
             is_target=is_target,
             target_group_size=target_group_size,
-            use_clc_scheduler=False,
+            skip_residual_mask=skip_residual_mask,
+            is_arbitrary=is_arbitrary,
+            func_num=func_num,
         )
         self.dkdv_kernel = BlackwellFusedMultiHeadAttentionBackwardDKDVKernel(
             cutlass.Float32,
@@ -127,7 +112,9 @@ class HSTUAttentionBackwardSm100D256:
             window_size_right,
             is_target=is_target,
             target_group_size=target_group_size,
-            use_clc_scheduler=False,
+            skip_residual_mask=skip_residual_mask,
+            is_arbitrary=is_arbitrary,
+            func_num=func_num,
         )
 
     @cute.jit
@@ -140,10 +127,10 @@ class HSTUAttentionBackwardSm100D256:
         dq: cute.Tensor,
         dk: cute.Tensor,
         dv: cute.Tensor,
-        dummy_stats: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
         num_targets: cute.Tensor | None,
+        func: cute.Tensor | None,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
         alpha: cutlass.Float32,
@@ -159,7 +146,6 @@ class HSTUAttentionBackwardSm100D256:
             h_q = q.shape[2]
         else:
             h_q = q.shape[1]
-        q_sequence_extent = q.shape[0] if q_rank == 3 else q.shape[1]
         if cutlass.const_expr(k_rank == 5):
             h_k = k.shape[2]
         elif cutlass.const_expr(k_rank == 4):
@@ -167,8 +153,6 @@ class HSTUAttentionBackwardSm100D256:
         else:
             h_k = k.shape[1]
         h_r = h_q // h_k
-        b = cu_seqlens_q.shape[0] - 1
-
         q = _as_bshkrd_tensor(q, h_k, h_r, varlen)
         k = _as_bshkrd_tensor(k, h_k, 1, varlen)
         v = _as_bshkrd_tensor(v, h_k, 1, varlen)
@@ -176,19 +160,16 @@ class HSTUAttentionBackwardSm100D256:
         dq = _as_bshkrd_tensor(dq, h_k, h_r, varlen)
         dk = _as_bshkrd_tensor(dk, h_k, 1, varlen)
         dv = _as_bshkrd_tensor(dv, h_k, 1, varlen)
-        stats = _as_dummy_stats_tensor(dummy_stats, q_sequence_extent, h_k, h_r, b)
-
         self.dq_kernel(
             q,
             k,
             v,
             dq,
             do,
-            stats,
-            stats,
             cu_seqlens_q,
             cu_seqlens_k,
             num_targets,
+            func,
             max_seqlen_q,
             max_seqlen_k,
             alpha,
@@ -202,11 +183,10 @@ class HSTUAttentionBackwardSm100D256:
             dk,
             dv,
             do,
-            stats,
-            stats,
             cu_seqlens_q,
             cu_seqlens_k,
             num_targets,
+            func,
             max_seqlen_q,
             max_seqlen_k,
             alpha,
@@ -275,11 +255,12 @@ def hstu_varlen_bwd_256_cute(
     *,
     num_targets: Optional[torch.Tensor] = None,
     target_group_size: int = 1,
+    func: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
     """Compile and run the native CuTe DSL D=256 path.
 
-    Native predicates cover unmasked, causal, local, and target attention.
-    Arbitrary interval masks remain on the established Triton path.
+    Native predicates cover unmasked, causal, local, target-group, and
+    arbitrary-interval attention.
     """
     assert q.ndim == k.ndim == v.ndim == do.ndim == 3
     assert q.is_cuda and k.is_cuda and v.is_cuda and do.is_cuda
@@ -295,16 +276,25 @@ def hstu_varlen_bwd_256_cute(
     is_unmasked = window_size_left == max_seqlen_k and window_size_right == max_seqlen_k
     is_local = not (is_causal or is_unmasked)
     is_target = num_targets is not None
+    is_arbitrary = func is not None
     assert not is_target or is_causal
+    assert not is_arbitrary or not (is_causal or is_local or is_target)
     if is_target:
         assert target_group_size > 0
         assert num_targets.dtype == torch.int32
         assert num_targets.device == q.device
         assert num_targets.numel() == cu_seqlens_q.numel() - 1
+    func_num = 0
+    if is_arbitrary:
+        assert func is not None
+        assert func.ndim == 3 and func.shape[0] == 1
+        assert func.device == q.device and func.dtype == torch.int32
+        assert func.shape[-1] >= q.shape[0]
+        func_num = func.shape[-2]
+        assert func_num > 0 and func_num % 2 == 1
 
-    # The dedicated kernels require fully compact TMA operands.  Copies are
-    # explicit here during bring-up; layout-preserving fast paths come after the
-    # native kernels clear correctness and performance gates.
+    # The dedicated kernels require fully compact TMA operands. Preserve the
+    # public layout contract by materializing compact inputs when necessary.
     q_work = q.contiguous()
     k_work = k.contiguous()
     v_work = v.contiguous()
@@ -312,19 +302,26 @@ def hstu_varlen_bwd_256_cute(
     dq_work = _native_output_buffer(dq, q_work)
     dk_work = _native_output_buffer(dk, k_work)
     dv_work = _native_output_buffer(dv, v_work)
-    # Values are deliberately unused by the HSTU score transform.  The buffers
-    # remain only because the inherited FA4 pipelines still issue their loads.
-    dummy_stats = torch.empty((1,), dtype=torch.float32, device=q.device)
-
+    batch_size = cu_seqlens_q.numel() - 1
+    skip_residual_mask = (
+        is_unmasked
+        and q.shape[0] == batch_size * max_seqlen_q
+        and k.shape[0] == batch_size * max_seqlen_k
+        and max_seqlen_q % 128 == 0
+        and max_seqlen_k % 128 == 0
+    )
     compile_key = (
         q.dtype,
         q.shape[1],
         is_causal,
         is_local,
         is_target,
+        is_arbitrary,
+        func_num,
         target_group_size if is_target else 1,
         window_size_left if is_local else None,
         window_size_right if is_local else None,
+        skip_residual_mask,
     )
     normalization_scale = 1.0 / max_seqlen_q
     if compile_key not in hstu_varlen_bwd_256_cute.compile_cache:
@@ -336,19 +333,22 @@ def hstu_varlen_bwd_256_cute(
             _dynamic_tensor(tensor, tensor.ndim - 1)
             for tensor in (dq_work, dk_work, dv_work)
         ]
-        stats_tensor = _dynamic_tensor(dummy_stats, 0)
         cu_q_tensor, cu_k_tensor = [
             _dynamic_tensor(tensor, 0) for tensor in (cu_seqlens_q, cu_seqlens_k)
         ]
         num_targets_tensor = _dynamic_optional_tensor(num_targets)
+        func_tensor = _dynamic_optional_tensor(func)
         compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = HSTUAttentionBackwardSm100D256(
             is_causal=is_causal,
             is_local=is_local,
             is_target=is_target,
+            is_arbitrary=is_arbitrary,
+            func_num=func_num,
             target_group_size=target_group_size,
             window_size_left=window_size_left if is_local else None,
             window_size_right=window_size_right if is_local else None,
+            skip_residual_mask=skip_residual_mask,
         )
         hstu_varlen_bwd_256_cute.compile_cache[compile_key] = cute.compile(
             kernel,
@@ -359,10 +359,10 @@ def hstu_varlen_bwd_256_cute(
             dq_tensor,
             dk_tensor,
             dv_tensor,
-            stats_tensor,
             cu_q_tensor,
             cu_k_tensor,
             num_targets_tensor,
+            func_tensor,
             Int32(max_seqlen_q),
             Int32(max_seqlen_k),
             alpha,
@@ -380,10 +380,10 @@ def hstu_varlen_bwd_256_cute(
         dq_work,
         dk_work,
         dv_work,
-        dummy_stats,
         cu_seqlens_q,
         cu_seqlens_k,
         num_targets,
+        func,
         Int32(max_seqlen_q),
         Int32(max_seqlen_k),
         alpha,

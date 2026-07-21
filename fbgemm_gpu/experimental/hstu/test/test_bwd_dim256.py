@@ -13,11 +13,9 @@ import torch.nn.functional as F
 
 try:
     from hstu_blackwell.hstu_ops_gpu import hstu_varlen_bwd_100
-    from hstu_blackwell.hstu_bwd_256 import hstu_varlen_bwd_256
     from hstu_blackwell.hstu_bwd_256_cute import hstu_varlen_bwd_256_cute
 except ImportError:  # installed-package layout
     from hstu.hstu_blackwell.hstu_ops_gpu import hstu_varlen_bwd_100
-    from hstu.hstu_blackwell.hstu_bwd_256 import hstu_varlen_bwd_256
     from hstu.hstu_blackwell.hstu_bwd_256_cute import (
         hstu_varlen_bwd_256_cute,
     )
@@ -93,6 +91,24 @@ def _make_mask(case: str, seqlen: int, device: torch.device) -> MaskInputs:
     raise AssertionError(f"unknown mask case: {case}")
 
 
+def _torch_output_and_grads(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    do: torch.Tensor,
+    mask: torch.Tensor,
+    alpha: float,
+    scaling_seqlen: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q = q.detach().clone().requires_grad_()
+    k = k.detach().clone().requires_grad_()
+    v = v.detach().clone().requires_grad_()
+    scores = torch.einsum("ihd,jhd->hij", q, k)
+    p = torch.where(mask[None, :, :], F.silu(alpha * scores), 0.0)
+    out = torch.einsum("hij,jhd->ihd", p, v) / scaling_seqlen
+    return (out, *torch.autograd.grad(out, (q, k, v), do))
+
+
 def _torch_grads(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -102,13 +118,15 @@ def _torch_grads(
     alpha: float,
     scaling_seqlen: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q = q.detach().clone().requires_grad_()
-    k = k.detach().clone().requires_grad_()
-    v = v.detach().clone().requires_grad_()
-    scores = torch.einsum("ihd,jhd->hij", q, k)
-    p = torch.where(mask[None, :, :], F.silu(alpha * scores), 0.0)
-    out = torch.einsum("hij,jhd->ihd", p, v) / scaling_seqlen
-    return torch.autograd.grad(out, (q, k, v), do)
+    return _torch_output_and_grads(
+        q,
+        k,
+        v,
+        do,
+        mask,
+        alpha,
+        scaling_seqlen,
+    )[1:]
 
 
 def _assert_error_tracks_low_precision(
@@ -128,25 +146,20 @@ def _assert_error_tracks_low_precision(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(
-    ("window_left", "window_right"),
-    ((65, 65), (65, 0), (17, 3)),
-    ids=("none", "causal", "local"),
-)
-def test_dim256_native_cute_matches_triton(
-    dtype,
-    window_left,
-    window_right,
-):
-    """Keep the native kernels covered even below the auto-dispatch crossover."""
+@pytest.mark.parametrize("mask_case", ["none", "causal", "local"])
+def test_dim256_native_cute_matches_reference(dtype, mask_case):
+    """Cover the native kernels directly on short rows."""
     torch.manual_seed(1122)
     seqlen, heads, head_dim = 65, 2, 256
+    alpha = 0.7
     device = torch.device("cuda")
     cu = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
-    q, k, v, do = [
-        torch.empty((seqlen, heads, head_dim), device=device).uniform_(-1, 1).to(dtype)
+    q_ref, k_ref, v_ref, do_ref = [
+        torch.empty((seqlen, heads, head_dim), device=device).uniform_(-1, 1)
         for _ in range(4)
     ]
+    q, k, v, do = [x.to(dtype) for x in (q_ref, k_ref, v_ref, do_ref)]
+    mask_inputs = _make_mask(mask_case, seqlen, device)
     native = hstu_varlen_bwd_256_cute(
         do,
         q,
@@ -159,38 +172,23 @@ def test_dim256_native_cute_matches_triton(
         None,
         None,
         None,
-        window_left,
-        window_right,
-        0.7,
+        mask_inputs.window_left if mask_inputs.window_left >= 0 else seqlen,
+        mask_inputs.window_right if mask_inputs.window_right >= 0 else seqlen,
+        alpha,
     )[:3]
-    triton_ref = hstu_varlen_bwd_256(
-        do,
-        q,
-        k,
-        v,
-        cu,
-        cu,
-        seqlen,
-        seqlen,
-        None,
-        None,
-        None,
-        None,
-        1,
-        window_left,
-        window_right,
-        0.7,
-        None,
+    reference = _torch_grads(
+        q_ref, k_ref, v_ref, do_ref, mask_inputs.mask, alpha, seqlen
     )[:3]
-    eps = torch.finfo(dtype).eps
-    for name, actual, expected in zip(("dq", "dk", "dv"), native, triton_ref):
-        error = (actual.float() - expected.float()).abs().max().item()
-        limit = 4 * eps * max(1.0, expected.float().abs().max().item())
-        assert error <= limit, f"{name} native/Triton max error {error} > {limit}"
-        assert torch.isfinite(actual.float()).all()
+    low_precision = _torch_grads(
+        q, k, v, do, mask_inputs.mask, alpha, seqlen
+    )
+    for name, actual, low, expected in zip(
+        ("dq", "dk", "dv"), native, low_precision, reference
+    ):
+        _assert_error_tracks_low_precision(name, actual, low, expected)
 
 
-def test_dim256_native_cute_varlen_delta_matches_triton():
+def test_dim256_native_cute_varlen_delta_matches_reference():
     torch.manual_seed(2233)
     q_lens, k_lens = (33, 65), (65, 97)
     max_q, max_k = max(q_lens), max(k_lens)
@@ -212,15 +210,35 @@ def test_dim256_native_cute_varlen_delta_matches_triton():
     do = torch.empty_like(q).uniform_(-0.5, 0.5)
     common = (do, q, k, v, cu_q, cu_k, max_q, max_k)
     native = hstu_varlen_bwd_256_cute(*common, None, None, None, max_k, 0, 0.6)[:3]
-    triton_ref = hstu_varlen_bwd_256(
-        *common, None, None, None, None, 1, max_k, 0, 0.6, None
-    )[:3]
-    for name, actual, expected in zip(("dq", "dk", "dv"), native, triton_ref):
-        error = (actual.float() - expected.float()).abs().max().item()
-        assert error <= 0.01, f"{name} native/Triton max error is {error}"
+    reference = (
+        torch.zeros_like(q, dtype=torch.float32),
+        torch.zeros_like(k, dtype=torch.float32),
+        torch.zeros_like(v, dtype=torch.float32),
+    )
+    q_offset = k_offset = 0
+    for q_len, k_len in zip(q_lens, k_lens):
+        rows = torch.arange(q_len, device=device)[:, None] + k_len - q_len
+        cols = torch.arange(k_len, device=device)[None, :]
+        grads = _torch_grads(
+            q[q_offset : q_offset + q_len].float(),
+            k[k_offset : k_offset + k_len].float(),
+            v[k_offset : k_offset + k_len].float(),
+            do[q_offset : q_offset + q_len].float(),
+            cols <= rows,
+            0.6,
+            max_q,
+        )
+        reference[0][q_offset : q_offset + q_len] = grads[0]
+        reference[1][k_offset : k_offset + k_len] = grads[1]
+        reference[2][k_offset : k_offset + k_len] = grads[2]
+        q_offset += q_len
+        k_offset += k_len
+    for name, actual, expected in zip(("dq", "dk", "dv"), native, reference):
+        relative = (actual.float() - expected).abs().max() / expected.abs().max()
+        assert relative < 1.0e-2, f"{name} relative max error is {relative:.4e}"
 
 
-def test_dim256_native_cute_target_delta_matches_triton():
+def test_dim256_native_cute_target_delta_matches_reference():
     torch.manual_seed(3344)
     q_lens, k_lens = (33, 65), (65, 97)
     max_q, max_k = max(q_lens), max(k_lens)
@@ -253,12 +271,38 @@ def test_dim256_native_cute_target_delta_matches_triton():
         num_targets=num_targets,
         target_group_size=4,
     )[:3]
-    triton_ref = hstu_varlen_bwd_256(
-        *common, None, None, None, num_targets, 4, max_k, 0, 0.6, None
-    )[:3]
-    for name, actual, expected in zip(("dq", "dk", "dv"), native, triton_ref):
-        error = (actual.float() - expected.float()).abs().max().item()
-        assert error <= 0.01, f"{name} native/Triton max error is {error}"
+    reference = (
+        torch.zeros_like(q, dtype=torch.float32),
+        torch.zeros_like(k, dtype=torch.float32),
+        torch.zeros_like(v, dtype=torch.float32),
+    )
+    q_offset = k_offset = 0
+    for batch_idx, (q_len, k_len) in enumerate(zip(q_lens, k_lens)):
+        rows = torch.arange(q_len, device=device)[:, None] + k_len - q_len
+        cols = torch.arange(k_len, device=device)[None, :]
+        history = k_len - int(num_targets[batch_idx].item())
+        target_index = torch.div(rows - history, 4, rounding_mode="floor")
+        target_left = history + target_index * 4
+        target_hole = (
+            (rows >= history) & (cols >= history) & (cols < target_left)
+        )
+        grads = _torch_grads(
+            q[q_offset : q_offset + q_len].float(),
+            k[k_offset : k_offset + k_len].float(),
+            v[k_offset : k_offset + k_len].float(),
+            do[q_offset : q_offset + q_len].float(),
+            (cols <= rows) & ~target_hole,
+            0.6,
+            max_q,
+        )
+        reference[0][q_offset : q_offset + q_len] = grads[0]
+        reference[1][k_offset : k_offset + k_len] = grads[1]
+        reference[2][k_offset : k_offset + k_len] = grads[2]
+        q_offset += q_len
+        k_offset += k_len
+    for name, actual, expected in zip(("dq", "dk", "dv"), native, reference):
+        relative = (actual.float() - expected).abs().max() / expected.abs().max()
+        assert relative < 1.0e-2, f"{name} relative max error is {relative:.4e}"
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -324,7 +368,7 @@ def test_dim256_varlen_delta_q_and_noncontiguous_do():
     q = torch.empty((sum(q_lens), heads, head_dim), device=device).uniform_(-1, 1)
     k = torch.empty((sum(k_lens), heads, head_dim), device=device).uniform_(-1, 1)
     v = torch.empty_like(k).uniform_(-1, 1)
-    # Last-dimension stride != 1 exercises the fallback input layout.
+    # Last-dimension stride != 1 exercises the compact-input copy path.
     do = (
         torch.empty((sum(q_lens), head_dim, heads), device=device)
         .uniform_(-1, 1)
@@ -564,6 +608,62 @@ def test_dim256_long_causal_matches_reference():
         assert relative < 1.0e-2, f"{name} relative max error is {relative:.4e}"
 
 
+def test_dim256_full_tile_unmasked_fast_path_matches_reference():
+    torch.manual_seed(8902)
+    batch, heads, seqlen, head_dim = 2, 2, 128, 256
+    device = torch.device("cuda")
+    cu = torch.arange(
+        0,
+        (batch + 1) * seqlen,
+        seqlen,
+        dtype=torch.int32,
+        device=device,
+    )
+    q, k, v, do = [
+        torch.empty((batch * seqlen, heads, head_dim), device=device).uniform_(
+            -0.5, 0.5
+        )
+        for _ in range(4)
+    ]
+    candidate = hstu_varlen_bwd_100(
+        do.to(torch.bfloat16),
+        q.to(torch.bfloat16),
+        k.to(torch.bfloat16),
+        v.to(torch.bfloat16),
+        cu,
+        cu,
+        seqlen,
+        seqlen,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1,
+        -1,
+        -1,
+        0.7,
+        None,
+        False,
+        None,
+        False,
+    )[:3]
+    reference = (torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v))
+    mask = torch.ones((seqlen, seqlen), dtype=torch.bool, device=device)
+    for batch_idx in range(batch):
+        start = batch_idx * seqlen
+        end = start + seqlen
+        grads = _torch_grads(
+            q[start:end], k[start:end], v[start:end], do[start:end], mask, 0.7, seqlen
+        )
+        for output, grad in zip(reference, grads):
+            output[start:end] = grad
+    for name, actual, expected in zip(("dq", "dk", "dv"), candidate, reference):
+        max_error = (actual.float() - expected).abs().max().item()
+        relative = max_error / (expected.abs().max().item() + 1.0e-12)
+        assert relative < 1.0e-2, f"{name} relative max error is {relative:.4e}"
+
+
 def test_dim256_writes_packed_gradient_buffers():
     torch.manual_seed(9012)
     batch, heads, seqlen, head_dim = 2, 4, 64, 256
@@ -672,27 +772,36 @@ def test_dim256_backward_is_cuda_graph_capturable():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = launch()
-    graph.replay()
+    for _ in range(10):
+        graph.replay()
+    torch.cuda.synchronize()
 
     for name, grad in zip(("dq", "dk", "dv"), captured[:3]):
         assert torch.isfinite(grad.float()).all(), f"{name} contains NaN/Inf"
 
 
-def test_dim256_end_to_end_autograd_dispatch():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "mask_case", ["none", "causal", "local", "target", "arbitrary"]
+)
+def test_dim256_end_to_end_autograd_dispatch(dtype, mask_case):
     from hstu.cuda_hstu_attention import hstu_attn_varlen_func
 
     torch.manual_seed(3456)
-    batch, heads, seqlen, head_dim = 2, 2, 65, 256
+    heads, seqlen, head_dim = 2, 65, 256
+    alpha = 0.7
     device = torch.device("cuda")
-    cu = torch.arange(0, (batch + 1) * seqlen, seqlen, dtype=torch.int32, device=device)
-    q, k, v = [
-        torch.randn(
-            (batch * seqlen, heads, head_dim),
-            dtype=torch.bfloat16,
-            device=device,
-            requires_grad=True,
+    cu = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
+    mask_inputs = _make_mask(mask_case, seqlen, device)
+    q_base, k_base, v_base, do = [
+        torch.empty((seqlen, heads, head_dim), dtype=dtype, device=device).uniform_(
+            -1, 1
         )
-        for _ in range(3)
+        for _ in range(4)
+    ]
+    q, k, v = [
+        tensor.detach().clone().requires_grad_()
+        for tensor in (q_base, k_base, v_base)
     ]
     out = hstu_attn_varlen_func(
         q,
@@ -706,18 +815,98 @@ def test_dim256_end_to_end_autograd_dispatch():
         seqlen,
         -1,
         None,
-        None,
-        1,
-        (-1, 0),
-        0.7,
+        mask_inputs.num_targets,
+        mask_inputs.target_group_size,
+        (mask_inputs.window_left, mask_inputs.window_right),
+        alpha,
         None,
         False,
         None,
+        func=mask_inputs.func,
     )
-    out.backward(torch.randn_like(out))
+    actual = (out, *torch.autograd.grad(out, (q, k, v), do))
+
+    low_precision = _torch_output_and_grads(
+        q_base,
+        k_base,
+        v_base,
+        do,
+        mask_inputs.mask,
+        alpha,
+        seqlen,
+    )
+    reference = _torch_output_and_grads(
+        q_base.float(),
+        k_base.float(),
+        v_base.float(),
+        do.float(),
+        mask_inputs.mask,
+        alpha,
+        seqlen,
+    )
 
     assert out.shape == q.shape
-    assert torch.isfinite(out.float()).all()
-    for name, grad in (("dq", q.grad), ("dk", k.grad), ("dv", v.grad)):
-        assert grad is not None, f"{name} was not produced by autograd"
-        assert torch.isfinite(grad.float()).all(), f"{name} contains NaN/Inf"
+    for name, got, low, expected in zip(
+        ("out", "dq", "dk", "dv"), actual, low_precision, reference
+    ):
+        _assert_error_tracks_low_precision(name, got, low, expected)
+
+
+def test_dim256_end_to_end_is_cuda_graph_capturable():
+    from hstu.cuda_hstu_attention import hstu_attn_varlen_func
+
+    torch.manual_seed(4567)
+    heads, seqlen, head_dim = 2, 128, 256
+    device = torch.device("cuda")
+    cu = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
+
+    def make_inputs():
+        q, k, v = [
+            torch.randn(
+                (seqlen, heads, head_dim),
+                dtype=torch.bfloat16,
+                device=device,
+                requires_grad=True,
+            )
+            for _ in range(3)
+        ]
+        return q, k, v, torch.randn_like(q)
+
+    def launch(q, k, v, do):
+        out = hstu_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            None,
+            None,
+            seqlen,
+            seqlen,
+            -1,
+            None,
+            None,
+            1,
+            (-1, -1),
+            0.7,
+            None,
+            False,
+            None,
+        )
+        return (out, *torch.autograd.grad(out, (q, k, v), do))
+
+    # Compile and initialize autograd outside capture using separate leaves.
+    warmup_inputs = make_inputs()
+    launch(*warmup_inputs)
+    torch.cuda.synchronize()
+
+    graph_inputs = make_inputs()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = launch(*graph_inputs)
+    for _ in range(10):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    for name, tensor in zip(("out", "dq", "dk", "dv"), captured):
+        assert torch.isfinite(tensor.float()).all(), f"{name} contains NaN/Inf"

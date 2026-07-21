@@ -7,7 +7,6 @@
 
 # Copyright (c) 2024, NVIDIA Corporation & AFFILIATES.
 
-import os
 from typing import Optional
 
 import torch
@@ -355,44 +354,11 @@ def hstu_varlen_bwd_100(
     if head_dim == 256:
         # D=256 cannot use the fused one-CTA CuTe kernel below: its live TMEM
         # ranges exceed the architectural 512-column allocation.  The native
-        # path therefore follows FA4's two-kernel decomposition (DQ, then
-        # DK/DV). Arbitrary interval masks stay on the validated Triton fallback;
-        # causal, local, and target-group predicates are native.
-        d256_cute_selector = os.environ.get("FBGEMM_HSTU_D256_CUTE", "auto").lower()
-        force_d256_cute = d256_cute_selector in ("1", "true", "on", "force")
-        disable_d256_cute = d256_cute_selector in ("0", "false", "off")
-        # On B300, matched A/B measurements show the 2-CTA path reaches parity
-        # at S=2048 and wins decisively after that, while Triton has lower launch
-        # latency for short rows.  Keep the crossover evidence in the selector;
-        # the environment override exists for testing and future tuning.
-        use_d256_cute = force_d256_cute or (
-            not disable_d256_cute and max(max_seqlen_q, max_seqlen_k) >= 2048
-        )
-        if use_d256_cute and not is_arbitrary:
-            from .hstu_bwd_256_cute import hstu_varlen_bwd_256_cute
+        # path follows FA4's two-kernel decomposition (DQ, then DK/DV). All
+        # supported D=256 masks are implemented in CuTe DSL.
+        from .hstu_bwd_256_cute import hstu_varlen_bwd_256_cute
 
-            return hstu_varlen_bwd_256_cute(
-                do,
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                dq,
-                dk,
-                dv,
-                window_size_left,
-                window_size_right,
-                alpha,
-                num_targets=num_targets,
-                target_group_size=target_group_size,
-            )
-
-        from .hstu_bwd_256 import hstu_varlen_bwd_256
-
-        return hstu_varlen_bwd_256(
+        return hstu_varlen_bwd_256_cute(
             do,
             q,
             k,
@@ -404,12 +370,12 @@ def hstu_varlen_bwd_100(
             dq,
             dk,
             dv,
-            num_targets,
-            target_group_size,
             window_size_left,
             window_size_right,
             alpha,
-            func,
+            num_targets=num_targets,
+            target_group_size=target_group_size,
+            func=func,
         )
 
     use_original_qkv_layout = (

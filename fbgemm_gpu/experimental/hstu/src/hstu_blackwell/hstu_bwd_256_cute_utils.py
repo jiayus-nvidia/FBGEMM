@@ -23,18 +23,13 @@ def make_sm100_thread_cooperative_group(size: int):
 class Sm100FmhaStaticTileSchedulerParams:
     def __init__(
         self,
-        is_persistent: bool,
         problem_shape_mbh: cute.Shape,
         *,
         loc=None,
         ip=None,
     ):
-        if is_persistent:
-            raise NotImplementedError("HSTU D=256 uses the non-persistent scheduler")
-        self.is_persistent = is_persistent
         self.problem_shape_mbh = problem_shape_mbh
         self._loc = loc
-        self._ip = ip
 
     def __extract_mlir_values__(self):
         values = cutlass.extract_mlir_values(self.problem_shape_mbh)
@@ -45,9 +40,7 @@ class Sm100FmhaStaticTileSchedulerParams:
         problem_shape = cutlass.new_from_mlir_values(
             self.problem_shape_mbh, values[: self._values_count]
         )
-        return Sm100FmhaStaticTileSchedulerParams(
-            self.is_persistent, problem_shape, loc=self._loc
-        )
+        return Sm100FmhaStaticTileSchedulerParams(problem_shape, loc=self._loc)
 
 
 class Sm100FmhaStaticTileScheduler:
@@ -66,10 +59,8 @@ class Sm100FmhaStaticTileScheduler:
         self._grid_shape = grid_shape
         self._current_work_linear_idx = current_work_linear_idx
         self._problem_shape_mbh = cute.make_layout(params.problem_shape_mbh)
-        self._num_blocks = cute.size(self._problem_shape_mbh)
         self._is_first_block = True
         self._loc = loc
-        self._ip = ip
 
     @staticmethod
     def get_grid_shape(
@@ -140,10 +131,8 @@ class Sm100FmhaStaticTileScheduler:
 def compute_sm100_fmha_grid(
     output_shape: cute.Shape,
     cta_tiler: Tuple[int, int, int],
-    is_persistent: bool,
 ):
     params = Sm100FmhaStaticTileSchedulerParams(
-        is_persistent,
         (
             cute.ceil_div(cute.size(output_shape[0]), cta_tiler[0]),
             cute.size(output_shape[2][0]),
@@ -153,34 +142,8 @@ def compute_sm100_fmha_grid(
     return params, Sm100FmhaStaticTileScheduler.get_grid_shape(params)
 
 
-class _UnsupportedClcScheduler:
-    """Compile-time-dead placeholder; CLC is intentionally disabled here."""
-
-    @staticmethod
-    def create(*args, **kwargs):
-        raise NotImplementedError("CLC scheduling is disabled for HSTU D=256")
-
-    @staticmethod
-    def get_grid_shape(*args, **kwargs):
-        raise NotImplementedError("CLC scheduling is disabled for HSTU D=256")
-
-
-class _UnsupportedClcParams:
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError("CLC scheduling is disabled for HSTU D=256")
-
-
-ClcState = _UnsupportedClcScheduler
-Sm100FmhaClcDynamicTileScheduler = _UnsupportedClcScheduler
-Sm100FmhaClcDynamicTileSchedulerParams = _UnsupportedClcParams
-
-
-def compute_sm100_fmha_grid_clc(*args, **kwargs):
-    raise NotImplementedError("CLC scheduling is disabled for HSTU D=256")
-
-
 class HSTUFusedMask:
-    """FA4-shaped adapter for HSTU causal/local D=256 masking."""
+    """FA4-shaped adapter for native HSTU D=256 masking."""
 
     @staticmethod
     @cute.jit
@@ -232,8 +195,8 @@ class HSTUFusedMask:
             window_size_left,
             window_size_right,
         )
-        # Mask every visited tile. This is conservative and keeps bring-up
-        # independent of the reference kernel's softmax-specific fast bounds.
+        # Mask every visited tile. This is conservative and keeps the HSTU
+        # predicates independent of softmax-specific fast bounds.
         return start, start
 
     @staticmethod
@@ -251,12 +214,31 @@ class HSTUFusedMask:
         is_target: cutlass.Constexpr[bool] = False,
         target_group_size: cutlass.Constexpr[int] = 1,
         num_targets: Int32 = Int32(0),
+        is_arbitrary: cutlass.Constexpr[bool] = False,
+        func_num: cutlass.Constexpr[int] = 0,
+        func: Optional[cute.Tensor] = None,
+        query_offset: Int32 = Int32(0),
     ) -> None:
         offset = seqlen_k - seqlen_q
         for i in cutlass.range(cute.size(predicates), unroll_full=True):
             index_q, index_k = index_qk[i]
             valid = index_q < seqlen_q and index_k < seqlen_k
-            if cutlass.const_expr(apply_semantic_window and (is_causal or is_local)):
+            if cutlass.const_expr(is_arbitrary):
+                assert isinstance(func, cute.Tensor)
+                func_row = query_offset + index_q
+                for interval_idx in cutlass.range(
+                    func_num // 2, unroll_full=True
+                ):
+                    interval_start = func[0, 2 * interval_idx, func_row]
+                    interval_end = func[0, 2 * interval_idx + 1, func_row]
+                    in_hole = (
+                        index_k >= interval_start and index_k < interval_end
+                    )
+                    valid = valid and not in_hole
+                valid = valid and index_k < func[0, func_num - 1, func_row]
+            elif cutlass.const_expr(
+                apply_semantic_window and (is_causal or is_local)
+            ):
                 score_row = index_q + offset
                 right = Int32(0) if window_size_right is None else window_size_right
                 valid = valid and index_k <= score_row + right
