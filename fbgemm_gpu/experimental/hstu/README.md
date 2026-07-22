@@ -121,7 +121,7 @@ python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="10.0"
 # To install HSTU standalone (without the rest of fbgemm_gpu), run from experimental/hstu/:
 #   export HSTU_DISABLE_BACKWARD=FALSE ...  # same environment variables as above
 #   HSTU_ARCH_LIST="8.0 9.0 10.0" python setup.py install
-# For sm100-only, the export variables are not needed since Blackwell is pure Python/Triton.
+# For sm100-only, the export variables are not needed since Blackwell is pure Python/CuTe DSL.
 # Then import hstu instead of fbgemm_gpu.experimental.hstu.
 ```
 
@@ -175,10 +175,15 @@ python setup.py install --build-target=hstu -DTORCH_CUDA_ARCH_LIST="10.0"
 ### HSTU-Blackwell
 - **Supported GPUs**: Blackwell only (B200)
 - **Data types**: FP16, BF16
-- **Head dimensions**: 64, 128
+- **Head dimensions**: 64, 128, 256
 - **Attention masks**: Almost same as HSTU-Ampere, only without context mask.
 - **Paged attention**: Supported in forward only. Page size is 128.
 - **RAB/dRAB**: Not supported.
 - **Quantization mode**: Not supported. (no FP8)
-- **Note**: Implemented using NVIDIA CUTLASS DSL (cute-dsl), JIT compiled at first call. Only undeterministic backward implementation.
+- **Note**: Forward and the D=64/128 backward paths use NVIDIA CUTLASS DSL
+  (cute-dsl) and are JIT compiled at first call. Only undeterministic backward
+  implementations are available.
+- **D=256 backward**: Uses dedicated native CuTe DSL 2-CTA kernels (dQ followed
+  by dK/dV) for all sequence lengths and supported masks, including arbitrary
+  interval masks.
 - **Note**: HSTU-Blackwell does **not** support `seqused_q` and `seqused_k`, i.e., variable valid token length is not supported.

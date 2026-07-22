@@ -718,7 +718,7 @@ class HSTU16Test(unittest.TestCase):
         is_delta_q = max_seq_len_q < max_seq_len_k
         major_version = torch.cuda.get_device_capability()[0]
         if major_version == 10:
-            if attn_dim not in (64, 128) or hidden_dim != attn_dim:
+            if attn_dim not in (64, 128, 256) or hidden_dim != attn_dim:
                 logger.info("Skipping sm100 unsupported HSTU16 dimension")
                 return
             if has_rab or has_drab:
