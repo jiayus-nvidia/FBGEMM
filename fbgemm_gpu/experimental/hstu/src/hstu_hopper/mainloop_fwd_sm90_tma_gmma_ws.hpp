@@ -276,13 +276,17 @@ struct CollectiveMainloopFwd {
         SmemLayoutQ{},
         select<0, 2>(TileShape_MNK{}),
         _1{}); // no mcast for Q
-    Tensor mRab = make_tensor(make_gmem_ptr(args.ptr_Rab), args.layout_Rab);
-    TMA_Rab tma_load_Rab = make_tma_copy(
-        GmemTiledCopyRab{},
-        mRab,
-        SmemLayoutRab{}(_, _, _0{}),
-        select<0, 1>(TileShape_MNK{}),
-        _1{}); // no mcast for Rab
+    // Older drivers reject null global addresses during TMA map encoding.
+    TMA_Rab tma_load_Rab{};
+    if constexpr (Has_rab) {
+      Tensor mRab = make_tensor(make_gmem_ptr(args.ptr_Rab), args.layout_Rab);
+      tma_load_Rab = make_tma_copy(
+          GmemTiledCopyRab{},
+          mRab,
+          SmemLayoutRab{}(_, _, _0{}),
+          select<0, 1>(TileShape_MNK{}),
+          _1{}); // no mcast for Rab
+    }
     Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.layout_K);
     TMA_K tma_load_K = make_tma_copy(
         GmemTiledCopyKV{},
@@ -347,7 +351,7 @@ struct CollectiveMainloopFwd {
         mainloop_params.tma_load_K.get_tma_descriptor());
     cute::prefetch_tma_descriptor(
         mainloop_params.tma_load_V.get_tma_descriptor());
-    if (Has_rab) {
+    if constexpr (Has_rab) {
       cute::prefetch_tma_descriptor(
           mainloop_params.tma_load_Rab.get_tma_descriptor());
     }

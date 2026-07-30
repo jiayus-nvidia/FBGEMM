@@ -375,13 +375,17 @@ struct CollectiveMainloopBwd {
         SmemLayoutQ{}(_, _, _0{}),
         select<0, 2>(TileShape_MNK{}),
         size<1>(ClusterShape{})); // mcast along N mode for this M load, if any
-    Tensor mRab = make_tensor(make_gmem_ptr(args.ptr_Rab), args.layout_Rab);
-    TMA_Rab tma_load_Rab = make_tma_copy(
-        GmemTiledCopyRab{},
-        mRab,
-        SmemLayoutRab{}(_, _, _0{}),
-        select<0, 1>(TileShape_MNK{}),
-        _1{}); // no mcast for Rab
+    // Older drivers reject null global addresses during TMA map encoding.
+    TMA_Rab tma_load_Rab{};
+    if constexpr (Has_rab) {
+      Tensor mRab = make_tensor(make_gmem_ptr(args.ptr_Rab), args.layout_Rab);
+      tma_load_Rab = make_tma_copy(
+          GmemTiledCopyRab{},
+          mRab,
+          SmemLayoutRab{}(_, _, _0{}),
+          select<0, 1>(TileShape_MNK{}),
+          _1{}); // no mcast for Rab
+    }
     Tensor mdO = make_tensor(make_gmem_ptr(args.ptr_dO), args.layout_dO);
     TMA_QdO tma_load_dO = make_tma_copy(
         GmemTiledCopyQdO{},
@@ -411,13 +415,18 @@ struct CollectiveMainloopBwd {
         SmemLayoutdQaccumTMA{},
         select<0, 2>(TileShape_MNK{}),
         _1{}); // no mcast for dQaccum
-    Tensor mdRab = make_tensor(make_gmem_ptr(args.ptr_dRab), args.layout_dRab);
-    TMA_store_dRab tma_store_dRab = make_tma_copy(
-        GmemTiledCopydRab{},
-        mdRab,
-        SmemLayoutPdS{}(_, _, _0{}),
-        select<0, 1>(TileShape_MNK{}),
-        _1{}); // no mcast for dRab
+    // Older drivers reject null global addresses during TMA map encoding.
+    TMA_store_dRab tma_store_dRab{};
+    if constexpr (Has_drab) {
+      Tensor mdRab =
+          make_tensor(make_gmem_ptr(args.ptr_dRab), args.layout_dRab);
+      tma_store_dRab = make_tma_copy(
+          GmemTiledCopydRab{},
+          mdRab,
+          SmemLayoutPdS{}(_, _, _0{}),
+          select<0, 1>(TileShape_MNK{}),
+          _1{}); // no mcast for dRab
+    }
 
     TMA_QdOt tma_load_Qt{};
     TMA_QdOt tma_load_dOt{};
