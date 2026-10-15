@@ -12,6 +12,7 @@
 from pathlib import Path
 from typing import Any, Optional, Tuple
 import importlib.util
+import sys
 
 from .library import *  # noqa: F401, F403
 try:
@@ -53,6 +54,87 @@ def _import_sm100():
         except ImportError:
             from hstu_blackwell import hstu_ops_gpu
     return hstu_ops_gpu
+
+
+def _import_sm90_dsl():
+    try:
+        from fbgemm_gpu.experimental.hstu.hstu_hopper_dsl import hstu_ops_gpu
+        return hstu_ops_gpu
+    except ImportError:
+        pass
+    try:
+        from hstu.hstu_hopper_dsl import hstu_ops_gpu
+        return hstu_ops_gpu
+    except ImportError:
+        pass
+    try:
+        from hstu_hopper_dsl import hstu_ops_gpu
+        return hstu_ops_gpu
+    except ImportError:
+        pass
+    # Uninstalled worktree: hstu/cuda_hstu_attention.py -> experimental/hstu/src
+    dsl_src = Path(__file__).resolve().parents[1] / "src"
+    dsl_src_str = str(dsl_src)
+    if dsl_src.is_dir() and dsl_src_str not in sys.path:
+        sys.path.insert(0, dsl_src_str)
+    from hstu_hopper_dsl import hstu_ops_gpu
+    return hstu_ops_gpu
+
+
+def _scale_hstu_out(out: torch.Tensor, scaling_seqlen: int, max_seqlen_q: int) -> torch.Tensor:
+    # Ampere/Hopper C++: acc_o /= scaling_seqlen (-1 means max_seqlen_q).
+    scale = max_seqlen_q if scaling_seqlen is None or scaling_seqlen < 0 else int(scaling_seqlen)
+    if scale == 1:
+        return out
+    return out / scale
+
+
+def _use_hstu_hopper_dsl_fwd(
+    q: torch.Tensor,
+    kv_cache: Optional[torch.Tensor],
+    rab: Optional[torch.Tensor],
+    func: Optional[torch.Tensor],
+    quant_mode: Optional[int],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
+    num_contexts: Optional[torch.Tensor],
+    window_size: Tuple[int, int] = (-1, -1),
+    max_seqlen_k: int = 0,
+) -> bool:
+    # Ampere C++ fwd matrix for dtype/head_dim; FP8/quant stays on C++ Hopper.
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if q.shape[-1] not in (32, 64, 128, 256):
+        return False
+    if rab is not None:
+        return False
+    if quant_mode not in (None, -1):
+        return False
+    if seqused_q is not None or seqused_k is not None:
+        return False
+    if num_contexts is not None:
+        return False
+    window_size_left, window_size_right = window_size
+    window_size_left = (
+        max_seqlen_k
+        if window_size_left < 0 or window_size_left > max_seqlen_k
+        else window_size_left
+    )
+    window_size_right = (
+        max_seqlen_k
+        if window_size_right < 0 or window_size_right > max_seqlen_k
+        else window_size_right
+    )
+    is_causal = window_size_left == max_seqlen_k and window_size_right == 0
+    is_local = (
+        window_size_left < max_seqlen_k or window_size_right < max_seqlen_k
+    ) and not is_causal
+    if kv_cache is not None:
+        if not is_causal or is_local or func is not None:
+            return False
+        if kv_cache.dim() != 5 or kv_cache.shape[1] != 2 or kv_cache.shape[2] not in (32, 64):
+            return False
+    return True
 
 def quantize_for_two_directions(x, seq_offsets, fp8_type=torch.float8_e4m3fn):
     B = seq_offsets.size(0) - 1
@@ -331,71 +413,100 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 last_page_lens,
             )
         elif major_version == 9:
-            vt = None
-            q_descale = None
-            k_descale = None
-            v_descale = None
-            vt_descale = None
-            cu_seqlens_vt_descale = None
-            cu_seqlens_q_block_descale = None
-            cu_seqlens_kv_block_descale = None
             ctx.q_fp16 = q
             ctx.k_fp16 = k
             ctx.v_fp16 = v
-            output_dtype = 0 if q.dtype == torch.bfloat16 else 1
-            if quant_mode == 0:
-                q = q.to(torch.float8_e4m3fn)
-                k = k.to(torch.float8_e4m3fn)
-                v = v.to(torch.float8_e4m3fn)
-                q_descale = torch.tensor([1.0], dtype=torch.float32, device='cuda')
-                k_descale = torch.tensor([1.0], dtype=torch.float32, device='cuda')
-                v_descale = torch.tensor([1.0], dtype=torch.float32, device='cuda')
-            elif quant_mode == 1:
-                q, q_descale, _, _, _ = quantize_for_two_directions(q, cu_seqlens_q, fp8_type=torch.float8_e4m3fn)
-                k, k_descale, _, _, _ = quantize_for_two_directions(k, cu_seqlens_k, fp8_type=torch.float8_e4m3fn)
-                v, v_descale, vt, vt_descale, cu_seqlens_vt_descale = quantize_for_two_directions(v, cu_seqlens_k, fp8_type=torch.float8_e4m3fn)
-                vt = vt.transpose(0, 2).contiguous().transpose(0, 2).detach()
-            elif quant_mode == 2: #block_scale
-                dim = q.shape[-1]
-                bm, bn = get_bm_and_bn_block_size_fwd(rab, dim)
-                q, q_descale, cu_seqlens_q_block_descale = quantize_for_block_scale(q, cu_seqlens_q, block_size=bm, fp8_type=torch.float8_e4m3fn)
-                k, k_descale, cu_seqlens_kv_block_descale = quantize_for_block_scale(k, cu_seqlens_k, block_size=bn, fp8_type=torch.float8_e4m3fn)
-                v, v_descale, _ = quantize_for_block_scale(v, cu_seqlens_k, block_size=bn, fp8_type=torch.float8_e4m3fn)
-            elif quant_mode == 3 or quant_mode == 4 or quant_mode == 5:
-                q, q_descale = quantize_for_head_batch_tensor(q, cu_seqlens_q, quant_mode=quant_mode, fp8_type=torch.float8_e4m3fn)
-                k, k_descale = quantize_for_head_batch_tensor(k, cu_seqlens_k, quant_mode=quant_mode, fp8_type=torch.float8_e4m3fn)
-                v, v_descale = quantize_for_head_batch_tensor(v, cu_seqlens_k, quant_mode=quant_mode, fp8_type=torch.float8_e4m3fn)
+            if _use_hstu_hopper_dsl_fwd(
+                q, kv_cache, rab, func, quant_mode, seqused_q, seqused_k, num_contexts,
+                window_size, max_seqlen_k,
+            ):
+                _sm90 = _import_sm90_dsl()
+                out = _sm90.hstu_varlen_fwd_90_dsl(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    num_contexts,
+                    num_targets,
+                    target_group_size,
+                    window_size[0],
+                    window_size[1],
+                    alpha,
+                    rab=rab,
+                    func=func,
+                    paged_kv=kv_cache,
+                    page_ids=page_ids,
+                    page_indptrs=page_offsets,
+                    last_page_lens=last_page_lens,
+                )
+                out = _scale_hstu_out(out, scaling_seqlen, max_seqlen_q)
+                rab_padded = None
+            else:
+                vt = None
+                q_descale = None
+                k_descale = None
+                v_descale = None
+                vt_descale = None
+                cu_seqlens_vt_descale = None
+                cu_seqlens_q_block_descale = None
+                cu_seqlens_kv_block_descale = None
+                output_dtype = 0 if q.dtype == torch.bfloat16 else 1
+                if quant_mode == 0:
+                    q = q.to(torch.float8_e4m3fn)
+                    k = k.to(torch.float8_e4m3fn)
+                    v = v.to(torch.float8_e4m3fn)
+                    q_descale = torch.tensor([1.0], dtype=torch.float32, device='cuda')
+                    k_descale = torch.tensor([1.0], dtype=torch.float32, device='cuda')
+                    v_descale = torch.tensor([1.0], dtype=torch.float32, device='cuda')
+                elif quant_mode == 1:
+                    q, q_descale, _, _, _ = quantize_for_two_directions(q, cu_seqlens_q, fp8_type=torch.float8_e4m3fn)
+                    k, k_descale, _, _, _ = quantize_for_two_directions(k, cu_seqlens_k, fp8_type=torch.float8_e4m3fn)
+                    v, v_descale, vt, vt_descale, cu_seqlens_vt_descale = quantize_for_two_directions(v, cu_seqlens_k, fp8_type=torch.float8_e4m3fn)
+                    vt = vt.transpose(0, 2).contiguous().transpose(0, 2).detach()
+                elif quant_mode == 2: #block_scale
+                    dim = q.shape[-1]
+                    bm, bn = get_bm_and_bn_block_size_fwd(rab, dim)
+                    q, q_descale, cu_seqlens_q_block_descale = quantize_for_block_scale(q, cu_seqlens_q, block_size=bm, fp8_type=torch.float8_e4m3fn)
+                    k, k_descale, cu_seqlens_kv_block_descale = quantize_for_block_scale(k, cu_seqlens_k, block_size=bn, fp8_type=torch.float8_e4m3fn)
+                    v, v_descale, _ = quantize_for_block_scale(v, cu_seqlens_k, block_size=bn, fp8_type=torch.float8_e4m3fn)
+                elif quant_mode == 3 or quant_mode == 4 or quant_mode == 5:
+                    q, q_descale = quantize_for_head_batch_tensor(q, cu_seqlens_q, quant_mode=quant_mode, fp8_type=torch.float8_e4m3fn)
+                    k, k_descale = quantize_for_head_batch_tensor(k, cu_seqlens_k, quant_mode=quant_mode, fp8_type=torch.float8_e4m3fn)
+                    v, v_descale = quantize_for_head_batch_tensor(v, cu_seqlens_k, quant_mode=quant_mode, fp8_type=torch.float8_e4m3fn)
 
-            out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_90(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_q,
-                seqused_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                scaling_seqlen,
-                num_contexts,
-                num_targets,
-                target_group_size,
-                window_size[0],
-                window_size[1],
-                alpha,
-                rab,
-                func,
-                quant_mode,
-                output_dtype,
-                vt,
-                cu_seqlens_vt_descale,
-                q_descale,
-                k_descale,
-                v_descale,
-                vt_descale,
-                cu_seqlens_q_block_descale,
-                cu_seqlens_kv_block_descale,
-            )
+                out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_90(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_q,
+                    seqused_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    scaling_seqlen,
+                    num_contexts,
+                    num_targets,
+                    target_group_size,
+                    window_size[0],
+                    window_size[1],
+                    alpha,
+                    rab,
+                    func,
+                    quant_mode,
+                    output_dtype,
+                    vt,
+                    cu_seqlens_vt_descale,
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                    vt_descale,
+                    cu_seqlens_q_block_descale,
+                    cu_seqlens_kv_block_descale,
+                )
         else:
             assert seqused_q is None and seqused_k is None, \
                 "HSTU-Blackwell does not support seqused_q and seqused_k"
@@ -823,28 +934,53 @@ class HstuAttnQKVPackedFunc(torch.autograd.Function):
                 func
             )
         elif major_version == 9:
-            out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_90(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_q,
-                seqused_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                scaling_seqlen,
-                num_contexts,
-                num_targets,
-                target_group_size,
-                window_size[0],
-                window_size[1],
-                alpha,
-                rab,
-                func,
-                -1, # quant_mode
-                0 if q.dtype == torch.bfloat16 else 1,
-            )
+            if _use_hstu_hopper_dsl_fwd(
+                q, None, rab, func, -1, seqused_q, seqused_k, num_contexts,
+                window_size, max_seqlen_k,
+            ):
+                _sm90 = _import_sm90_dsl()
+                out = _sm90.hstu_varlen_fwd_90_dsl(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    num_contexts,
+                    num_targets,
+                    target_group_size,
+                    window_size[0],
+                    window_size[1],
+                    alpha,
+                    rab=rab,
+                    func=func,
+                )
+                out = _scale_hstu_out(out, scaling_seqlen, max_seqlen_q)
+                rab_padded = None
+            else:
+                out, rab_padded = torch.ops.fbgemm.hstu_varlen_fwd_90(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_q,
+                    seqused_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    scaling_seqlen,
+                    num_contexts,
+                    num_targets,
+                    target_group_size,
+                    window_size[0],
+                    window_size[1],
+                    alpha,
+                    rab,
+                    func,
+                    -1, # quant_mode
+                    0 if q.dtype == torch.bfloat16 else 1,
+                )
         else:
             assert seqused_q is None and seqused_k is None, \
                 "HSTU-Blackwell does not support seqused_q and seqused_k"
