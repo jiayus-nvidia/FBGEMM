@@ -199,6 +199,22 @@ class HSTUAttentionForwardSm90:
 
         return SharedStorageOverlapQO if self.overlap_qo else SharedStorage
 
+    @cute.jit
+    def _split_kv_range(self, n_total: Int32):
+        """Evenly partition KV tiles across blockIdx.y (additive split-K)."""
+        n_split = cute.arch.grid_dim()[1]
+        split_id = cute.arch.block_idx()[1]
+        chunk = cute.ceil_div(n_total, n_split)
+        kv_start = split_id * chunk
+        kv_end = kv_start + chunk
+        if kv_end > n_total:
+            kv_end = n_total
+        n_this = kv_end - kv_start
+        if n_this < Int32(0):
+            n_this = Int32(0)
+            kv_start = n_total
+        return kv_start, n_this
+
     @cute.kernel
     def kernel(
         self,
@@ -354,11 +370,14 @@ class HSTUAttentionForwardSm90:
                         n_block_max = n_block_hist + n_block_tgt
                     else:
                         n_block_max = cute.ceil_div(seqlen.seqlen_k, self.kBlockN)
-                    pipeline_q.producer_acquire(q_producer_state)
-                    cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr = pipeline_q.producer_get_barrier(q_producer_state))
-                    q_producer_state.advance()
+                    kv_start, n_this = self._split_kv_range(n_block_max)
+                    if n_this > Int32(0):
+                        pipeline_q.producer_acquire(q_producer_state)
+                        cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr = pipeline_q.producer_get_barrier(q_producer_state))
+                        q_producer_state.advance()
 
-                    for n_block in cutlass.range(n_block_max, unroll=1):
+                    for j in cutlass.range(n_this, unroll=1):
+                        n_block = kv_start + j
                         pipeline_k.producer_acquire(kv_producer_state)
                         pipeline_v.producer_acquire(v_producer_state)
                         if const_expr(self.is_paged):
@@ -448,9 +467,15 @@ class HSTUAttentionForwardSm90:
                     n_block_max = n_block_hist + n_block_tgt
                 else:
                     n_block_max = cute.ceil_div(seqlen.seqlen_k, self.kBlockN)
-                pipeline_q.consumer_wait(q_consumer_state)
+                kv_start, n_this = self._split_kv_range(n_block_max)
                 is_first = True
-                for n_block in cutlass.range(n_block_max, unroll=1):
+                if n_this <= Int32(0):
+                    for z in cutlass.range_constexpr(cute.size(acc_O)):
+                        acc_O[z] = Float32(0)
+                else:
+                    pipeline_q.consumer_wait(q_consumer_state)
+                for j in cutlass.range(n_this, unroll=1):
+                    n_block = kv_start + j
                     pipeline_k.consumer_wait(kv_consumer_state)
                     acc_S = gemm_zero_init(
                         tiled_mma_qk,
@@ -522,8 +547,9 @@ class HSTUAttentionForwardSm90:
                     is_first = False
                 # d=256: sO aliases sQ. Keep the Q stage until O is stored.
                 if const_expr(not self.overlap_qo):
-                    pipeline_q.consumer_release(q_consumer_state)
-                    q_consumer_state.advance()
+                    if n_this > Int32(0):
+                        pipeline_q.consumer_release(q_consumer_state)
+                        q_consumer_state.advance()
 
                 rO = cute.make_fragment_like(acc_O, self.dtype)
                 rO.store(acc_O.load().to(self.dtype))
@@ -541,12 +567,16 @@ class HSTUAttentionForwardSm90:
                     barrier_id=int(NamedBarrierFwd.Epilogue),
                     number_of_threads=self.num_mma_warp_groups * self.threads_per_warp_group,
                 )
+                n_split = cute.arch.grid_dim()[1]
+                split_id = cute.arch.block_idx()[1]
+                o_split_stride = cute.size(mO.shape[0]) // n_split
+                offset_o = seqlen.offset_q + split_id * o_split_stride
                 seqlen_remaining = seqlen.seqlen_q - m_block * self.kBlockM
                 if seqlen_remaining >= Int32(self.kBlockM):
                     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
                     if warp_idx == 4:
                         mO_tma = cute.domain_offset(
-                            (seqlen.offset_q, 0), tma_tensor_O[None, None, head_idx]
+                            (offset_o, 0), tma_tensor_O[None, None, head_idx]
                         )
                         gO_tma = cute.local_tile(
                             mO_tma, (self.kBlockM, self.head_dim_padded), (m_block, 0)
@@ -563,7 +593,7 @@ class HSTUAttentionForwardSm90:
                     # Packed varlen: a full TMA store would land in the next
                     # sequence. Only write rows that belong to this batch.
                     mO_cur = cute.domain_offset(
-                        (seqlen.offset_q, 0), mO[None, None, head_idx]
+                        (offset_o, 0), mO[None, None, head_idx]
                     )
                     gO = cute.local_tile(
                         mO_cur, (self.kBlockM, self.head_dim_padded), (m_block, 0)
@@ -589,8 +619,9 @@ class HSTUAttentionForwardSm90:
                         barrier_id=int(NamedBarrierFwd.Epilogue),
                         number_of_threads=self.num_mma_warp_groups * self.threads_per_warp_group,
                     )
-                    pipeline_q.consumer_release(q_consumer_state)
-                    q_consumer_state.advance()
+                    if n_this > Int32(0):
+                        pipeline_q.consumer_release(q_consumer_state)
+                        q_consumer_state.advance()
 
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
@@ -618,6 +649,7 @@ class HSTUAttentionForwardSm90:
         page_ids: Optional[cute.Tensor] = None,
         page_indptrs: Optional[cute.Tensor] = None,
         last_page_seqlen: Optional[cute.Tensor] = None,
+        kv_split: Int32 = 1,
     ):
         self.dtype = mQ.element_type
         self.o_dtype = mO.element_type
@@ -690,7 +722,8 @@ class HSTUAttentionForwardSm90:
             element_size=self.dtype.width // 8,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
-        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
+        grid_x, _, _ = TileScheduler.get_grid_shape(tile_sched_params)
+        grid_dim = (grid_x, kv_split, Int32(1))
         self.kernel(
             tma_tensor_Q, tma_tensor_K, tma_tensor_V, tma_tensor_O, mO,
             tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_O,

@@ -33,6 +33,35 @@ def _mark_optional_tensor(tensor: Optional[torch.Tensor]):
     return _mark_dynamic_tensor(tensor, tensor.ndim - 1)
 
 
+def _choose_kv_split(
+    max_seqlen_k: int,
+    kBlockN: int,
+    q_tokens: int,
+    kBlockM: int,
+    n_heads: int,
+    n_batch: int,
+) -> int:
+    """Split KV tiles across blockIdx.y so short-Lq/long-hist fills the GPU.
+
+    HSTU O is additive in N, so partials just sum. Official tests with large
+    batch already launch enough CTAs and stay at n_split=1.
+    """
+    n_kv = max(1, (int(max_seqlen_k) + kBlockN - 1) // kBlockN)
+    n_m = max(1, (int(q_tokens) + kBlockM - 1) // kBlockM)
+    base = max(1, n_m * int(n_heads) * int(n_batch))
+    try:
+        sms = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    except Exception:
+        return 1
+    # Short KV loops lose to extra Q loads + partial-O reduction.
+    if base >= sms or n_kv < 32:
+        return 1
+    n_split = min(n_kv, sms // base)
+    while n_split > 1 and (n_kv + n_split - 1) // n_split < 4:
+        n_split -= 1
+    return max(1, int(n_split))
+
+
 def hstu_varlen_fwd_90_dsl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -110,7 +139,27 @@ def hstu_varlen_fwd_90_dsl(
     if q_pad:
         q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, q_pad))
 
+    n_batch = int(cu_seqlens_q.numel() - 1)
+    kv_split = _choose_kv_split(
+        max_seqlen_k, kBlockN, q.shape[0], kBlockM, q.shape[1], n_batch
+    )
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    if kv_split > 1:
+        o_shape = (kv_split, q.shape[0], q.shape[1], q.shape[2])
+        cache = hstu_varlen_fwd_90_dsl._o_work_cache
+        o_work = cache.get(o_shape)
+        if (
+            o_work is None
+            or o_work.shape != o_shape
+            or o_work.dtype != q.dtype
+            or o_work.device != q.device
+        ):
+            o_work = torch.empty(o_shape, dtype=q.dtype, device=q.device)
+            cache[o_shape] = o_work
+        o_launch = o_work.view(kv_split * q.shape[0], q.shape[1], q.shape[2])
+    else:
+        o_work = None
+        o_launch = out
     compile_key = (
         q.dtype,
         head_dim,
@@ -125,11 +174,12 @@ def hstu_varlen_fwd_90_dsl(
         is_arbitrary,
         func_num,
         is_paged,
+        kv_split,
     )
 
     if compile_key not in hstu_varlen_fwd_90_dsl.compile_cache:
         q_tensor, k_tensor, v_tensor, o_tensor = [
-            _mark_dynamic_tensor(t, t.ndim - 1) for t in (q, k, v, out)
+            _mark_dynamic_tensor(t, t.ndim - 1) for t in (q, k, v, o_launch)
         ]
         cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
             _mark_dynamic_tensor(t, t.ndim - 1) for t in (cu_seqlens_q, cu_seqlens_k)
@@ -177,6 +227,7 @@ def hstu_varlen_fwd_90_dsl(
             page_ids_tensor,
             page_indptrs_tensor,
             last_page_seqlen_tensor,
+            kv_split,
             options="--enable-tvm-ffi",
         )
 
@@ -185,7 +236,7 @@ def hstu_varlen_fwd_90_dsl(
         q,
         k,
         v,
-        out,
+        o_launch,
         max_seqlen_q,
         max_seqlen_k,
         cu_seqlens_q,
@@ -201,9 +252,12 @@ def hstu_varlen_fwd_90_dsl(
         page_ids,
         page_indptrs,
         last_page_lens,
+        kv_split,
     )
-    
+    if kv_split > 1:
+        out.copy_(o_work.float().sum(dim=0).to(out.dtype))
     return out[:q_tokens]
 
 
 hstu_varlen_fwd_90_dsl.compile_cache = {}
+hstu_varlen_fwd_90_dsl._o_work_cache = {}
