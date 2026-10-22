@@ -393,6 +393,10 @@ if "10.0" in arch_list:
 packages.append("hstu.hstu_blackwell_rtx")
 package_dir["hstu.hstu_blackwell_rtx"] = "src/hstu_blackwell_rtx"
 
+# Hopper paged kernel prototype (CuTe DSL, no nvcc).
+packages.append("hstu.hstu_hopper_dsl")
+package_dir["hstu.hstu_hopper_dsl"] = "src/hstu_hopper_dsl"
+
 setup(
     name=PACKAGE_NAME,
     version="0.1.0" + '+cu' + str(bare_metal_version),
