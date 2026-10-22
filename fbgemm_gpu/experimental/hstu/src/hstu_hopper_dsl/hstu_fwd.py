@@ -58,7 +58,15 @@ class HSTUAttentionForwardSm90:
         self.kBlockM = kBlockM
         self.kBlockN = kBlockN
         self.page_size = page_size
-        self.tiles_per_page = 1 if self.kBlockN == 0 else self.page_size // self.kBlockN
+        # MMA tile vs cache page. page_size==kBlockN → one TMA per tile (old path).
+        if self.is_paged and self.page_size > 0:
+            if self.kBlockN % self.page_size != 0:
+                raise ValueError(
+                    f"kBlockN={self.kBlockN} must be a multiple of page_size={self.page_size}"
+                )
+            self.pages_per_tile = self.kBlockN // self.page_size
+        else:
+            self.pages_per_tile = 1
         self.qk_acc_dtype = Float32
         self.pv_acc_dtype = Float32
         
@@ -130,6 +138,14 @@ class HSTUAttentionForwardSm90:
         self.sQ_layout = cute.tile_to_shape(sQ_layout_atom, (self.kBlockM, self.head_dim_padded), (0, 1))
         self.sK_layout = cute.tile_to_shape(sK_layout_atom, (self.kBlockN, self.head_dim_padded, self.num_stages), (0, 1, 2))
         self.sV_layout = cute.tile_to_shape(sV_layout_atom, (self.kBlockN, self.head_dim_padded, self.num_stages), (0, 1, 2))
+        # Paged history TMA is one cache page, which may be a slice of the MMA tile.
+        page_n = self.page_size if self.is_paged and self.page_size > 0 else self.kBlockN
+        self.sK_page_layout = cute.tile_to_shape(
+            sK_layout_atom, (page_n, self.head_dim_padded), (0, 1)
+        )
+        self.sV_page_layout = cute.tile_to_shape(
+            sV_layout_atom, (page_n, self.head_dim_padded), (0, 1)
+        )
         self.sO_layout = cute.tile_to_shape(sO_layout_atom, (self.kBlockM, self.head_dim_padded), (0, 1))
         self.sP_layout = None
 
@@ -325,8 +341,20 @@ class HSTUAttentionForwardSm90:
                         mV_cur = cute.domain_offset((seqlen.offset_k, 0), tma_tensor_V[None, None, head_idx])
 
                     gQ = cute.local_tile(mQ_cur, (self.kBlockM, self.head_dim_padded), (m_block, 0))
-                    gK = cute.local_tile(mK_cur, (self.kBlockN, self.head_dim_padded), (None, 0))
-                    gV = cute.local_tile(mV_cur, (self.kBlockN, self.head_dim_padded), (None, 0))
+                    if const_expr(self.is_paged):
+                        gK = cute.local_tile(
+                            mK_cur, (self.page_size, self.head_dim_padded), (None, 0)
+                        )
+                        gV = cute.local_tile(
+                            mV_cur, (self.page_size, self.head_dim_padded), (None, 0)
+                        )
+                    else:
+                        gK = cute.local_tile(
+                            mK_cur, (self.kBlockN, self.head_dim_padded), (None, 0)
+                        )
+                        gV = cute.local_tile(
+                            mV_cur, (self.kBlockN, self.head_dim_padded), (None, 0)
+                        )
 
                     tQsQ, tQgQ = cpasync.tma_partition(
                         tma_atom_Q, 0, cute.make_layout(1),
@@ -334,16 +362,17 @@ class HSTUAttentionForwardSm90:
                         cute.group_modes(gQ, 0, cute.rank(gQ)),
                     )
 
-                    tKsK, tKgK = cpasync.tma_partition(
-                        tma_atom_K, 0, cute.make_layout(1),
-                        cute.group_modes(sK, 0, cute.rank(sK) - 1),
-                        cute.group_modes(gK, 0, cute.rank(gK) - 1),
-                    )
-                    tVsV, tVgV = cpasync.tma_partition(
-                        tma_atom_V, 0, cute.make_layout(1),
-                        cute.group_modes(sV, 0, cute.rank(sV) - 1),
-                        cute.group_modes(gV, 0, cute.rank(gV) - 1),
-                    )
+                    if const_expr(not self.is_paged or self.pages_per_tile == 1):
+                        tKsK, tKgK = cpasync.tma_partition(
+                            tma_atom_K, 0, cute.make_layout(1),
+                            cute.group_modes(sK, 0, cute.rank(sK) - 1),
+                            cute.group_modes(gK, 0, cute.rank(gK) - 1),
+                        )
+                        tVsV, tVgV = cpasync.tma_partition(
+                            tma_atom_V, 0, cute.make_layout(1),
+                            cute.group_modes(sV, 0, cute.rank(sV) - 1),
+                            cute.group_modes(gV, 0, cute.rank(gV) - 1),
+                        )
 
                     if const_expr(self.is_paged):
                         offset_tgt = seqlen.offset_q + seqlen.seqlen_q - seqlen.seqlen_t
@@ -370,6 +399,12 @@ class HSTUAttentionForwardSm90:
                         n_block_max = n_block_hist + n_block_tgt
                     else:
                         n_block_max = cute.ceil_div(seqlen.seqlen_k, self.kBlockN)
+                    dummy_src = Int32(0)
+                    if const_expr(self.is_paged and self.pages_per_tile > 1):
+                        dummy_src = (
+                            cute.size(mK_cur.shape[0]) // Int32(self.page_size)
+                            - Int32(1)
+                        )
                     kv_start, n_this = self._split_kv_range(n_block_max)
                     if n_this > Int32(0):
                         pipeline_q.producer_acquire(q_producer_state)
@@ -382,17 +417,71 @@ class HSTUAttentionForwardSm90:
                         pipeline_v.producer_acquire(v_producer_state)
                         if const_expr(self.is_paged):
                             if n_block < n_block_hist:
-                                src_idx = page_ids[seqlen.page_ind + n_block]
-                                cute.copy(
-                                    tma_atom_K, tKgK[None, src_idx],
-                                    tKsK[None, kv_producer_state.index],
-                                    tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state),
-                                )
-                                cute.copy(
-                                    tma_atom_V, tVgV[None, src_idx],
-                                    tVsV[None, v_producer_state.index],
-                                    tma_bar_ptr=pipeline_v.producer_get_barrier(v_producer_state),
-                                )
+                                if const_expr(self.pages_per_tile == 1):
+                                    src_idx = page_ids[seqlen.page_ind + n_block]
+                                    cute.copy(
+                                        tma_atom_K, tKgK[None, src_idx],
+                                        tKsK[None, kv_producer_state.index],
+                                        tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state),
+                                    )
+                                    cute.copy(
+                                        tma_atom_V, tVgV[None, src_idx],
+                                        tVsV[None, v_producer_state.index],
+                                        tma_bar_ptr=pipeline_v.producer_get_barrier(v_producer_state),
+                                    )
+                                else:
+                                    for t in cutlass.range_constexpr(self.pages_per_tile):
+                                        page_idx = (
+                                            n_block * Int32(self.pages_per_tile)
+                                            + Int32(t)
+                                        )
+                                        src_idx = dummy_src
+                                        if page_idx < seqlen.n_pages:
+                                            src_idx = page_ids[
+                                                seqlen.page_ind + page_idx
+                                            ]
+                                        sK_t = cute.local_tile(
+                                            sK,
+                                            (
+                                                self.page_size,
+                                                self.head_dim_padded,
+                                                self.num_stages,
+                                            ),
+                                            (t, 0, 0),
+                                        )
+                                        sV_t = cute.local_tile(
+                                            sV,
+                                            (
+                                                self.page_size,
+                                                self.head_dim_padded,
+                                                self.num_stages,
+                                            ),
+                                            (t, 0, 0),
+                                        )
+                                        tKsK_t, tKgK_t = cpasync.tma_partition(
+                                            tma_atom_K, 0, cute.make_layout(1),
+                                            cute.group_modes(sK_t, 0, cute.rank(sK_t) - 1),
+                                            cute.group_modes(gK, 0, cute.rank(gK) - 1),
+                                        )
+                                        tVsV_t, tVgV_t = cpasync.tma_partition(
+                                            tma_atom_V, 0, cute.make_layout(1),
+                                            cute.group_modes(sV_t, 0, cute.rank(sV_t) - 1),
+                                            cute.group_modes(gV, 0, cute.rank(gV) - 1),
+                                        )
+                                        cute.copy(
+                                            tma_atom_K, tKgK_t[None, src_idx],
+                                            tKsK_t[None, kv_producer_state.index],
+                                            tma_bar_ptr=pipeline_k.producer_get_barrier(
+                                                kv_producer_state
+                                            ),
+                                        )
+                                        cute.copy(
+                                            tma_atom_V, tVgV_t[None, src_idx],
+                                            tVsV_t[None, v_producer_state.index],
+                                            tma_bar_ptr=pipeline_v.producer_get_barrier(
+                                                v_producer_state
+                                            ),
+                                        )
                             else:
                                 src_idx = n_block - n_block_hist
                                 cute.copy(
@@ -498,7 +587,7 @@ class HSTUAttentionForwardSm90:
                         col = n_block * self.kBlockN + tScS[i][1]
                         last_page_offset = Int32(0)
                         if const_expr(self.is_paged and self.is_target):
-                            last_page_offset = self.kBlockN - seqlen.last_page_seqlen
+                            last_page_offset = n_block_hist * self.kBlockN - seqlen_h
                             if row >= seqlen_h:
                                 col = col - last_page_offset
                         if const_expr(self.is_arbitrary):
@@ -688,14 +777,24 @@ class HSTUAttentionForwardSm90:
             (self.kBlockN, self.head_dim_padded),
         )
         if const_expr(self.is_paged):
-            tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
-                tma_op_load, mPagedK, cute.select(self.sK_layout, mode=[0, 1]),
-                (self.kBlockN, self.head_dim_padded),
-            )
-            tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
-                tma_op_load, mPagedV, cute.select(self.sV_layout, mode=[0, 1]),
-                (self.kBlockN, self.head_dim_padded),
-            )
+            if const_expr(self.pages_per_tile == 1):
+                tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
+                    tma_op_load, mPagedK, cute.select(self.sK_layout, mode=[0, 1]),
+                    (self.kBlockN, self.head_dim_padded),
+                )
+                tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
+                    tma_op_load, mPagedV, cute.select(self.sV_layout, mode=[0, 1]),
+                    (self.kBlockN, self.head_dim_padded),
+                )
+            else:
+                tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
+                    tma_op_load, mPagedK, self.sK_page_layout,
+                    (self.page_size, self.head_dim_padded),
+                )
+                tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
+                    tma_op_load, mPagedV, self.sV_page_layout,
+                    (self.page_size, self.head_dim_padded),
+                )
         else:
             tma_atom_K, tma_tensor_K = tma_atom_K_tgt, tma_tensor_K_tgt
             tma_atom_V, tma_tensor_V = tma_atom_V_tgt, tma_tensor_V_tgt

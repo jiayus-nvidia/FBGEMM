@@ -35,3 +35,8 @@ class SeqlenInfo:
         self.max_seqlen_k = max_seqlen_k
         self.last_page_seqlen = last_page_seqlen[batch_idx] if last_page_seqlen is not None else 0
         self.page_ind = page_indptrs[batch_idx] if page_indptrs is not None else 0
+        self.n_pages = (
+            page_indptrs[batch_idx + 1] - self.page_ind
+            if page_indptrs is not None
+            else cutlass.Int32(0)
+        )

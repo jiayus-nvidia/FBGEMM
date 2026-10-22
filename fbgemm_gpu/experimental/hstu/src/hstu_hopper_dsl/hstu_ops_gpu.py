@@ -54,12 +54,87 @@ def _choose_kv_split(
     except Exception:
         return 1
     # Short KV loops lose to extra Q loads + partial-O reduction.
-    if base >= sms or n_kv < 32:
+    # Threshold is in tokens so a larger kBlockN is not punished (old
+    # `n_kv < 32` with kBlockN=32 meant <1024 tokens).
+    if base >= sms or n_kv * int(kBlockN) < 1024:
         return 1
     n_split = min(n_kv, sms // base)
     while n_split > 1 and (n_kv + n_split - 1) // n_split < 4:
         n_split -= 1
     return max(1, int(n_split))
+
+
+def _paged_smem_ok(head_dim: int, k_block_m: int, k_block_n: int, stages: int = 2) -> bool:
+    """H100 227 KB smem. Occupancy stays 1; this is just a fit check."""
+    elem = 2
+    overlap = head_dim == 256
+    q = k_block_m * head_dim * elem
+    kv = 2 * k_block_n * head_dim * stages * elem
+    o = 0 if overlap else q
+    return q + kv + o + 4096 < 227 * 1024
+
+
+def _choose_paged_kblock_n(
+    head_dim: int, page_size: int, override: Optional[int] = None
+) -> int:
+    """MMA N tile. Independent of cache page_size; must be a multiple of it."""
+    if override is not None:
+        k = int(override)
+        if k % page_size != 0:
+            raise ValueError(f"kBlockN={k} must be a multiple of page_size={page_size}")
+        if not _paged_smem_ok(head_dim, 128, k):
+            raise ValueError(
+                f"kBlockN={k} head_dim={head_dim} does not fit in Hopper smem"
+            )
+        return k
+    if head_dim >= 128:
+        for k in (128, 64, page_size):
+            if k % page_size == 0 and _paged_smem_ok(head_dim, 128, k):
+                return k
+    return page_size
+
+
+def _paged_kv_planes(
+    paged_kv: torch.Tensor, extra_zero_page: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """K/V as (pages * page_size, heads, dim) for TMA. Reuse plane buffers.
+
+    extra_zero_page: one trailing zero page so OOB slots of a kBlockN>page_size
+    tile still complete the TMA transaction barrier.
+    """
+    n_pages, _, page_size, n_heads, head_dim = paged_kv.shape
+    k_view = paged_kv.select(1, 0)
+    v_view = paged_kv.select(1, 1)
+    packed = n_pages + int(extra_zero_page)
+    if (
+        not extra_zero_page
+        and k_view.is_contiguous()
+        and v_view.is_contiguous()
+    ):
+        return (
+            k_view.reshape(-1, n_heads, head_dim),
+            v_view.reshape(-1, n_heads, head_dim),
+        )
+    plane = (packed, page_size, n_heads, head_dim)
+    cache = hstu_varlen_fwd_90_dsl._paged_plane_cache
+    buf = cache.get(plane)
+    if (
+        buf is None
+        or buf[0].shape != plane
+        or buf[0].dtype != paged_kv.dtype
+        or buf[0].device != paged_kv.device
+    ):
+        buf = (
+            torch.empty(plane, dtype=paged_kv.dtype, device=paged_kv.device),
+            torch.empty(plane, dtype=paged_kv.dtype, device=paged_kv.device),
+        )
+        cache[plane] = buf
+    buf[0][:n_pages].copy_(k_view)
+    buf[1][:n_pages].copy_(v_view)
+    if extra_zero_page:
+        buf[0][n_pages:].zero_()
+        buf[1][n_pages:].zero_()
+    return buf[0].view(-1, n_heads, head_dim), buf[1].view(-1, n_heads, head_dim)
 
 
 def hstu_varlen_fwd_90_dsl(
@@ -82,6 +157,7 @@ def hstu_varlen_fwd_90_dsl(
     page_ids: Optional[torch.Tensor] = None,
     page_indptrs: Optional[torch.Tensor] = None,
     last_page_lens: Optional[torch.Tensor] = None,
+    k_block_n: Optional[int] = None,
 ):
     q = q.contiguous()
     k = k.contiguous()
@@ -128,9 +204,10 @@ def hstu_varlen_fwd_90_dsl(
         assert last_page_lens is not None, "Paged KV is True, but last_page_lens is missing."
         page_size = int(paged_kv.shape[2])
         assert page_size in (32, 64), "Only support page_size 32 and 64"
-        kBlockN = page_size
-        paged_k = paged_kv[:, 0].contiguous().reshape(-1, paged_kv.shape[-2], paged_kv.shape[-1])
-        paged_v = paged_kv[:, 1].contiguous().reshape(-1, paged_kv.shape[-2], paged_kv.shape[-1])
+        kBlockN = _choose_paged_kblock_n(head_dim, page_size, k_block_n)
+        paged_k, paged_v = _paged_kv_planes(
+            paged_kv, extra_zero_page=kBlockN > page_size
+        )
     else:
         paged_k = paged_v = None
 
@@ -261,3 +338,4 @@ def hstu_varlen_fwd_90_dsl(
 
 hstu_varlen_fwd_90_dsl.compile_cache = {}
 hstu_varlen_fwd_90_dsl._o_work_cache = {}
+hstu_varlen_fwd_90_dsl._paged_plane_cache = {}
