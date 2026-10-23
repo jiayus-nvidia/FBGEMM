@@ -200,8 +200,111 @@ class HSTUAttentionForwardSm90:
         return SharedStorageOverlapQO if self.overlap_qo else SharedStorage
 
     @cute.jit
+    def _kv_block_iter(
+        self,
+        seqlen: SeqlenInfo,
+        m_block: Int32,
+        window_size_left: Int32,
+        window_size_right: Int32,
+    ):
+        """Ampere paged/dense KV visit set: causal n_block_max + target is_jump.
+
+        Returns (n_block_min, n_block_hist, n_hist_count, n_tgt_begin, n_total,
+        n_masking_lo, n_masking_hi). Tile i maps to n_block_min+i if
+        i < n_hist_count else n_tgt_begin+(i-n_hist_count). Causal interior
+        tiles in [n_masking_lo, n_masking_hi) still need the element mask.
+        """
+        seqlen_offset = seqlen.seqlen_k - seqlen.seqlen_q
+        seqlen_h = seqlen.seqlen_h
+        is_in_target = cutlass.Boolean(False)
+        is_jump = cutlass.Boolean(False)
+        if const_expr(self.is_target):
+            is_in_target = (m_block + Int32(1)) * Int32(self.kBlockM) + seqlen_offset > seqlen_h
+            is_jump = m_block * Int32(self.kBlockM) + seqlen_offset > seqlen_h
+
+        n_block_hist = cute.ceil_div(seqlen_h, self.kBlockN)
+        last_page_offset = Int32(0)
+        if const_expr(self.is_paged and self.is_target):
+            if is_in_target:
+                last_page_offset = Int32(self.kBlockN) - seqlen.last_page_seqlen
+        if const_expr(self.is_paged):
+            n_block_max = n_block_hist + cute.ceil_div(seqlen.seqlen_t, self.kBlockN)
+        else:
+            n_block_max = cute.ceil_div(seqlen.seqlen_k, self.kBlockN)
+
+        n_block_min = Int32(0)
+        if const_expr(self.is_local):
+            n_block_min = (
+                m_block * Int32(self.kBlockM) + seqlen_offset - window_size_left
+            ) // Int32(self.kBlockN)
+            if n_block_min < Int32(0):
+                n_block_min = Int32(0)
+
+        if const_expr(self.is_causal or self.is_local):
+            kv_limit = (
+                (m_block + Int32(1)) * Int32(self.kBlockM)
+                + seqlen_offset
+                + window_size_right
+            )
+            if const_expr(self.is_paged):
+                kv_limit = kv_limit + last_page_offset
+            n_block_limit = cute.ceil_div(kv_limit, self.kBlockN)
+            if n_block_limit < n_block_max:
+                n_block_max = n_block_limit
+
+        n_masking_steps = Int32(0)
+        n_masking_block_min = Int32(0)
+        n_masking_block_max = Int32(0)
+        if const_expr(self.is_causal):
+            n_masking_hi = seqlen.seqlen_k + last_page_offset
+            n_masking_row = (
+                (m_block + Int32(1)) * Int32(self.kBlockM)
+                + seqlen_offset
+                + last_page_offset
+            )
+            if n_masking_row < n_masking_hi:
+                n_masking_hi = n_masking_row
+            n_masking_block_max = cute.ceil_div(n_masking_hi, self.kBlockN)
+            n_masking_block_min = (
+                m_block * Int32(self.kBlockM) + seqlen_offset
+            ) // Int32(self.kBlockN)
+            if const_expr(self.is_target):
+                if is_jump:
+                    target_index = (
+                        m_block * Int32(self.kBlockM) - seqlen_h
+                    ) // Int32(self.target_group_size)
+                    n_masking_block_min = (
+                        seqlen_h
+                        + seqlen_offset
+                        + target_index * Int32(self.target_group_size)
+                        + last_page_offset
+                    ) // Int32(self.kBlockN)
+            n_masking_steps = n_masking_block_max - n_masking_block_min
+
+        n_hist_count = n_block_max - n_block_min
+        n_tgt_begin = n_block_max
+        if is_jump:
+            if n_masking_steps > Int32(0):
+                n_hist_count = n_block_hist - n_block_min
+                n_tgt_begin = n_block_max - n_masking_steps
+        if n_hist_count < Int32(0):
+            n_hist_count = Int32(0)
+        n_total = n_hist_count + (n_block_max - n_tgt_begin)
+        if n_total < Int32(0):
+            n_total = Int32(0)
+        return (
+            n_block_min,
+            n_block_hist,
+            n_hist_count,
+            n_tgt_begin,
+            n_total,
+            n_masking_block_min,
+            n_masking_block_max,
+        )
+
+    @cute.jit
     def _split_kv_range(self, n_total: Int32):
-        """Evenly partition KV tiles across blockIdx.y (additive split-K)."""
+        """Evenly partition visited KV tiles across blockIdx.y (additive split-K)."""
         n_split = cute.arch.grid_dim()[1]
         split_id = cute.arch.block_idx()[1]
         chunk = cute.ceil_div(n_total, n_split)
@@ -333,7 +436,6 @@ class HSTUAttentionForwardSm90:
                         cute.group_modes(sQ, 0, cute.rank(sQ)),
                         cute.group_modes(gQ, 0, cute.rank(gQ)),
                     )
-
                     tKsK, tKgK = cpasync.tma_partition(
                         tma_atom_K, 0, cute.make_layout(1),
                         cute.group_modes(sK, 0, cute.rank(sK) - 1),
@@ -365,19 +467,20 @@ class HSTUAttentionForwardSm90:
                             cute.group_modes(sV, 0, cute.rank(sV) - 1),
                             cute.group_modes(gV_tgt, 0, cute.rank(gV_tgt) - 1),
                         )
-                        n_block_hist = cute.ceil_div(seqlen.seqlen_h, self.kBlockN)
-                        n_block_tgt = cute.ceil_div(seqlen.seqlen_t, self.kBlockN)
-                        n_block_max = n_block_hist + n_block_tgt
-                    else:
-                        n_block_max = cute.ceil_div(seqlen.seqlen_k, self.kBlockN)
-                    kv_start, n_this = self._split_kv_range(n_block_max)
+                    n_block_min, n_block_hist, n_hist_count, n_tgt_begin, n_total, n_masking_lo, n_masking_hi = self._kv_block_iter(
+                        seqlen, m_block, window_size_left, window_size_right
+                    )
+                    kv_start, n_this = self._split_kv_range(n_total)
                     if n_this > Int32(0):
                         pipeline_q.producer_acquire(q_producer_state)
                         cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr = pipeline_q.producer_get_barrier(q_producer_state))
                         q_producer_state.advance()
 
                     for j in cutlass.range(n_this, unroll=1):
-                        n_block = kv_start + j
+                        kv_i = kv_start + j
+                        n_block = n_block_min + kv_i
+                        if kv_i >= n_hist_count:
+                            n_block = n_tgt_begin + (kv_i - n_hist_count)
                         pipeline_k.producer_acquire(kv_producer_state)
                         pipeline_v.producer_acquire(v_producer_state)
                         if const_expr(self.is_paged):
@@ -461,13 +564,10 @@ class HSTUAttentionForwardSm90:
                     page_indptrs, last_page_seqlen,
                 )
 
-                if const_expr(self.is_paged):
-                    n_block_hist = cute.ceil_div(seqlen.seqlen_h, self.kBlockN)
-                    n_block_tgt = cute.ceil_div(seqlen.seqlen_t, self.kBlockN)
-                    n_block_max = n_block_hist + n_block_tgt
-                else:
-                    n_block_max = cute.ceil_div(seqlen.seqlen_k, self.kBlockN)
-                kv_start, n_this = self._split_kv_range(n_block_max)
+                n_block_min, n_block_hist, n_hist_count, n_tgt_begin, n_total, n_masking_lo, n_masking_hi = self._kv_block_iter(
+                    seqlen, m_block, window_size_left, window_size_right
+                )
+                kv_start, n_this = self._split_kv_range(n_total)
                 is_first = True
                 if n_this <= Int32(0):
                     for z in cutlass.range_constexpr(cute.size(acc_O)):
@@ -475,7 +575,10 @@ class HSTUAttentionForwardSm90:
                 else:
                     pipeline_q.consumer_wait(q_consumer_state)
                 for j in cutlass.range(n_this, unroll=1):
-                    n_block = kv_start + j
+                    kv_i = kv_start + j
+                    n_block = n_block_min + kv_i
+                    if kv_i >= n_hist_count:
+                        n_block = n_tgt_begin + (kv_i - n_hist_count)
                     pipeline_k.consumer_wait(kv_consumer_state)
                     acc_S = gemm_zero_init(
                         tiled_mma_qk,
@@ -489,46 +592,59 @@ class HSTUAttentionForwardSm90:
                     kv_consumer_state.advance()
 
                     scale_half = alpha * Float32(0.5)
-                    cS = cute.make_identity_tensor((self.kBlockM, self.kBlockN))
-                    tScS = tiled_mma_qk.get_slice(tidx).partition_C(cS)
-                    seqlen_h = seqlen.seqlen_h
-                    seqlen_offset = seqlen.seqlen_k - seqlen.seqlen_q
-                    for i in cutlass.range_constexpr(cute.size(acc_S)):
-                        row = m_block * self.kBlockM + tScS[i][0] + seqlen_offset
-                        col = n_block * self.kBlockN + tScS[i][1]
-                        last_page_offset = Int32(0)
-                        if const_expr(self.is_paged and self.is_target):
-                            last_page_offset = self.kBlockN - seqlen.last_page_seqlen
-                            if row >= seqlen_h:
-                                col = col - last_page_offset
-                        if const_expr(self.is_arbitrary):
-                            func_row = row + seqlen.offset_q - seqlen_offset
-                            for j in cutlass.range_constexpr(self.func_num // 2):
-                                if col >= func[2 * j, func_row] and col < func[2 * j + 1, func_row]:
-                                    acc_S[i] = Float32(0)
-                            if col >= func[self.func_num - 1, func_row] or col >= seqlen.seqlen_k:
-                                acc_S[i] = Float32(0)
-                        elif const_expr(not self.is_causal and not self.is_local):
-                            if col >= seqlen.seqlen_k:
-                                acc_S[i] = Float32(0)
-                        else:
-                            col_limit_right = row + Int32(1) + window_size_right
-                            if col_limit_right > seqlen.seqlen_k:
-                                col_limit_right = seqlen.seqlen_k
-                            if col >= col_limit_right:
-                                acc_S[i] = Float32(0)
-                            if const_expr(self.is_local):
-                                col_limit_left = row - window_size_left
-                                if col_limit_left < 0:
-                                    col_limit_left = Int32(0)
-                                if col < col_limit_left:
-                                    acc_S[i] = Float32(0)
-                            if const_expr(self.is_target):
-                                if row >= seqlen_h and (col + last_page_offset) >= seqlen_h:
-                                    target_index = (row - seqlen_h) // Int32(self.target_group_size)
-                                    target_col_limit_left = seqlen_h + target_index * Int32(self.target_group_size)
-                                    if col < target_col_limit_left:
+                    # Ampere: skip the element mask on fully-valid interior tiles.
+                    # Always mask local/arbitrary, the last (partial) history page,
+                    # and causal tiles in [n_masking_lo, n_masking_hi).
+                    do_mask = cutlass.Boolean(False)
+                    if const_expr(self.is_arbitrary or self.is_local):
+                        do_mask = True
+                    else:
+                        if (n_block + Int32(1)) * Int32(self.kBlockN) > seqlen.seqlen_h:
+                            do_mask = True
+                        if const_expr(self.is_causal):
+                            if n_block >= n_masking_lo and n_block < n_masking_hi:
+                                do_mask = True
+                    if do_mask:
+                        cS = cute.make_identity_tensor((self.kBlockM, self.kBlockN))
+                        tScS = tiled_mma_qk.get_slice(tidx).partition_C(cS)
+                        seqlen_h = seqlen.seqlen_h
+                        seqlen_offset = seqlen.seqlen_k - seqlen.seqlen_q
+                        for i in cutlass.range_constexpr(cute.size(acc_S)):
+                            row = m_block * self.kBlockM + tScS[i][0] + seqlen_offset
+                            col = n_block * self.kBlockN + tScS[i][1]
+                            last_page_offset = Int32(0)
+                            if const_expr(self.is_paged and self.is_target):
+                                last_page_offset = self.kBlockN - seqlen.last_page_seqlen
+                                if row >= seqlen_h:
+                                    col = col - last_page_offset
+                            if const_expr(self.is_arbitrary):
+                                func_row = row + seqlen.offset_q - seqlen_offset
+                                for j in cutlass.range_constexpr(self.func_num // 2):
+                                    if col >= func[2 * j, func_row] and col < func[2 * j + 1, func_row]:
                                         acc_S[i] = Float32(0)
+                                if col >= func[self.func_num - 1, func_row] or col >= seqlen.seqlen_k:
+                                    acc_S[i] = Float32(0)
+                            elif const_expr(not self.is_causal and not self.is_local):
+                                if col >= seqlen.seqlen_k:
+                                    acc_S[i] = Float32(0)
+                            else:
+                                col_limit_right = row + Int32(1) + window_size_right
+                                if col_limit_right > seqlen.seqlen_k:
+                                    col_limit_right = seqlen.seqlen_k
+                                if col >= col_limit_right:
+                                    acc_S[i] = Float32(0)
+                                if const_expr(self.is_local):
+                                    col_limit_left = row - window_size_left
+                                    if col_limit_left < 0:
+                                        col_limit_left = Int32(0)
+                                    if col < col_limit_left:
+                                        acc_S[i] = Float32(0)
+                                if const_expr(self.is_target):
+                                    if row >= seqlen_h and (col + last_page_offset) >= seqlen_h:
+                                        target_index = (row - seqlen_h) // Int32(self.target_group_size)
+                                        target_col_limit_left = seqlen_h + target_index * Int32(self.target_group_size)
+                                        if col < target_col_limit_left:
+                                            acc_S[i] = Float32(0)
                     for i in cutlass.range_constexpr(cute.size(acc_S)):
                         vh = acc_S[i] * scale_half
                         acc_S[i] = vh * tanhf(vh) + vh

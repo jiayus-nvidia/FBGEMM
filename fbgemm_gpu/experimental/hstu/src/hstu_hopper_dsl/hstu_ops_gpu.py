@@ -33,6 +33,21 @@ def _mark_optional_tensor(tensor: Optional[torch.Tensor]):
     return _mark_dynamic_tensor(tensor, tensor.ndim - 1)
 
 
+_SM_COUNT: dict[int, int] = {}
+
+
+def _sm_count() -> int:
+    try:
+        idx = int(torch.cuda.current_device())
+    except Exception:
+        return 0
+    n = _SM_COUNT.get(idx)
+    if n is None:
+        n = int(torch.cuda.get_device_properties(idx).multi_processor_count)
+        _SM_COUNT[idx] = n
+    return n
+
+
 def _choose_kv_split(
     max_seqlen_k: int,
     kBlockN: int,
@@ -49,17 +64,88 @@ def _choose_kv_split(
     n_kv = max(1, (int(max_seqlen_k) + kBlockN - 1) // kBlockN)
     n_m = max(1, (int(q_tokens) + kBlockM - 1) // kBlockM)
     base = max(1, n_m * int(n_heads) * int(n_batch))
-    try:
-        sms = int(torch.cuda.get_device_properties(0).multi_processor_count)
-    except Exception:
+    sms = _sm_count()
+    if sms <= 0:
         return 1
     # Short KV loops lose to extra Q loads + partial-O reduction.
-    if base >= sms or n_kv < 32:
+    # Threshold is in tokens so a larger kBlockN is not punished (old
+    # `n_kv < 32` with kBlockN=32 meant <1024 tokens).
+    if base >= sms or n_kv * int(kBlockN) < 1024:
         return 1
     n_split = min(n_kv, sms // base)
     while n_split > 1 and (n_kv + n_split - 1) // n_split < 4:
         n_split -= 1
     return max(1, int(n_split))
+
+
+def _as_contiguous(t: torch.Tensor) -> torch.Tensor:
+    return t if t.is_contiguous() else t.contiguous()
+
+
+def _ensure_tma_aligned(t: Optional[torch.Tensor], align: int = 16) -> Optional[torch.Tensor]:
+    """TMA from_dlpack assumes 16-byte pointers.
+
+    Recsys packs KV metadata with ``narrow`` into one int32 buffer, so
+    ``last_page_lens`` often starts at offset ``batch_size+1`` and is
+    contiguous but not 16-byte aligned. ``contiguous()`` is a no-op then;
+    clone to a fresh allocation.
+    """
+    if t is None:
+        return None
+    if t.data_ptr() % align == 0:
+        return t if t.is_contiguous() else t.contiguous()
+    return t.clone()
+
+
+def _cached_like(cache: dict, shape, dtype, device) -> torch.Tensor:
+    buf = cache.get(shape)
+    if buf is None or buf.shape != shape or buf.dtype != dtype or buf.device != device:
+        buf = torch.empty(shape, dtype=dtype, device=device)
+        cache[shape] = buf
+    return buf
+
+
+def _paged_kv_planes(
+    paged_kv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """K/V as (pages * page_size, heads, dim) for TMA. Reuse plane buffers."""
+    n_pages, _, page_size, n_heads, head_dim = paged_kv.shape
+    k_view = paged_kv.select(1, 0)
+    v_view = paged_kv.select(1, 1)
+    if k_view.is_contiguous() and v_view.is_contiguous():
+        return (
+            k_view.reshape(-1, n_heads, head_dim),
+            v_view.reshape(-1, n_heads, head_dim),
+        )
+    plane = (n_pages, page_size, n_heads, head_dim)
+    cache = hstu_varlen_fwd_90_dsl._paged_plane_cache
+    buf = cache.get(plane)
+    if (
+        buf is None
+        or buf[0].shape != plane
+        or buf[0].dtype != paged_kv.dtype
+        or buf[0].device != paged_kv.device
+    ):
+        buf = (
+            torch.empty(plane, dtype=paged_kv.dtype, device=paged_kv.device),
+            torch.empty(plane, dtype=paged_kv.dtype, device=paged_kv.device),
+        )
+        cache[plane] = buf
+    buf[0].copy_(k_view)
+    buf[1].copy_(v_view)
+    return buf[0].view(-1, n_heads, head_dim), buf[1].view(-1, n_heads, head_dim)
+
+
+def _reduce_split_o(o_work: torch.Tensor, out: torch.Tensor) -> None:
+    """Sum split partials in fp32, write bf16/fp16 out. Two kernels, no extra casts."""
+    acc = _cached_like(
+        hstu_varlen_fwd_90_dsl._o_fp32_cache, out.shape, torch.float32, out.device
+    )
+    try:
+        torch.sum(o_work, dim=0, dtype=torch.float32, out=acc)
+    except TypeError:
+        acc.copy_(o_work.sum(dim=0, dtype=torch.float32))
+    out.copy_(acc)
 
 
 def hstu_varlen_fwd_90_dsl(
@@ -83,9 +169,17 @@ def hstu_varlen_fwd_90_dsl(
     page_indptrs: Optional[torch.Tensor] = None,
     last_page_lens: Optional[torch.Tensor] = None,
 ):
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
+    q = _ensure_tma_aligned(_as_contiguous(q))
+    k = _ensure_tma_aligned(_as_contiguous(k))
+    v = _ensure_tma_aligned(_as_contiguous(v))
+    cu_seqlens_q = _ensure_tma_aligned(cu_seqlens_q)
+    cu_seqlens_k = _ensure_tma_aligned(cu_seqlens_k)
+    num_contexts = _ensure_tma_aligned(num_contexts)
+    num_targets = _ensure_tma_aligned(num_targets)
+    func = _ensure_tma_aligned(func)
+    page_ids = _ensure_tma_aligned(page_ids)
+    page_indptrs = _ensure_tma_aligned(page_indptrs)
+    last_page_lens = _ensure_tma_aligned(last_page_lens)
     q_tokens = q.shape[0]
 
     # Ampere C++ matrix: bf16/fp16 and head_dim 32/64/128/256.
@@ -129,8 +223,10 @@ def hstu_varlen_fwd_90_dsl(
         page_size = int(paged_kv.shape[2])
         assert page_size in (32, 64), "Only support page_size 32 and 64"
         kBlockN = page_size
-        paged_k = paged_kv[:, 0].contiguous().reshape(-1, paged_kv.shape[-2], paged_kv.shape[-1])
-        paged_v = paged_kv[:, 1].contiguous().reshape(-1, paged_kv.shape[-2], paged_kv.shape[-1])
+        with torch.cuda.nvtx.range("hstu_paged_kv_planes"):
+            paged_k, paged_v = _paged_kv_planes(paged_kv)
+        paged_k = _ensure_tma_aligned(paged_k)
+        paged_v = _ensure_tma_aligned(paged_v)
     else:
         paged_k = paged_v = None
 
@@ -146,16 +242,9 @@ def hstu_varlen_fwd_90_dsl(
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     if kv_split > 1:
         o_shape = (kv_split, q.shape[0], q.shape[1], q.shape[2])
-        cache = hstu_varlen_fwd_90_dsl._o_work_cache
-        o_work = cache.get(o_shape)
-        if (
-            o_work is None
-            or o_work.shape != o_shape
-            or o_work.dtype != q.dtype
-            or o_work.device != q.device
-        ):
-            o_work = torch.empty(o_shape, dtype=q.dtype, device=q.device)
-            cache[o_shape] = o_work
+        o_work = _cached_like(
+            hstu_varlen_fwd_90_dsl._o_work_cache, o_shape, q.dtype, q.device
+        )
         o_launch = o_work.view(kv_split * q.shape[0], q.shape[1], q.shape[2])
     else:
         o_work = None
@@ -232,32 +321,35 @@ def hstu_varlen_fwd_90_dsl(
         )
 
     compiled_fwd = hstu_varlen_fwd_90_dsl.compile_cache[compile_key]
-    compiled_fwd(
-        q,
-        k,
-        v,
-        o_launch,
-        max_seqlen_q,
-        max_seqlen_k,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        num_contexts,
-        num_targets,
-        alpha,
-        window_size_left,
-        window_size_right,
-        func,
-        paged_k,
-        paged_v,
-        page_ids,
-        page_indptrs,
-        last_page_lens,
-        kv_split,
-    )
-    if kv_split > 1:
-        out.copy_(o_work.float().sum(dim=0).to(out.dtype))
+    with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
+        compiled_fwd(
+            q,
+            k,
+            v,
+            o_launch,
+            max_seqlen_q,
+            max_seqlen_k,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            num_contexts,
+            num_targets,
+            alpha,
+            window_size_left,
+            window_size_right,
+            func,
+            paged_k,
+            paged_v,
+            page_ids,
+            page_indptrs,
+            last_page_lens,
+            kv_split,
+        )
+        if kv_split > 1:
+            _reduce_split_o(o_work, out)
     return out[:q_tokens]
 
 
 hstu_varlen_fwd_90_dsl.compile_cache = {}
 hstu_varlen_fwd_90_dsl._o_work_cache = {}
+hstu_varlen_fwd_90_dsl._o_fp32_cache = {}
+hstu_varlen_fwd_90_dsl._paged_plane_cache = {}

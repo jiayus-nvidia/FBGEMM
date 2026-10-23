@@ -56,29 +56,44 @@ def _import_sm100():
     return hstu_ops_gpu
 
 
+def _is_sm90_dsl_module(module) -> bool:
+    return callable(getattr(module, "hstu_varlen_fwd_90_dsl", None))
+
+
 def _import_sm90_dsl():
+    # A dummy ``fbgemm_gpu`` on PYTHONPATH can make the first import succeed
+    # without the Hopper DSL. Only accept modules that actually export the op.
+    candidates = []
     try:
-        from fbgemm_gpu.experimental.hstu.hstu_hopper_dsl import hstu_ops_gpu
-        return hstu_ops_gpu
+        from fbgemm_gpu.experimental.hstu.hstu_hopper_dsl import hstu_ops_gpu as _m
+        candidates.append(_m)
     except ImportError:
         pass
     try:
-        from hstu.hstu_hopper_dsl import hstu_ops_gpu
-        return hstu_ops_gpu
+        from hstu.hstu_hopper_dsl import hstu_ops_gpu as _m
+        candidates.append(_m)
     except ImportError:
         pass
     try:
-        from hstu_hopper_dsl import hstu_ops_gpu
-        return hstu_ops_gpu
+        from hstu_hopper_dsl import hstu_ops_gpu as _m
+        candidates.append(_m)
     except ImportError:
         pass
+    for module in candidates:
+        if _is_sm90_dsl_module(module):
+            return module
     # Uninstalled worktree: hstu/cuda_hstu_attention.py -> experimental/hstu/src
     dsl_src = Path(__file__).resolve().parents[1] / "src"
     dsl_src_str = str(dsl_src)
     if dsl_src.is_dir() and dsl_src_str not in sys.path:
         sys.path.insert(0, dsl_src_str)
-    from hstu_hopper_dsl import hstu_ops_gpu
-    return hstu_ops_gpu
+    from hstu_hopper_dsl import hstu_ops_gpu as _m
+    if not _is_sm90_dsl_module(_m):
+        raise ImportError(
+            "Hopper DSL loaded but hstu_varlen_fwd_90_dsl is missing. "
+            "Check PYTHONPATH for a stub fbgemm_gpu package."
+        )
+    return _m
 
 
 def _scale_hstu_out(out: torch.Tensor, scaling_seqlen: int, max_seqlen_q: int) -> torch.Tensor:
