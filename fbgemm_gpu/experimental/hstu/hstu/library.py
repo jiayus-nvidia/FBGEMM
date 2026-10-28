@@ -37,12 +37,17 @@ if (
     # in hstu/hstu_ops_gpu.py can find their target ops (fbgemm::hstu_varlen_fwd_{80,90}),
     # even on Blackwell where the actual sm100 path is served via hstu.hstu_blackwell.
     if open_source or no_fbgemm_gpu:
-        torch.ops.load_library(
-            os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
+        so_path = os.path.join(
+            os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so"
         )
-        torch.classes.load_library(
-            os.path.join(os.path.dirname(__file__), "fbgemm_gpu_experimental_hstu.so")
-        )
+        if os.path.exists(so_path):
+            torch.ops.load_library(so_path)
+            torch.classes.load_library(so_path)
+        else:
+            logging.warning(
+                "fbgemm_gpu_experimental_hstu.so not found; "
+                "C++ HSTU ops unavailable, Hopper DSL fwd can still run"
+            )
     else:
         torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_gpu")
 
