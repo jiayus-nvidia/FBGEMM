@@ -144,11 +144,15 @@ def _use_hstu_hopper_dsl_fwd(
     is_local = (
         window_size_left < max_seqlen_k or window_size_right < max_seqlen_k
     ) and not is_causal
-    if kv_cache is not None:
-        if not is_causal or is_local or func is not None:
-            return False
-        if kv_cache.dim() != 5 or kv_cache.shape[1] != 2 or kv_cache.shape[2] not in (32, 64):
-            return False
+    # Hopper DSL fwd is for paged inference. Dense packed-varlen training
+    # (kv_cache is None) hits a last-M-tile TMA overlap bug vs PyTorch;
+    # keep those cases on C++ hstu_varlen_fwd_90.
+    if kv_cache is None:
+        return False
+    if not is_causal or is_local or func is not None:
+        return False
+    if kv_cache.dim() != 5 or kv_cache.shape[1] != 2 or kv_cache.shape[2] not in (32, 64):
+        return False
     return True
 
 def quantize_for_two_directions(x, seq_offsets, fp8_type=torch.float8_e4m3fn):
